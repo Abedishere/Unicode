@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ai-orchestrator = "orchestrator:main"
+unicode = "orchestrator:main"
 
 [tool.setuptools]
 py-modules = ["orchestrator"]
