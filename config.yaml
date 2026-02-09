@@ -1,0 +1,9 @@
+discussion_rounds: 4
+max_review_iterations: 3
+claude_model: "opus"
+codex_model: "gpt-5.3-codex"
+qwen_model: "qwen3-coder"
+timeout_seconds: 600
+codex_timeout_seconds: 300
+auto_commit: false
+working_directory: "."

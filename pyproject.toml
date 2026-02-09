@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-orchestrator"
+version = "0.1.0"
+description = "Orchestrate Claude Code and Codex CLI into an automated agentic workflow"
+requires-python = ">=3.10"
+dependencies = [
+    "click",
+    "pyyaml",
+    "rich",
+]
+
+[project.scripts]
+ai-orchestrator = "orchestrator:main"
+
+[tool.setuptools]
+py-modules = ["orchestrator"]
+packages = ["agents", "phases", "utils"]
+
+[tool.setuptools.package-data]
+"*" = ["config.yaml"]
