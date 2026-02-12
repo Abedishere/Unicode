@@ -9,7 +9,10 @@ from pathlib import Path
 
 import click
 import yaml
+from rich.columns import Columns
 from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
 
 from agents.claude_agent import ClaudeAgent
 from agents.codex_agent import CodexAgent
@@ -29,18 +32,50 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 
 console = Console()
 
-BANNER = r"""
-[bold magenta]
-  _   _ _   _ ___ ____ ___  ____  _____
- | | | | \ | |_ _/ ___/ _ \|  _ \| ____|
- | | | |  \| || | |  | | | | | | |  _|
- | |_| | |\  || | |__| |_| | |_| | |___
-  \___/|_| \_|___\____\___/|____/|_____|
-[/]
-[dim]  Claude + Codex + Qwen — AI Agent Orchestrator[/]
-[dim]  Type your task or pass it as an argument.[/]
-[dim]  Press Ctrl+C twice to exit.[/]
-"""
+VERSION = "0.1.0"
+
+ASCII_ART = """\
+[bold magenta]  _   _ _   _ ___ ____ ___  ____  _____
+ | | | | \\ | |_ _/ ___/ _ \\|  _ \\| ____|
+ | | | |  \\| || | |  | | | | | | |  _|
+ | |_| | |\\  || | |__| |_| | |_| | |___
+  \\___/|_| \\_|___\\____\\___/|____/|_____|[/]"""
+
+
+def _print_banner(cfg: dict, work_dir: str) -> None:
+    """Print the startup banner with ASCII art left and info box right."""
+    console.print()
+
+    # Info panel (right side)
+    info_lines = Text()
+    info_lines.append(">_ ", style="bold magenta")
+    info_lines.append(f"Unicode Orchestrator", style="bold white")
+    info_lines.append(f" (v{VERSION})\n\n", style="dim")
+    info_lines.append(f"  Claude ", style="bold cyan")
+    info_lines.append(f"{cfg['claude_model']}", style="dim")
+    info_lines.append(f"  |  ", style="dim")
+    info_lines.append(f"Codex ", style="bold green")
+    info_lines.append(f"{cfg['codex_model']}", style="dim")
+    info_lines.append(f"\n  Qwen ", style="bold magenta")
+    info_lines.append(f"{cfg['qwen_model']}", style="dim")
+    info_lines.append(f"\n  {work_dir}", style="dim")
+
+    info_panel = Panel(
+        info_lines,
+        border_style="bright_black",
+        padding=(0, 1),
+    )
+
+    console.print(
+        Columns([ASCII_ART, info_panel], padding=(0, 2), expand=False),
+    )
+
+    console.print()
+    console.print(
+        "[dim]Tips: Type your task or pass it as an argument. "
+        "Press Ctrl+C twice to exit.[/]"
+    )
+    console.print()
 
 # Tracks when the last Ctrl+C was pressed for double-press detection
 _last_ctrl_c: float = 0.0
@@ -83,6 +118,22 @@ def load_config(config_path: str | None) -> dict:
             overrides = yaml.safe_load(f) or {}
         defaults.update(overrides)
     return defaults
+
+
+def _print_phase_banner(label: str, role: str, desc: str, color: str = "cyan") -> None:
+    """Print a colored phase banner panel (like Qwen Code's notice boxes)."""
+    content = Text()
+    content.append(f"Talking to ", style="default")
+    content.append(role, style=f"bold {color}")
+    content.append(f" — {desc}", style="dim")
+    console.print()
+    console.print(Panel(
+        content,
+        title=f"[bold {color}]{label}[/]",
+        border_style=color,
+        padding=(0, 1),
+    ))
+    console.print()
 
 
 def _run_phase(label: str, fn, *args, **kwargs):
@@ -128,34 +179,33 @@ def _run_phase(label: str, fn, *args, **kwargs):
 
 
 def _prompt_task() -> str:
-    """Claude Code-style multiline task prompt.
+    """Multiline task prompt with Qwen Code-style visuals.
 
-    Shows `> ` for the first line and `... ` for continuation lines.
+    Shows a dim rule, `> ` for the first line and `... ` for continuations.
     An empty line (double-Enter) or EOF submits the input.
-    Prints a dim `[N lines]` indicator for inputs longer than 3 lines.
+    Prints a magenta underline and `[N lines]` indicator for long inputs.
     """
     while True:
         lines: list[str] = []
+        # Dim horizontal rule above prompt
+        console.rule(style="bright_black")
         try:
-            # First line with bold cyan `> ` prompt
-            first = console.input("[bold cyan]> [/]")
+            # First line with bold magenta `> ` prompt
+            first = console.input("[bold magenta]> [/]")
             if first.strip():
                 lines.append(first)
             else:
-                # Empty first line — re-prompt
                 console.print("[dim]Please enter a task.[/]")
                 continue
 
-            # Continuation lines with `... ` prefix
+            # Continuation lines with dim `... ` prefix
             while True:
                 cont = console.input("[dim]... [/]")
                 if not cont.strip():
-                    # Empty line → submit
                     break
                 lines.append(cont)
 
         except EOFError:
-            # Ctrl+D / Ctrl+Z submits whatever we have
             if not lines:
                 continue
 
@@ -163,6 +213,9 @@ def _prompt_task() -> str:
         if not task:
             console.print("[dim]Please enter a task.[/]")
             continue
+
+        # Magenta underline after submission
+        console.rule(style="magenta")
 
         if len(lines) > 3:
             console.print(f"[dim]  [{len(lines)} lines][/]")
@@ -213,7 +266,7 @@ def _run_task(
     # ── Phase 1: Plan (Codex drafts, Claude reviews) ──
     run_plan = phase in ("all", "plan", "discuss")
     if run_plan and phase == "all":
-        console.print(f"\n[bold cyan]── Planning ──[/]  [dim]talking to [bold]admins[/dim] (Claude & Codex)[/]")
+        _print_phase_banner("Planning", "admins", "Claude & Codex will draft the plan", "cyan")
     if run_plan:
         result, extra = request_approval("plan",
             "Codex (GPT) will draft a plan, then Claude will review it.")
@@ -236,7 +289,7 @@ def _run_task(
     # ── Phase 2: Discussion (only if admins disagree on the plan) ──
     run_discuss = phase in ("all", "discuss")
     if run_discuss and not agreed and phase == "all":
-        console.print(f"\n[bold cyan]── Discussion ──[/]  [dim]talking to [bold]admins[/dim] (Claude & Codex)[/]")
+        _print_phase_banner("Discussion", "admins", "Claude & Codex will discuss the plan", "cyan")
     if run_discuss and not agreed:
         log_info("Admins disagree — starting discussion to resolve.")
         result, extra = request_approval("discussion",
@@ -275,7 +328,7 @@ def _run_task(
     # ── Phase 3: Implementation (Claude as developer, with Qwen available) ──
     run_impl = phase in ("all", "implement")
     if run_impl and phase == "all":
-        console.print(f"\n[bold cyan]── Implementation ──[/]  [dim]talking to [bold]developer[/dim] (Claude Code)[/]")
+        _print_phase_banner("Implementation", "developer", "Claude Code will implement the plan", "magenta")
     if run_impl:
         result, extra = request_approval("implement",
             "Claude (developer) will now implement the plan with full file access.\n"
@@ -307,7 +360,7 @@ def _run_task(
 
     # ── Phase 4: Code Review (Codex reviews, first is mandatory) ──
     if phase == "all":
-        console.print(f"\n[bold cyan]── Code Review ──[/]  [dim]talking to [bold]reviewer[/dim] (Codex)[/]")
+        _print_phase_banner("Code Review", "reviewer", "Codex will review the implementation", "green")
     log_info("First code review is mandatory.")
     rev = _run_phase("Code Review",
         run_review, task, plan, claude, codex, work_dir,
@@ -401,8 +454,6 @@ def main(
     # Install double Ctrl+C handler
     signal.signal(signal.SIGINT, _sigint_handler)
 
-    console.print(BANNER)
-
     cfg = load_config(config_path)
 
     # CLI overrides
@@ -424,7 +475,8 @@ def main(
     # Initialize agent MD files (header + orchestrator.md reference)
     init_agent_md(work_dir)
 
-    log_info(f"Working directory: {work_dir}")
+    # Print the banner with info box
+    _print_banner(cfg, work_dir)
 
     # Create agents
     claude = ClaudeAgent(
@@ -446,17 +498,13 @@ def main(
     # Show phase banner immediately on startup when a specific phase is selected
     if phase != "all":
         _phase_banners = {
-            "plan":      ("Planning",       "admins",   "Claude & Codex will draft the plan"),
-            "discuss":   ("Discussion",     "admins",   "Claude & Codex will discuss the plan"),
-            "implement": ("Implementation", "developer","Claude Code (developer) will implement"),
-            "review":    ("Code Review",    "reviewer", "Codex will review the implementation"),
+            "plan":      ("Planning",       "admins",   "Claude & Codex will draft the plan",      "cyan"),
+            "discuss":   ("Discussion",     "admins",   "Claude & Codex will discuss the plan",    "cyan"),
+            "implement": ("Implementation", "developer","Claude Code (developer) will implement",  "magenta"),
+            "review":    ("Code Review",    "reviewer", "Codex will review the implementation",    "green"),
         }
-        label, role, desc = _phase_banners.get(phase, (phase, "agents", ""))
-        console.print()
-        console.print(f"[bold cyan]┌─ {label} phase[/]")
-        console.print(f"[bold cyan]│[/]  You are talking to the [bold]{role}[/]")
-        console.print(f"[bold cyan]│[/]  [dim]{desc}[/]")
-        console.print(f"[bold cyan]└{'─' * 40}[/]")
+        label, role, desc, color = _phase_banners.get(phase, (phase, "agents", "", "cyan"))
+        _print_phase_banner(label, role, desc, color)
 
     # ── Main loop: keep accepting tasks until double Ctrl+C ──
     first_task = task  # from CLI argument, if any

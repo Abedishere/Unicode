@@ -43,7 +43,6 @@ def request_approval(action: str, description: str) -> tuple[str, str | None]:
             f"[bold]{description}[/]",
             title=f"[bold yellow]Approval needed: {action}[/]",
             border_style="yellow",
-            expand=True,
         ))
 
         if extra_instructions:
@@ -56,7 +55,7 @@ def request_approval(action: str, description: str) -> tuple[str, str | None]:
             "n": "No, skip this step",
         }
         for key, label in choices.items():
-            console.print(f"  [bold cyan]{key}[/] — {label}")
+            console.print(f"  [bold magenta]{key}[/] — {label}")
 
         console.print()
         choice = click.prompt(
