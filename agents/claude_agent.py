@@ -1,5 +1,5 @@
 from agents.base import BaseAgent
-from utils.runner import run_cli
+from utils.runner import run_cli, run_interactive
 
 
 class ClaudeAgent(BaseAgent):
@@ -41,3 +41,22 @@ class ClaudeAgent(BaseAgent):
         if not stdout.strip() and stderr.strip():
             raise RuntimeError(f"Claude CLI failed: {stderr}")
         return stdout.strip()
+
+    def implement_interactive(self, task: str, plan: str) -> int:
+        """Run Claude Code interactively — full TUI with streaming output.
+
+        The plan is already saved to .orchestrator/plan.md; Claude Code reads
+        it directly. Returns the process exit code.
+        """
+        cmd = [
+            "claude",
+            "--model", self.model,
+            "--dangerously-skip-permissions",
+            "Read .orchestrator/plan.md and implement the plan exactly.",
+        ]
+        return run_interactive(
+            cmd,
+            agent_name=f"{self.name} (developer)",
+            timeout=self.timeout,
+            cwd=self.working_dir,
+        )

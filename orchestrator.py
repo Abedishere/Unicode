@@ -22,7 +22,7 @@ from utils.approval import request_approval, reset_session_approvals
 from utils.git_utils import commit, push, init_repo, is_git_repo
 from utils.history import append_history, agent_update_md, init_agent_md, write_orchestrator_md
 from utils.logger import init_transcript, log_error, log_info, log_phase, log_success
-from utils.runner import CancelledByUser
+from utils.runner import CancelledByUser, TimeoutSkipToReview
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -128,19 +128,58 @@ def _run_phase(label: str, fn, *args, **kwargs):
 
 
 def _prompt_task() -> str:
-    """Keep asking until the user gives a non-empty task."""
+    """Claude Code-style multiline task prompt.
+
+    Shows `> ` for the first line and `... ` for continuation lines.
+    An empty line (double-Enter) or EOF submits the input.
+    Prints a dim `[N lines]` indicator for inputs longer than 3 lines.
+    """
     while True:
+        lines: list[str] = []
         try:
-            task = click.prompt(
-                click.style("What do you want to build?", fg="cyan", bold=True),
-                default="",
-                show_default=False,
-            )
-        except (EOFError, click.Abort):
+            # First line with bold cyan `> ` prompt
+            first = console.input("[bold cyan]> [/]")
+            if first.strip():
+                lines.append(first)
+            else:
+                # Empty first line — re-prompt
+                console.print("[dim]Please enter a task.[/]")
+                continue
+
+            # Continuation lines with `... ` prefix
+            while True:
+                cont = console.input("[dim]... [/]")
+                if not cont.strip():
+                    # Empty line → submit
+                    break
+                lines.append(cont)
+
+        except EOFError:
+            # Ctrl+D / Ctrl+Z submits whatever we have
+            if not lines:
+                continue
+
+        task = "\n".join(lines).strip()
+        if not task:
+            console.print("[dim]Please enter a task.[/]")
             continue
-        if task.strip():
-            return task.strip()
-        console.print("[dim]Please enter a task.[/]")
+
+        if len(lines) > 3:
+            console.print(f"[dim]  [{len(lines)} lines][/]")
+
+        return task
+
+
+def _load_saved_plan(work_dir: str) -> str:
+    """Try to load a previously saved plan from .orchestrator/plan.md."""
+    plan_path = Path(work_dir) / ".orchestrator" / "plan.md"
+    if plan_path.exists():
+        plan = plan_path.read_text(encoding="utf-8").strip()
+        if plan:
+            log_info(f"Loaded saved plan from {plan_path}")
+            return plan
+    log_info("No saved plan found — proceeding without one.")
+    return ""
 
 
 def _run_task(
@@ -150,6 +189,7 @@ def _run_task(
     claude: ClaudeAgent,
     codex: CodexAgent,
     qwen: QwenAgent,
+    phase: str = "all",
 ) -> None:
     """Execute one full orchestration run for the given task."""
     # Reset per-session approvals for each new task
@@ -158,33 +198,46 @@ def _run_task(
     transcript_path = init_transcript(work_dir)
     log_info(f"Transcript: {transcript_path}")
     log_info(f"Task: {task}")
-
     start_time = time.time()
 
     # Track state across phases
     discussion: list[dict[str, str]] = []
     plan = ""
     approved = False
+    skip_to_review = False
+
+    # For standalone implement/review, load saved plan
+    if phase in ("implement", "review"):
+        plan = _load_saved_plan(work_dir)
 
     # ── Phase 1: Plan (Codex drafts, Claude reviews) ──
-    result, extra = request_approval("plan",
-        "Codex (GPT) will draft a plan, then Claude will review it.")
-    if result == "proceed":
-        if extra:
-            task = f"{task}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
-            log_info("Updated task with your instructions.")
-        plan_result = _run_phase("Plan",
-            consolidate_plan, task, claude, codex, work_dir)
-        if plan_result is not None:
-            plan, agreed = plan_result
+    run_plan = phase in ("all", "plan", "discuss")
+    if run_plan and phase == "all":
+        console.print(f"\n[bold cyan]── Planning ──[/]  [dim]talking to [bold]admins[/dim] (Claude & Codex)[/]")
+    if run_plan:
+        result, extra = request_approval("plan",
+            "Codex (GPT) will draft a plan, then Claude will review it.")
+        if result == "proceed":
+            if extra:
+                task = f"{task}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
+                log_info("Updated task with your instructions.")
+            plan_result = _run_phase("Plan",
+                consolidate_plan, task, claude, codex, work_dir)
+            if plan_result is not None:
+                plan, agreed = plan_result
+            else:
+                plan, agreed = "", True
         else:
-            plan, agreed = "", True
+            log_info("Skipping plan phase.")
+            agreed = True
     else:
-        log_info("Skipping plan phase.")
         agreed = True
 
     # ── Phase 2: Discussion (only if admins disagree on the plan) ──
-    if not agreed:
+    run_discuss = phase in ("all", "discuss")
+    if run_discuss and not agreed and phase == "all":
+        console.print(f"\n[bold cyan]── Discussion ──[/]  [dim]talking to [bold]admins[/dim] (Claude & Codex)[/]")
+    if run_discuss and not agreed:
         log_info("Admins disagree — starting discussion to resolve.")
         result, extra = request_approval("discussion",
             "Claude and Codex disagree on the plan. They'll discuss for "
@@ -206,27 +259,55 @@ def _run_task(
                 plan, _ = plan_result
         else:
             log_info("Skipping discussion — proceeding with current plan.")
+    elif not agreed:
+        log_info("Admins agree — skipping discussion.")
     else:
         log_info("Admins agree — skipping discussion.")
 
+    # Stop here if the user only wanted plan or discuss
+    if phase in ("plan", "discuss"):
+        log_phase("Phase complete.")
+        duration = time.time() - start_time
+        mins, secs = divmod(int(duration), 60)
+        log_info(f"Finished in {mins}m {secs:02d}s.")
+        return
+
     # ── Phase 3: Implementation (Claude as developer, with Qwen available) ──
-    result, extra = request_approval("implement",
-        "Claude (developer) will now implement the plan with full file access.\n"
-        "Qwen is available for delegation on simple tasks.")
-    if result == "proceed":
-        if extra:
-            plan = f"{plan}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
-            log_info("Updated plan with your instructions.")
-        impl = _run_phase("Implementation",
-            run_implementation, task, plan, claude)
-        if impl is not None:
-            # Qwen writes orchestrator.md (project summary)
-            _run_phase("Writing orchestrator.md",
-                write_orchestrator_md, work_dir, task, plan, discussion, qwen)
-    else:
-        log_info("Skipping implementation phase.")
+    run_impl = phase in ("all", "implement")
+    if run_impl and phase == "all":
+        console.print(f"\n[bold cyan]── Implementation ──[/]  [dim]talking to [bold]developer[/dim] (Claude Code)[/]")
+    if run_impl:
+        result, extra = request_approval("implement",
+            "Claude (developer) will now implement the plan with full file access.\n"
+            "Qwen is available for delegation on simple tasks.")
+        if result == "proceed":
+            if extra:
+                plan = f"{plan}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
+                log_info("Updated plan with your instructions.")
+            try:
+                impl = _run_phase("Implementation",
+                    run_implementation, task, plan, claude)
+                if impl is not None:
+                    # Qwen writes orchestrator.md (project summary)
+                    _run_phase("Writing orchestrator.md",
+                        write_orchestrator_md, work_dir, task, plan, discussion, qwen)
+            except TimeoutSkipToReview:
+                log_info("Skipping to review phase (user request after timeout).")
+                skip_to_review = True
+        else:
+            log_info("Skipping implementation phase.")
+
+    # Stop here if the user only wanted implement (and didn't skip to review)
+    if phase == "implement" and not skip_to_review:
+        log_phase("Implementation phase complete.")
+        duration = time.time() - start_time
+        mins, secs = divmod(int(duration), 60)
+        log_info(f"Finished in {mins}m {secs:02d}s.")
+        return
 
     # ── Phase 4: Code Review (Codex reviews, first is mandatory) ──
+    if phase == "all":
+        console.print(f"\n[bold cyan]── Code Review ──[/]  [dim]talking to [bold]reviewer[/dim] (Codex)[/]")
     log_info("First code review is mandatory.")
     rev = _run_phase("Code Review",
         run_review, task, plan, claude, codex, work_dir,
@@ -303,12 +384,18 @@ def _run_task(
 @click.option("--rounds", type=int, default=None, help="Override discussion rounds.")
 @click.option("--auto-commit", is_flag=True, default=None, help="Auto-commit on approval.")
 @click.option("--working-dir", default=None, help="Override working directory.")
+@click.option(
+    "--phase", default="all",
+    type=click.Choice(["all", "plan", "discuss", "implement", "review"], case_sensitive=False),
+    help="Run only a specific phase.",
+)
 def main(
     task: str | None,
     config_path: str,
     rounds: int | None,
     auto_commit: bool | None,
     working_dir: str | None,
+    phase: str,
 ):
     """Orchestrate Claude Code and Codex to collaboratively complete TASK."""
     # Install double Ctrl+C handler
@@ -356,6 +443,21 @@ def main(
         working_dir=work_dir,
     )
 
+    # Show phase banner immediately on startup when a specific phase is selected
+    if phase != "all":
+        _phase_banners = {
+            "plan":      ("Planning",       "admins",   "Claude & Codex will draft the plan"),
+            "discuss":   ("Discussion",     "admins",   "Claude & Codex will discuss the plan"),
+            "implement": ("Implementation", "developer","Claude Code (developer) will implement"),
+            "review":    ("Code Review",    "reviewer", "Codex will review the implementation"),
+        }
+        label, role, desc = _phase_banners.get(phase, (phase, "agents", ""))
+        console.print()
+        console.print(f"[bold cyan]┌─ {label} phase[/]")
+        console.print(f"[bold cyan]│[/]  You are talking to the [bold]{role}[/]")
+        console.print(f"[bold cyan]│[/]  [dim]{desc}[/]")
+        console.print(f"[bold cyan]└{'─' * 40}[/]")
+
     # ── Main loop: keep accepting tasks until double Ctrl+C ──
     first_task = task  # from CLI argument, if any
 
@@ -368,7 +470,7 @@ def main(
                 console.print()
                 current_task = _prompt_task()
 
-            _run_task(current_task, cfg, work_dir, claude, codex, qwen)
+            _run_task(current_task, cfg, work_dir, claude, codex, qwen, phase)
 
         except Exception as exc:
             log_error(f"Orchestrator failed: {exc}")
