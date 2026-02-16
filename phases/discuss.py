@@ -61,12 +61,17 @@ def run_discussion(
     codex: BaseAgent,
     rounds: int = 2,
     user_context: str | None = None,
+    allow_user_questions: bool = True,
 ) -> list[dict[str, str]]:
     """Run a multi-round discussion between Claude and Codex.
 
     Max 2 rounds — they must reach a decision within that limit.
     Returns the conversation history as a list of
     {"agent": name, "message": text} dicts.
+
+    If allow_user_questions is False, agents never pause to ask the user.
+    Otherwise, user questions are only allowed after at least one full
+    round of back-and-forth (both agents have spoken once).
     """
     log_phase("Phase 2: Discussion (max 2 rounds)")
     history: list[dict[str, str]] = []
@@ -78,6 +83,9 @@ def run_discussion(
     for round_num in range(1, rounds + 1):
         log_info(f"Round {round_num}/{rounds}")
 
+        # Only allow user questions after the first full round
+        can_ask = allow_user_questions and round_num > 1
+
         # --- Claude's turn ---
         claude_prompt = _build_prompt(task, plan, history, "Claude", "Codex")
         log_info("Waiting for Claude ...")
@@ -86,7 +94,7 @@ def run_discussion(
         log_agent("Claude", claude_reply)
 
         # Check if Claude is asking the user something
-        if _has_user_question(claude_reply):
+        if can_ask and _has_user_question(claude_reply):
             answer = _ask_user("Claude", claude_reply)
             if answer:
                 history.append({"agent": "User", "message": answer})
@@ -100,7 +108,7 @@ def run_discussion(
         log_agent("Codex", codex_reply)
 
         # Check if Codex is asking the user something
-        if _has_user_question(codex_reply):
+        if can_ask and _has_user_question(codex_reply):
             answer = _ask_user("Codex", codex_reply)
             if answer:
                 history.append({"agent": "User", "message": answer})

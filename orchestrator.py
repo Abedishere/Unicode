@@ -34,12 +34,63 @@ console = Console()
 
 VERSION = "0.1.0"
 
-ASCII_ART = """\
-[bold magenta]  _   _ _   _ ___ ____ ___  ____  _____
- | | | | \\ | |_ _/ ___/ _ \\|  _ \\| ____|
- | | | |  \\| || | |  | | | | | | |  _|
- | |_| | |\\  || | |__| |_| | |_| | |___
-  \\___/|_| \\_|___\\____\\___/|____/|_____|[/]"""
+# 3-color gradient stops: orange (Claude) → teal (Codex) → purple (Qwen)
+_C = "#E8915C"  # Claude orange/amber
+_X = "#50C8B4"  # Codex teal/blue-green
+_Q = "#7B68EE"  # Qwen purple/blue
+
+# Box-drawing block letters (Qwen Code style)
+_art_lines = [
+    "▄▄    ▄▄ ▄▄▄    ▄▄ ▄▄  ▄▄▄▄▄▄   ▄▄▄▄▄▄  ▄▄▄▄▄▄  ▄▄▄▄▄▄▄",
+    "██║   ██║████╗  ██║██║██╔════╝ ██╔═══██╗██╔══██╗██╔════╝",
+    "██║   ██║██╔██╗ ██║██║██║      ██║   ██║██║  ██║█████╗  ",
+    "██║   ██║██║╚██╗██║██║██║      ██║   ██║██║  ██║██╔══╝  ",
+    "╚██████╔╝██║ ╚████║██║╚██████╗ ╚██████╔╝██████╔╝███████╗",
+    " ╚═════╝ ╚═╝  ╚═══╝╚═╝ ╚═════╝  ╚═════╝ ╚═════╝ ╚══════╝",
+]
+
+
+def _hex_to_rgb(h: str) -> tuple[int, int, int]:
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _lerp_color(c1: tuple[int, int, int], c2: tuple[int, int, int], t: float) -> str:
+    r = int(c1[0] + (c2[0] - c1[0]) * t)
+    g = int(c1[1] + (c2[1] - c1[1]) * t)
+    b = int(c1[2] + (c2[2] - c1[2]) * t)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _gradient_char(col: int, width: int) -> str:
+    """Return a hex color for column position using a 3-stop gradient."""
+    stops = [_hex_to_rgb(_C), _hex_to_rgb(_X), _hex_to_rgb(_Q)]
+    t = col / max(width - 1, 1)  # 0.0 → 1.0
+    if t <= 0.5:
+        return _lerp_color(stops[0], stops[1], t / 0.5)
+    else:
+        return _lerp_color(stops[1], stops[2], (t - 0.5) / 0.5)
+
+
+def _gradient_line(line: str, width: int) -> str:
+    """Apply per-character gradient to a line of art."""
+    rich_line = ""
+    for i, ch in enumerate(line):
+        if ch == " ":
+            rich_line += " "
+        else:
+            color = _gradient_char(i, width)
+            rich_line += f"[bold {color}]{ch}[/]"
+    return rich_line
+
+
+def _build_gradient_art() -> str:
+    """Build ASCII art with gradient coloring."""
+    max_width = max(len(l) for l in _art_lines)
+    return "\n".join(_gradient_line(line, max_width) for line in _art_lines)
+
+
+ASCII_ART = _build_gradient_art()
 
 
 def _print_banner(cfg: dict, work_dir: str) -> None:
@@ -51,12 +102,12 @@ def _print_banner(cfg: dict, work_dir: str) -> None:
     info_lines.append(">_ ", style="bold magenta")
     info_lines.append(f"Unicode Orchestrator", style="bold white")
     info_lines.append(f" (v{VERSION})\n\n", style="dim")
-    info_lines.append(f"  Claude ", style="bold cyan")
+    info_lines.append(f"  Claude ", style=f"bold {_C}")
     info_lines.append(f"{cfg['claude_model']}", style="dim")
     info_lines.append(f"  |  ", style="dim")
-    info_lines.append(f"Codex ", style="bold green")
+    info_lines.append(f"Codex ", style=f"bold {_X}")
     info_lines.append(f"{cfg['codex_model']}", style="dim")
-    info_lines.append(f"\n  Qwen ", style="bold magenta")
+    info_lines.append(f"\n  Qwen ", style=f"bold {_Q}")
     info_lines.append(f"{cfg['qwen_model']}", style="dim")
     info_lines.append(f"\n  {work_dir}", style="dim")
 
@@ -103,6 +154,7 @@ def load_config(config_path: str | None) -> dict:
         "timeout_seconds": 600,
         "codex_timeout_seconds": 300,
         "auto_commit": False,
+        "allow_user_questions": True,
         "working_directory": ".",
     }
     # Resolve config: explicit path → CWD → package dir
@@ -178,12 +230,23 @@ def _run_phase(label: str, fn, *args, **kwargs):
                 return None
 
 
+def _prompt_gradient_line() -> str:
+    """Build a gradient underline: orange → teal → purple."""
+    w = console.width
+    third = w // 3
+    return (
+        f"[{_C}]{'━' * third}[/]"
+        f"[{_X}]{'━' * third}[/]"
+        f"[{_Q}]{'━' * (w - 2 * third)}[/]"
+    )
+
+
 def _prompt_task() -> str:
     """Multiline task prompt with Qwen Code-style visuals.
 
-    Shows a dim rule, `> ` for the first line and `... ` for continuations.
+    Shows a dim rule above, `> ` prompt, colored underline below.
     An empty line (double-Enter) or EOF submits the input.
-    Prints a magenta underline and `[N lines]` indicator for long inputs.
+    Prints `[N lines]` indicator for long inputs.
     """
     while True:
         lines: list[str] = []
@@ -214,8 +277,8 @@ def _prompt_task() -> str:
             console.print("[dim]Please enter a task.[/]")
             continue
 
-        # Magenta underline after submission
-        console.rule(style="magenta")
+        # Colored gradient underline after submission
+        console.print(_prompt_gradient_line())
 
         if len(lines) > 3:
             console.print(f"[dim]  [{len(lines)} lines][/]")
@@ -300,7 +363,8 @@ def _run_task(
                 task = f"{task}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
                 log_info("Updated task with your instructions.")
             disc = _run_phase("Discussion",
-                run_discussion, task, plan, claude, codex, 2)
+                run_discussion, task, plan, claude, codex, 2,
+                allow_user_questions=cfg.get("allow_user_questions", True))
             if disc is not None:
                 discussion = disc
 
@@ -436,6 +500,7 @@ def _run_task(
 @click.option("--config", "config_path", default="config.yaml", help="Config file path.")
 @click.option("--rounds", type=int, default=None, help="Override discussion rounds.")
 @click.option("--auto-commit", is_flag=True, default=None, help="Auto-commit on approval.")
+@click.option("--no-questions", is_flag=True, default=False, help="Disable admin questions to user during discussion.")
 @click.option("--working-dir", default=None, help="Override working directory.")
 @click.option(
     "--phase", default="all",
@@ -447,6 +512,7 @@ def main(
     config_path: str,
     rounds: int | None,
     auto_commit: bool | None,
+    no_questions: bool,
     working_dir: str | None,
     phase: str,
 ):
@@ -461,6 +527,8 @@ def main(
         cfg["discussion_rounds"] = rounds
     if auto_commit is not None:
         cfg["auto_commit"] = auto_commit
+    if no_questions:
+        cfg["allow_user_questions"] = False
     if working_dir is not None:
         cfg["working_directory"] = working_dir
 
