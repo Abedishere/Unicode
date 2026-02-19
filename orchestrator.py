@@ -22,10 +22,14 @@ from phases.discuss import run_discussion
 from phases.implement import run_implementation
 from phases.plan import consolidate_plan
 from phases.review import run_review
-from utils.approval import request_approval, reset_session_approvals
+from utils.approval import request_approval, reset_session_approvals, set_auto_all, is_auto_all
 from utils.git_utils import commit, push, init_repo, is_git_repo
 from utils.history import append_history, agent_update_md, init_agent_md, write_orchestrator_md
 from utils.logger import init_transcript, log_error, log_info, log_phase, log_success
+from utils.memory import (
+    add_learning, add_task_to_index, extract_keywords_from_task,
+    get_context_for_task, load_memory, save_memory,
+)
 from utils.runner import CancelledByUser, TimeoutSkipToReview
 
 
@@ -33,7 +37,7 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 
 console = Console()
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # 3-color gradient stops: orange (Claude) → teal (Codex) → purple (Qwen)
 _C = "#E8915C"  # Claude orange/amber
@@ -42,12 +46,14 @@ _Q = "#7B68EE"  # Qwen purple/blue
 
 # Box-drawing block letters (Qwen Code style)
 _art_lines = [
-    "▄▄    ▄▄ ▄▄▄    ▄▄ ▄▄  ▄▄▄▄▄▄   ▄▄▄▄▄▄  ▄▄▄▄▄▄  ▄▄▄▄▄▄▄",
-    "██║   ██║████╗  ██║██║██╔════╝ ██╔═══██╗██╔══██╗██╔════╝",
-    "██║   ██║██╔██╗ ██║██║██║      ██║   ██║██║  ██║█████╗  ",
-    "██║   ██║██║╚██╗██║██║██║      ██║   ██║██║  ██║██╔══╝  ",
-    "╚██████╔╝██║ ╚████║██║╚██████╗ ╚██████╔╝██████╔╝███████╗",
-    " ╚═════╝ ╚═╝  ╚═══╝╚═╝ ╚═════╝  ╚═════╝ ╚═════╝ ╚══════╝",
+    "  ██╗          ▄▄    ▄▄ ▄▄▄    ▄▄ ▄▄  ▄▄▄▄▄▄   ▄▄▄▄▄▄  ▄▄▄▄▄▄  ▄▄▄▄▄▄▄ ",
+    "    ██╗        ██║   ██║████╗  ██║██║██╔════╝ ██╔═══██╗██╔══██╗██╔════╝",
+    "      ██╗      ██║   ██║██╔██╗ ██║██║██║      ██║   ██║██║  ██║█████╗  ",
+    "        ██╗    ██║   ██║██║╚██╗██║██║██║      ██║   ██║██║  ██║██╔══╝  ",
+    "        ██╝    ╚██████╔╝██║ ╚████║██║╚██████╗ ╚██████╔╝██████╔╝███████╗",
+    "      ██╝        ╚═════╝ ╚═╝  ╚═══╝╚═╝ ╚═════╝  ╚═════╝ ╚═════╝ ╚══════╝",
+    "    ██╝",
+    "  ██╝",
 ]
 
 
@@ -98,6 +104,8 @@ def _print_banner(cfg: dict, work_dir: str) -> None:
     """Print the startup banner with ASCII art left and info box right."""
     console.print()
 
+    dev_model = cfg.get("dev_model", cfg["claude_model"])
+
     # Info panel (right side)
     info_lines = Text()
     info_lines.append(">_ ", style="bold magenta")
@@ -110,6 +118,9 @@ def _print_banner(cfg: dict, work_dir: str) -> None:
     info_lines.append(f"{cfg['codex_model']}", style="dim")
     info_lines.append(f"\n  Qwen ", style=f"bold {_Q}")
     info_lines.append(f"{cfg['qwen_model']}", style="dim")
+    info_lines.append(f"  |  ", style="dim")
+    info_lines.append(f"Dev ", style=f"bold {_C}")
+    info_lines.append(f"{dev_model}", style="dim")
     info_lines.append(f"\n  {work_dir}", style="dim")
 
     info_panel = Panel(
@@ -146,6 +157,90 @@ def _sigint_handler(signum, frame):
     console.print("\n[bold yellow]Press Ctrl+C again within 2s to exit.[/]")
 
 
+# ── Tier definitions ─────────────────────────────────────────────────
+_DEFAULT_TIERS = {
+    "quick": {
+        "dev_model": "sonnet",
+        "max_review_iterations": 1,
+        "discussion_rounds": 1,
+    },
+    "standard": {
+        "dev_model": "sonnet",
+        "max_review_iterations": 2,
+        "discussion_rounds": 2,
+    },
+    "complex": {
+        "dev_model": "opus",
+        "max_review_iterations": 3,
+        "discussion_rounds": 4,
+    },
+}
+
+
+def _prompt_tier(cfg: dict) -> str:
+    """Interactively ask the user to select a complexity tier.
+
+    Returns the tier name. Modifies cfg in-place with the tier's settings.
+    """
+    tiers = cfg.get("tiers", _DEFAULT_TIERS)
+
+    console.print()
+    console.print(Panel(
+        "[bold]Select task complexity tier[/]",
+        title="[bold cyan]Tier Selection[/]",
+        border_style="cyan",
+    ))
+
+    tier_info = {
+        "quick": ("Quick fix / simple task", "Sonnet dev, 1 review"),
+        "standard": ("Standard task", "Sonnet dev, 2 reviews"),
+        "complex": ("Complex / architectural", "Opus dev, 3 reviews"),
+    }
+
+    for key in ("quick", "standard", "complex"):
+        label, detail = tier_info.get(key, (key, ""))
+        dev = tiers.get(key, {}).get("dev_model", "sonnet")
+        console.print(f"  [bold magenta]{key[0]}[/] — {label} [dim]({detail}, dev:{dev})[/]")
+
+    console.print()
+    choice = click.prompt(
+        click.style("Tier", fg="cyan", bold=True),
+        type=click.Choice(["q", "s", "c"], case_sensitive=False),
+        default="s",
+        show_choices=False,
+    )
+
+    tier_map = {"q": "quick", "s": "standard", "c": "complex"}
+    tier_name = tier_map[choice]
+    tier_cfg = tiers.get(tier_name, {})
+
+    # Apply tier settings to cfg
+    for key, val in tier_cfg.items():
+        cfg[key] = val
+
+    console.print(f"[dim]  Tier: {tier_name} (dev:{cfg.get('dev_model', 'sonnet')})[/]")
+    return tier_name
+
+
+def _prompt_auto_mode() -> bool:
+    """Ask if the user wants auto-approve-all mode for this task."""
+    console.print()
+    console.print(
+        "  [bold magenta]a[/] — Auto mode [dim](skip all approvals except git commit)[/]"
+    )
+    console.print(
+        "  [bold magenta]m[/] — Manual mode [dim](approve each phase individually)[/]"
+    )
+    console.print()
+    choice = click.prompt(
+        click.style("Mode", fg="cyan", bold=True),
+        type=click.Choice(["a", "m"], case_sensitive=False),
+        default="m",
+        show_choices=False,
+    )
+    return choice == "a"
+
+
 def load_config(config_path: str | None) -> dict:
     defaults = {
         "discussion_rounds": 4,
@@ -153,11 +248,13 @@ def load_config(config_path: str | None) -> dict:
         "claude_model": "opus",
         "codex_model": "gpt-5.3-codex",
         "qwen_model": "qwen3-coder",
+        "dev_model": "sonnet",
         "timeout_seconds": 600,
         "codex_timeout_seconds": 300,
         "auto_commit": False,
         "allow_user_questions": True,
         "working_directory": ".",
+        "tiers": _DEFAULT_TIERS,
     }
     # Resolve config: explicit path → CWD → package dir
     resolved = None
@@ -458,6 +555,7 @@ _SLASH_COMMANDS = [
     ("/clear", "Remove all attachments"),
     ("/clear-images", "Remove attached images only"),
     ("/clear-paste", "Remove pasted text only"),
+    ("/auto", "Toggle auto-approve mode"),
 ]
 
 
@@ -821,6 +919,8 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False):
         # the entire burst, then check whether the result is an
         # image path and, if so, auto-submit without requiring Enter.
         if primary and msvcrt.kbhit():
+            pre_burst_len = len(buf)     # text typed before the burst
+            pre_burst_cursor = cursor
             time.sleep(0.025)           # let the burst fully arrive
             got_enter = False
             while msvcrt.kbhit():
@@ -834,13 +934,57 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False):
             sys.stdout.write(f"\r{prompt_ansi}{''.join(buf)}\033[K")
             sys.stdout.flush()
             candidate = "".join(buf)
-            # Auto-submit if the pasted content is an image path
-            if _is_image_path(candidate):
+
+            # Extract just the pasted/dropped portion
+            pasted_part = "".join(buf[pre_burst_cursor:cursor])
+            had_prior_text = pre_burst_cursor > 0
+
+            # Check if the PASTED portion alone is an image path
+            if _is_image_path(pasted_part):
+                if had_prior_text:
+                    # User had typed text before the drag-drop.
+                    # Strip the image path from the buffer, keeping
+                    # the original text intact, and auto-attach.
+                    del buf[pre_burst_cursor:cursor]
+                    cursor = pre_burst_cursor
+                    _try_attach_image(pasted_part)
+                    img_path = _attached_images[-1][1]
+                    img_num = _attached_images[-1][0]
+                    # Redraw: prompt + original text, then badge below
+                    sys.stdout.write(f"\r{prompt_ansi}{''.join(buf)}\033[K\r\n")
+                    badge_name = Path(img_path).name
+                    try:
+                        badge_size = _humanize_size(Path(img_path).stat().st_size)
+                    except OSError:
+                        badge_size = ""
+                    size_s = f" ({badge_size})" if badge_size else ""
+                    sys.stdout.write(
+                        f"  \033[1;36;48;5;237m [Image #{img_num}] \033[0m"
+                        f" \033[2m{badge_name}{size_s}\033[0m\r\n"
+                    )
+                    # Reprint the prompt with the preserved text
+                    sys.stdout.write(f"{prompt_ansi}{''.join(buf)}")
+                    if cursor < len(buf):
+                        sys.stdout.write(f"\033[{len(buf) - cursor}D")
+                    sys.stdout.flush()
+                    # User stays on prompt with their text intact
+                    continue
+                else:
+                    # No prior text — original auto-submit behavior
+                    if menu_n:
+                        _clear_below_cursor(menu_n, 0)
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    return (pasted_part, None, "submit")
+
+            # Also check the full buffer (for case where user typed nothing)
+            if not had_prior_text and _is_image_path(candidate):
                 if menu_n:
                     _clear_below_cursor(menu_n, 0)
                 sys.stdout.write("\r\n")
                 sys.stdout.flush()
                 return (candidate, None, "submit")
+
             # Enter arrived inside the paste — submit as normal line
             if got_enter:
                 if menu_n:
@@ -951,6 +1095,12 @@ def _prompt_task() -> str:
                 if stripped.lower() in ("/clear-paste", "/clear"):
                     _attached_pastes.clear()
                 console.print("[dim]  Attachments cleared.[/]")
+                continue
+            if stripped.lower() == "/auto":
+                new_state = not is_auto_all()
+                set_auto_all(new_state)
+                state_str = "ON" if new_state else "OFF"
+                console.print(f"[bold cyan]  Auto-approve mode: {state_str}[/]")
                 continue
 
             # ── Auto-detect image path ────────────────────────────
@@ -1074,6 +1224,35 @@ def _load_saved_plan(work_dir: str) -> str:
     return ""
 
 
+def _extract_review_learnings(
+    qwen: QwenAgent,
+    review_text: str,
+    task: str,
+    work_dir: str,
+) -> None:
+    """Have Qwen extract lessons learned from a code review and save to memory."""
+    prompt = (
+        f"TASK: {task}\n\n"
+        f"CODE REVIEW FEEDBACK:\n{review_text[:2000]}\n\n"
+        "Extract any recurring patterns or mistakes from this review. "
+        "Return a JSON array of strings, each a short lesson (max 50 words). "
+        "If no useful lessons, return []. Example:\n"
+        '[\"Always validate user input before database queries\", '
+        '\"Use constants instead of magic numbers\"]\n'
+        "Return ONLY the JSON array, nothing else."
+    )
+    try:
+        result = qwen.query(prompt)
+        import json
+        lessons = json.loads(result)
+        if isinstance(lessons, list):
+            for lesson in lessons[:3]:
+                if isinstance(lesson, str) and lesson.strip():
+                    add_learning(work_dir, "past_mistakes", lesson.strip())
+    except Exception:
+        pass  # Non-critical — don't break the pipeline
+
+
 def _run_task(
     task: str,
     cfg: dict,
@@ -1082,6 +1261,7 @@ def _run_task(
     codex: CodexAgent,
     qwen: QwenAgent,
     phase: str = "all",
+    tier: str = "standard",
 ) -> None:
     """Execute one full orchestration run for the given task."""
     # Reset per-session approvals for each new task
@@ -1090,7 +1270,13 @@ def _run_task(
     transcript_path = init_transcript(work_dir)
     log_info(f"Transcript: {transcript_path}")
     log_info(f"Task: {task}")
+    log_info(f"Tier: {tier} | Dev model: {claude.dev_model}")
     start_time = time.time()
+
+    # Load shared memory context for this task
+    memory_context = get_context_for_task(work_dir, task)
+    if memory_context:
+        log_info("Loaded shared memory context from previous tasks.")
 
     # Track state across phases
     discussion: list[dict[str, str]] = []
@@ -1114,7 +1300,8 @@ def _run_task(
                 task = f"{task}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
                 log_info("Updated task with your instructions.")
             plan_result = _run_phase("Plan",
-                consolidate_plan, task, claude, codex, work_dir)
+                consolidate_plan, task, claude, codex, work_dir,
+                memory_context=memory_context)
             if plan_result is not None:
                 plan, agreed = plan_result
             else:
@@ -1131,15 +1318,16 @@ def _run_task(
         _print_phase_banner("Discussion", "admins", "Claude & Codex will discuss the plan", "cyan")
     if run_discuss and not agreed:
         log_info("Admins disagree — starting discussion to resolve.")
+        disc_rounds = cfg.get("discussion_rounds", 2)
         result, extra = request_approval("discussion",
-            "Claude and Codex disagree on the plan. They'll discuss for "
-            "2 rounds to resolve.")
+            f"Claude and Codex disagree on the plan. They'll discuss for "
+            f"{disc_rounds} rounds to resolve.")
         if result == "proceed":
             if extra:
                 task = f"{task}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
                 log_info("Updated task with your instructions.")
             disc = _run_phase("Discussion",
-                run_discussion, task, plan, claude, codex, 2,
+                run_discussion, task, plan, claude, codex, disc_rounds,
                 allow_user_questions=cfg.get("allow_user_questions", True))
             if disc is not None:
                 discussion = disc
@@ -1147,7 +1335,8 @@ def _run_task(
             # Re-plan after discussion
             log_info("Re-planning after discussion ...")
             plan_result = _run_phase("Re-Plan",
-                consolidate_plan, task, claude, codex, work_dir, discussion)
+                consolidate_plan, task, claude, codex, work_dir, discussion,
+                memory_context=memory_context)
             if plan_result is not None:
                 plan, _ = plan_result
         else:
@@ -1168,18 +1357,23 @@ def _run_task(
     # ── Phase 3: Implementation (Claude as developer, with Qwen available) ──
     run_impl = phase in ("all", "implement")
     if run_impl and phase == "all":
-        _print_phase_banner("Implementation", "developer", "Claude Code will implement the plan", "magenta")
+        _print_phase_banner(
+            "Implementation", "developer",
+            f"Claude Code (dev:{claude.dev_model}) will implement the plan",
+            "magenta",
+        )
     if run_impl:
         result, extra = request_approval("implement",
-            "Claude (developer) will now implement the plan with full file access.\n"
-            "Qwen is available for delegation on simple tasks.")
+            f"Claude (dev:{claude.dev_model}) will now implement the plan with full file access.")
         if result == "proceed":
             if extra:
                 plan = f"{plan}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
                 log_info("Updated plan with your instructions.")
             try:
                 impl = _run_phase("Implementation",
-                    run_implementation, task, plan, claude)
+                    run_implementation, task, plan, claude,
+                    discussion=discussion,
+                    memory_context=memory_context)
                 if impl is not None:
                     # Qwen writes orchestrator.md (project summary)
                     _run_phase("Writing orchestrator.md",
@@ -1198,9 +1392,10 @@ def _run_task(
         log_info(f"Finished in {mins}m {secs:02d}s.")
         return
 
-    # ── Phase 4: Code Review (Codex reviews, first is mandatory) ──
+    # ── Phase 4: Code Review (Codex reviews with Claude validation) ──
     if phase == "all":
-        _print_phase_banner("Code Review", "reviewer", "Codex will review the implementation", "green")
+        _print_phase_banner("Code Review", "reviewer",
+            "Codex reviews, Claude validates", "green")
     log_info("First code review is mandatory.")
     rev = _run_phase("Code Review",
         run_review, task, plan, claude, codex, work_dir,
@@ -1265,6 +1460,16 @@ def _run_task(
     append_history(work_dir, task, outcome, duration, actions_summary, transcript_name)
     log_info("Appended run to .orchestrator/history.md")
 
+    # ── Save to shared memory ──
+    keywords = extract_keywords_from_task(task)
+    add_task_to_index(work_dir, task, outcome, keywords)
+    log_info("Task indexed in shared memory.")
+
+    # Extract learnings from the task
+    if plan:
+        add_learning(work_dir, "architecture_decisions",
+            f"[{outcome}] {task[:100]}: {plan[:200]}")
+
     if approved:
         log_success("Task complete!")
     else:
@@ -1283,6 +1488,15 @@ def _run_task(
     type=click.Choice(["all", "plan", "discuss", "implement", "review"], case_sensitive=False),
     help="Run only a specific phase.",
 )
+@click.option(
+    "--tier", default=None,
+    type=click.Choice(["quick", "standard", "complex"], case_sensitive=False),
+    help="Task complexity tier (skip selection prompt).",
+)
+@click.option("--auto", "auto_mode", is_flag=True, default=False,
+    help="Auto-approve all phases except git commit.")
+@click.option("--dev-model", default=None,
+    help="Override developer model (e.g. sonnet, opus).")
 def main(
     task: str | None,
     config_path: str,
@@ -1291,6 +1505,9 @@ def main(
     no_questions: bool,
     working_dir: str | None,
     phase: str,
+    tier: str | None,
+    auto_mode: bool,
+    dev_model: str | None,
 ):
     """Orchestrate Claude Code and Codex to collaboratively complete TASK."""
     # Install double Ctrl+C handler
@@ -1307,6 +1524,8 @@ def main(
         cfg["allow_user_questions"] = False
     if working_dir is not None:
         cfg["working_directory"] = working_dir
+    if dev_model is not None:
+        cfg["dev_model"] = dev_model
 
     work_dir = os.path.abspath(cfg["working_directory"])
     os.makedirs(work_dir, exist_ok=True)
@@ -1322,22 +1541,10 @@ def main(
     # Print the banner with info box
     _print_banner(cfg, work_dir)
 
-    # Create agents
-    claude = ClaudeAgent(
-        model=cfg["claude_model"],
-        timeout=cfg["timeout_seconds"],
-        working_dir=work_dir,
-    )
-    codex = CodexAgent(
-        model=cfg["codex_model"],
-        timeout=cfg["codex_timeout_seconds"],
-        working_dir=work_dir,
-    )
-    qwen = QwenAgent(
-        model=cfg["qwen_model"],
-        timeout=cfg["timeout_seconds"],
-        working_dir=work_dir,
-    )
+    # Auto mode from CLI
+    if auto_mode:
+        set_auto_all(True)
+        console.print("[bold cyan]Auto-approve mode: ON[/] [dim](git commit still requires confirmation)[/]")
 
     # Show phase banner immediately on startup when a specific phase is selected
     if phase != "all":
@@ -1363,7 +1570,47 @@ def main(
                 current_task = _prompt_task()
                 _flush_stdin()  # discard leftover paste data
 
-            _run_task(current_task, cfg, work_dir, claude, codex, qwen, phase)
+            # ── Tier & mode selection (interactive, per-task) ──
+            if tier:
+                # CLI-specified tier — apply once
+                selected_tier = tier
+                tier_cfg = cfg.get("tiers", _DEFAULT_TIERS).get(selected_tier, {})
+                for key, val in tier_cfg.items():
+                    cfg[key] = val
+            else:
+                # Interactive tier selection
+                selected_tier = _prompt_tier(cfg)
+
+            # Interactive auto-mode selection (if not already set via CLI)
+            if not is_auto_all() and not auto_mode:
+                if _prompt_auto_mode():
+                    set_auto_all(True)
+                    console.print("[bold cyan]  Auto-approve mode: ON[/]")
+
+            # Create/update agents with current config (tier may have changed dev_model)
+            claude = ClaudeAgent(
+                model=cfg["claude_model"],
+                timeout=cfg["timeout_seconds"],
+                working_dir=work_dir,
+                dev_model=cfg.get("dev_model", cfg["claude_model"]),
+            )
+            codex = CodexAgent(
+                model=cfg["codex_model"],
+                timeout=cfg["codex_timeout_seconds"],
+                working_dir=work_dir,
+            )
+            qwen = QwenAgent(
+                model=cfg["qwen_model"],
+                timeout=cfg["timeout_seconds"],
+                working_dir=work_dir,
+            )
+
+            _run_task(current_task, cfg, work_dir, claude, codex, qwen, phase,
+                      tier=selected_tier)
+
+            # Reset auto-all after each task (unless set via CLI)
+            if not auto_mode:
+                set_auto_all(False)
 
         except Exception as exc:
             log_error(f"Orchestrator failed: {exc}")

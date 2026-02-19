@@ -1,9 +1,21 @@
+from __future__ import annotations
+
 from agents.base import BaseAgent
 from utils.runner import run_cli, run_interactive
 
 
 class ClaudeAgent(BaseAgent):
-    """Wrapper around the Claude Code CLI (claude -p)."""
+    """Wrapper around the Claude Code CLI (claude -p).
+
+    Supports separate admin and dev models. The *model* is used for admin
+    queries (planning, review). The *dev_model* (defaults to *model*) is
+    used for implementation tasks.
+    """
+
+    def __init__(self, model: str, timeout: int, working_dir: str,
+                 dev_model: str | None = None):
+        super().__init__(model=model, timeout=timeout, working_dir=working_dir)
+        self.dev_model = dev_model or model
 
     @property
     def name(self) -> str:
@@ -24,16 +36,19 @@ class ClaudeAgent(BaseAgent):
         return stdout.strip()
 
     def implement(self, plan: str) -> str:
-        """Run Claude Code as the developer — full file access."""
+        """Run Claude Code as the developer — full file access.
+
+        Uses dev_model instead of admin model.
+        """
         cmd = [
             "claude", "-p",
             "--output-format", "text",
-            "--model", self.model,
+            "--model", self.dev_model,
             "--dangerously-skip-permissions",
         ]
         stdout, stderr = run_cli(
             cmd,
-            agent_name=f"{self.name} (developer)",
+            agent_name=f"{self.name} (dev:{self.dev_model})",
             input_text=plan,
             timeout=self.timeout,
             cwd=self.working_dir,
@@ -45,18 +60,18 @@ class ClaudeAgent(BaseAgent):
     def implement_interactive(self, task: str, plan: str) -> int:
         """Run Claude Code interactively — full TUI with streaming output.
 
-        The plan is already saved to .orchestrator/plan.md; Claude Code reads
-        it directly. Returns the process exit code.
+        Uses dev_model. The plan is already saved to .orchestrator/plan.md;
+        Claude Code reads it directly. Returns the process exit code.
         """
         cmd = [
             "claude",
-            "--model", self.model,
+            "--model", self.dev_model,
             "--dangerously-skip-permissions",
             "Read .orchestrator/plan.md and implement the plan exactly.",
         ]
         return run_interactive(
             cmd,
-            agent_name=f"{self.name} (developer)",
+            agent_name=f"{self.name} (dev:{self.dev_model})",
             timeout=self.timeout,
             cwd=self.working_dir,
         )

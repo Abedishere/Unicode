@@ -21,8 +21,12 @@ def consolidate_plan(
     codex: BaseAgent,
     working_dir: str,
     discussion: list[dict[str, str]] | None = None,
+    memory_context: str = "",
 ) -> tuple[str, bool]:
     """Create an implementation plan. Codex drafts, Claude reviews.
+
+    *memory_context* is the shared memory string from past tasks, prepended
+    to both agents' prompts so they can leverage prior learnings.
 
     Returns (final_plan, agreed) where agreed=False means they disagree
     and a discussion round is needed.
@@ -38,6 +42,7 @@ def consolidate_plan(
 
     # Codex (GPT) drafts the plan — cheaper
     codex_prompt = (
+        f"{memory_context}"
         "You are Codex, a senior technical lead (admin). You are collaborating "
         "with Claude (another admin). A developer will implement your plan.\n"
         "You do NOT write code or create files. You may read the repo to inform your plan.\n\n"
@@ -54,6 +59,7 @@ def consolidate_plan(
 
     # Claude reviews
     claude_prompt = (
+        f"{memory_context}"
         "You are Claude, a senior technical lead (admin). You are collaborating "
         "with Codex (another admin). A developer will implement this plan.\n"
         "You do NOT write code or create files. You may read the repo to inform your review.\n\n"

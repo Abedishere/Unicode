@@ -11,15 +11,33 @@ console = Console()
 # Actions that have been approved for the entire session
 _session_approved: set[str] = set()
 
+# When True, all actions are auto-approved EXCEPT git-commit and @User questions
+_auto_all: bool = False
+
+# Actions that are NEVER auto-approved even in auto-all mode
+_ALWAYS_CONFIRM = {"git-commit"}
+
 
 def reset_session_approvals() -> None:
     """Clear all session-wide auto-approvals (called between tasks)."""
     _session_approved.clear()
 
 
+def set_auto_all(enabled: bool) -> None:
+    """Enable or disable auto-approve-all mode for the session."""
+    global _auto_all
+    _auto_all = enabled
+
+
+def is_auto_all() -> bool:
+    """Return whether auto-all mode is active."""
+    return _auto_all
+
+
 def request_approval(action: str, description: str) -> tuple[str, str | None]:
     """Ask the user for permission before proceeding with an action.
 
+    In auto-all mode, automatically approves everything except git-commit.
     Keeps asking until the user gives a definitive y/a/n answer.
     If they pick 'e' (edit), collects their instructions and loops back.
 
@@ -31,6 +49,11 @@ def request_approval(action: str, description: str) -> tuple[str, str | None]:
         ("proceed", extra)  — user approved; extra is their edit text or None
         ("deny", None)      — user denied
     """
+    # Auto-all mode: skip approval for non-critical actions
+    if _auto_all and action not in _ALWAYS_CONFIRM:
+        console.print(f"[dim]  [auto] {action}: {description[:80]}[/]")
+        return "proceed", None
+
     # Already approved for this session
     if action in _session_approved:
         return "proceed", None

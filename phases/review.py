@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 
 import click
@@ -24,6 +26,52 @@ _CHANGES_NEEDED = re.compile(
 )
 
 
+def _validate_review_with_claude(
+    claude: ClaudeAgent,
+    codex_review: str,
+    diff: str,
+    task: str,
+    plan: str,
+) -> tuple[bool, str]:
+    """Have Claude validate Codex's review comments before acting on them.
+
+    Returns (should_apply, validated_feedback). If Claude agrees the feedback
+    is valid, should_apply is True and validated_feedback contains only the
+    legitimate issues. If Claude disagrees, should_apply is False.
+    """
+    validate_prompt = (
+        "You are Claude, a senior technical lead. Codex reviewed a developer's "
+        "implementation and requested changes. Your job is to VALIDATE whether "
+        "Codex's feedback is legitimate.\n\n"
+        "RULES:\n"
+        "- Only actual bugs, logic errors, or plan deviations are valid.\n"
+        "- Requests for tests, docs, style changes, or hypothetical issues are NOT valid.\n"
+        "- If Codex is hallucinating issues that don't exist in the diff, reject them.\n"
+        "- If even ONE issue is legitimate, return VALID and list only the real issues.\n"
+        "- If ALL issues are invalid, return INVALID.\n\n"
+        f"TASK: {task}\n\n"
+        f"PLAN:\n{plan[:2000]}\n\n"
+        f"DIFF:\n```diff\n{diff[:3000]}\n```\n\n"
+        f"CODEX REVIEW:\n{codex_review}\n\n"
+        "Reply with EXACTLY one line first:\n"
+        "VALID — or — INVALID\n\n"
+        "If VALID, list only the legitimate issues as bullet points."
+    )
+
+    log_info("Claude is validating Codex's review ...")
+    try:
+        validation = claude.query(validate_prompt)
+        log_agent("Claude (review validation)", validation)
+    except RuntimeError:
+        log_info("Claude validation failed — proceeding with Codex review as-is.")
+        return True, codex_review
+
+    upper = validation.strip().upper()
+    if upper.startswith("INVALID"):
+        return False, validation
+    return True, validation
+
+
 def run_review(
     task: str,
     plan: str,
@@ -32,13 +80,17 @@ def run_review(
     working_dir: str,
     max_iterations: int,
 ) -> bool:
-    """Have Codex review Claude's implementation.
+    """Have Codex review Claude's implementation with dual-admin validation.
 
-    Max 2 iterations. If Codex doesn't clearly request changes,
-    the review is treated as approved.
+    Codex performs the primary review. If changes are requested, Claude
+    validates the feedback before applying it — preventing hallucinated
+    review comments from breaking working code.
+
+    Max iterations capped at config value. If Codex doesn't clearly request
+    changes, the review is treated as approved.
     """
     log_phase("Phase 4: Code Review")
-    max_iterations = min(max_iterations, 2)
+    max_iterations = min(max_iterations, 3)
 
     for iteration in range(1, max_iterations + 1):
         log_info(f"Review iteration {iteration}/{max_iterations}")
@@ -109,18 +161,28 @@ def run_review(
             log_success("Code review: APPROVED (max iterations)")
             return True
 
-        # Changes requested — send to Claude for fixes
-        log_info("Changes requested — sending to Claude ...")
+        # Dual-admin validation: Claude checks if Codex's feedback is legitimate
+        should_apply, validated = _validate_review_with_claude(
+            claude, review, diff, task, plan,
+        )
+
+        if not should_apply:
+            log_info("Claude rejected Codex's review — feedback was invalid.")
+            log_success("Code review: APPROVED (validated by Claude)")
+            return True
+
+        # Changes validated — send to developer for fixes
+        log_info("Changes validated — sending to developer ...")
         fix_prompt = (
             "You are the developer. The admins reviewed your work and requested changes.\n\n"
-            f"Review feedback:\n{review}\n\n"
+            f"Review feedback (validated by both admins):\n{validated}\n\n"
             f"TASK: {task}\n"
             f"PLAN:\n{plan}\n\n"
             "Fix ONLY actual bugs or logic errors. Ignore requests for tests or docs. "
             "No commentary, just fix the code."
         )
         fix_output = claude.implement(fix_prompt)
-        log_agent("Claude", fix_output)
+        log_agent("Claude (developer)", fix_output)
 
     # Should not reach here, but just in case
     log_success("Code review: APPROVED")

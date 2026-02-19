@@ -3,7 +3,26 @@ max_review_iterations: 3
 claude_model: "opus"
 codex_model: "gpt-5.3-codex"
 qwen_model: "qwen3-coder"
+dev_model: "sonnet"
 timeout_seconds: 600
 codex_timeout_seconds: 300
 auto_commit: false
 working_directory: "."
+
+# Task complexity tiers (selected at task start or via --tier)
+#   quick:    Sonnet dev, 1 review round, 1 discussion round
+#   standard: Sonnet dev, 2 review rounds, 2 discussion rounds (default)
+#   complex:  Opus dev, 3 review rounds, 4 discussion rounds
+tiers:
+  quick:
+    dev_model: "sonnet"
+    max_review_iterations: 1
+    discussion_rounds: 1
+  standard:
+    dev_model: "sonnet"
+    max_review_iterations: 2
+    discussion_rounds: 2
+  complex:
+    dev_model: "opus"
+    max_review_iterations: 3
+    discussion_rounds: 4
