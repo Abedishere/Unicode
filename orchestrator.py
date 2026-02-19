@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
 import time
 from pathlib import Path
 
@@ -124,6 +125,7 @@ def _print_banner(cfg: dict, work_dir: str) -> None:
     console.print()
     console.print(
         "[dim]Tips: Type your task or pass it as an argument. "
+        "Drag/paste image paths or use /image <path> to attach images. "
         "Press Ctrl+C twice to exit.[/]"
     )
     console.print()
@@ -241,47 +243,767 @@ def _prompt_gradient_line() -> str:
     )
 
 
-def _prompt_task() -> str:
-    """Multiline task prompt with Qwen Code-style visuals.
+# ── Image attachment and paste detection state ──
+_IMAGE_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".tiff", ".ico",
+})
+_paste_counter: int = 0
+_image_counter: int = 0
+_attached_images: list[tuple[int, str]] = []  # (image_number, absolute_path)
+_attached_pastes: list[tuple[int, list[str]]] = []  # (paste_number, lines)
 
-    Shows a dim rule above, `> ` prompt, colored underline below.
-    An empty line (double-Enter) or EOF submits the input.
-    Prints `[N lines]` indicator for long inputs.
+
+def _clean_path(text: str) -> str:
+    """Normalize a pasted/dragged file path for Windows and Unix.
+
+    Aggressively strips quotes, whitespace, control characters, and common
+    terminal drag-and-drop artefacts.
     """
+    s = text.strip()
+    # Remove control chars (can sneak in from paste/drag)
+    s = "".join(ch for ch in s if ord(ch) >= 32 or ch in ("\t",))
+    # Windows Terminal PowerShell drag: & 'path' or & "path"
+    if s.startswith("& "):
+        s = s[2:].strip()
+    # Strip surrounding quotes — try matched pairs first, then lone quotes
+    for q in ('"', "'", '`'):
+        if s.startswith(q) and s.endswith(q) and len(s) > 1:
+            s = s[1:-1]
+            break
+    else:
+        # No matched pair — strip any leading/trailing quote individually
+        s = s.strip('"').strip("'").strip('`')
+    # file:/// URI
+    if s.lower().startswith("file:///"):
+        s = s[8:]
+    return s.strip()
+
+
+def _is_image_path(text: str) -> str | None:
+    """Heuristic: does *text* look like a path to an image file?
+
+    Checks two things:
+    1. Looks like a file path (drive letter, path separators, etc.)
+    2. Ends with a known image extension.
+
+    Does **not** require the file to exist — drag-and-drop paths from
+    other machines, network drives, or recently moved files still match.
+
+    Returns the cleaned path string if it looks like an image, else None.
+    """
+    s = _clean_path(text)
+    if not s:
+        return None
+
+    # Must have an image extension
+    p = Path(s)
+    if p.suffix.lower() not in _IMAGE_EXTENSIONS:
+        return None
+
+    # Must look like a real path (not just "foo.jpg" typed as text)
+    is_path = (
+        "/" in s
+        or "\\" in s
+        or (len(s) > 2 and s[1] == ":")      # drive letter  C:\...
+        or s.startswith("~")                   # home dir
+    )
+    if not is_path:
+        return None
+
+    return s
+
+
+def _humanize_size(nbytes: int) -> str:
+    """Return a human-readable file size string."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if nbytes < 1024:
+            return f"{nbytes:.0f} {unit}" if unit == "B" else f"{nbytes:.1f} {unit}"
+        nbytes /= 1024
+    return f"{nbytes:.1f} TB"
+
+
+def _image_badge(num: int, path: str) -> str:
+    """Return a Claude Code-style image badge string for Rich."""
+    name = Path(path).name
+    try:
+        size = _humanize_size(Path(path).stat().st_size)
+    except OSError:
+        size = ""
+    size_str = f" ({size})" if size else ""
+    return f"[bold cyan on grey23] \\[Image #{num}] [/] [dim]{name}{size_str}[/]"
+
+
+def _try_attach_image(text: str) -> bool:
+    """If *text* looks like a path to an image, attach it and return True."""
+    global _image_counter
+    img_path = _is_image_path(text)
+    if img_path is None:
+        return False
+    # Try to resolve to an absolute path; if the file exists use the
+    # resolved path, otherwise keep the original cleaned path as-is.
+    p = Path(img_path).expanduser()
+    try:
+        final = str(p.resolve()) if p.exists() else img_path
+    except OSError:
+        final = img_path
+    _image_counter += 1
+    _attached_images.append((_image_counter, final))
+    return True
+
+
+def _paste_is_image_path(paste: list[str]) -> bool:
+    """Check if a multi-line paste payload is really just a drag-dropped image path.
+
+    Drag-and-drop on Windows Terminal often produces a multi-line paste with
+    trailing blank lines or PowerShell artefacts like ``& 'C:\\path\\img.png'``.
+    Collapse non-blank lines into one string and test with _try_attach_image.
+    """
+    collapsed = " ".join(line for line in paste if line.strip())
+    return _try_attach_image(collapsed)
+
+
+def _handle_image_command(cmd: str) -> None:
+    """Process ``/image <path>`` — validate and attach an image."""
+    global _image_counter
+    parts = cmd.split(maxsplit=1)
+    if len(parts) < 2:
+        console.print("[dim]Usage: /image <path>[/]")
+        return
+    raw = _clean_path(parts[1])
+    if not raw:
+        console.print("[dim red]  Empty path.[/]")
+        return
+    p = Path(raw).expanduser()
+    if p.suffix.lower() not in _IMAGE_EXTENSIONS:
+        console.print(
+            f"[dim red]  Unsupported format: {p.suffix}  "
+            f"(supported: {', '.join(sorted(_IMAGE_EXTENSIONS))})[/]"
+        )
+        return
+    try:
+        final = str(p.resolve()) if p.exists() else raw
+    except OSError:
+        final = raw
+    _image_counter += 1
+    _attached_images.append((_image_counter, final))
+    console.print(f"  {_image_badge(_image_counter, final)}")
+
+
+def _flush_stdin():
+    """Discard leftover data in stdin buffer (prevents paste leaking)."""
+    if os.name == 'nt':
+        import msvcrt
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+    else:
+        import select
+        while select.select([sys.stdin], [], [], 0)[0]:
+            sys.stdin.readline()
+
+
+def _has_stdin_data() -> bool:
+    """Return True if stdin has buffered data ready to read (non-blocking)."""
+    if os.name == "nt":
+        import msvcrt
+        return msvcrt.kbhit()
+    else:
+        import select
+        return bool(select.select([sys.stdin], [], [], 0)[0])
+
+
+def _drain_stdin_lines() -> list[str]:
+    """Read all lines currently buffered in stdin without blocking.
+
+    Uses low-level OS calls so nothing extra is printed to screen.
+    Returns the collected lines (newlines stripped).
+    """
+    buffered: list[str] = []
+    if os.name == "nt":
+        import msvcrt
+        current: list[str] = []
+        while msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ("\r", "\n"):
+                buffered.append("".join(current))
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            buffered.append("".join(current))
+    else:
+        import select
+        while select.select([sys.stdin], [], [], 0)[0]:
+            raw = sys.stdin.readline()
+            if not raw:
+                break
+            buffered.append(raw.rstrip("\n\r"))
+    return buffered
+
+
+def _erase_screen_from(saved: bool = True) -> None:
+    """Erase all terminal content from the DEC-saved cursor position onward.
+
+    If *saved* is True, uses DEC restore-cursor (\\0338) first. Then clears
+    from cursor to end of screen. Works on Windows Terminal, iTerm2, etc.
+    """
+    if saved:
+        sys.stdout.write("\0338")  # DEC restore cursor (DECRC)
+    sys.stdout.write("\033[J")     # Erase from cursor to end of screen
+    sys.stdout.flush()
+
+
+# ── Slash command definitions ──────────────────────────────────────────
+_SLASH_COMMANDS = [
+    ("/image <path>", "Attach an image file"),
+    ("/clear", "Remove all attachments"),
+    ("/clear-images", "Remove attached images only"),
+    ("/clear-paste", "Remove pasted text only"),
+]
+
+
+def _clear_below_cursor(n: int) -> None:
+    """Clear *n* lines below the cursor (menu area) using SCO save/restore."""
+    if n <= 0:
+        return
+    sys.stdout.write("\033[s")  # SCO save cursor
+    for _ in range(n):
+        sys.stdout.write("\n\033[2K")
+    sys.stdout.write("\033[u")  # SCO restore cursor
+    sys.stdout.flush()
+
+
+def _render_slash_menu(typed: str, prev_n: int) -> int:
+    """Show/update the slash-command picker below the cursor.
+
+    Returns the number of terminal lines used by the menu (0 if hidden).
+    Uses SCO save/restore so it doesn't interfere with the DEC pair used
+    by the outer prompt area.
+    """
+    if prev_n:
+        _clear_below_cursor(prev_n)
+
+    # Match against the command keyword only (before any space/arg)
+    base = typed.split()[0] if typed.split() else typed
+    matches = [(c, d) for c, d in _SLASH_COMMANDS if c.split()[0].startswith(base)]
+    if not matches:
+        return 0
+
+    sys.stdout.write("\033[s")   # SCO save cursor
+    sys.stdout.write("\n")       # blank line gap
+    for cmd, desc in matches:
+        sys.stdout.write(f"  \033[1;35m{cmd:<22}\033[0m \033[2m{desc}\033[0m\n")
+    sys.stdout.write("\033[u")   # SCO restore cursor
+    sys.stdout.flush()
+    return len(matches) + 1      # +1 for the blank-line gap
+
+
+# ── Attachment selection-mode rendering ────────────────────────────────
+
+def _attachment_count() -> int:
+    """Total number of pending attachments (pastes + images)."""
+    return len(_attached_pastes) + len(_attached_images)
+
+
+def _redraw_prompt_area(selected: int = -1) -> None:
+    """Erase & redraw the full prompt area from the DEC-saved position.
+
+    Parameters
+    ----------
+    selected : int
+        Index into the combined attachment list to highlight.
+        -1 means no selection (normal display).
+    """
+    # Restore DEC cursor → clear everything below → re-save at same spot.
+    sys.stdout.write("\0338\033[J\0337")
+    sys.stdout.flush()
+
+    console.rule(style="bright_black")
+
+    total = _attachment_count()
+    idx = 0
+
+    for num, plines in _attached_pastes:
+        badge = f"\\[Pasted text #{num} +{len(plines)} lines]"
+        if idx == selected:
+            console.print(f"  [bold white on red] {badge} [/]")
+        else:
+            console.print(f"  [bold cyan on grey23] {badge} [/]")
+        idx += 1
+
+    for num, img_path in _attached_images:
+        name = Path(img_path).name
+        try:
+            size = _humanize_size(Path(img_path).stat().st_size)
+        except OSError:
+            size = "?"
+        if idx == selected:
+            console.print(
+                f"  [bold white on red] \\[Image #{num}] [/]"
+                f" [dim]{name} ({size})[/]"
+            )
+        else:
+            console.print(f"  {_image_badge(num, img_path)}")
+        idx += 1
+
+    # Hint on the last attachment line (only in normal mode)
+    if total > 0 and selected == -1:
+        # Move cursor up to end of last attachment line, append hint
+        sys.stdout.write(f"\033[A\033[999C")  # up 1, end of line
+        sys.stdout.write(" \033[2m(↑ to select)\033[0m")
+        sys.stdout.write("\n")  # back down
+        sys.stdout.flush()
+
+    # Print prompt prefix
+    sys.stdout.write("\033[1;35m> \033[0m")
+    sys.stdout.flush()
+
+
+def _run_selection_mode() -> None:
+    """Enter attachment selection mode (called from ``_prompt_line_raw``).
+
+    ↑/↓ or ←/→ navigate, Backspace deletes selected, Escape/Enter exits.
+    Redraws the prompt area after every action.
+    """
+    import msvcrt
+
+    total = _attachment_count()
+    if total == 0:
+        return
+
+    sel = total - 1  # start at last attachment
+    _redraw_prompt_area(selected=sel)
+
+    while True:
+        ch = msvcrt.getwch()
+
+        if ch in ("\x00", "\xe0"):
+            ch2 = msvcrt.getwch()
+            if ch2 == "K":      # Left
+                sel = max(0, sel - 1)
+                _redraw_prompt_area(selected=sel)
+            elif ch2 == "M":    # Right
+                sel = min(total - 1, sel + 1)
+                _redraw_prompt_area(selected=sel)
+            elif ch2 == "H":    # Up — move left (wraps to intent)
+                sel = max(0, sel - 1)
+                _redraw_prompt_area(selected=sel)
+            elif ch2 == "P":    # Down — exit selection
+                _redraw_prompt_area(selected=-1)
+                return
+            continue
+
+        if ch == "\x08":  # Backspace — delete selected attachment
+            if sel < len(_attached_pastes):
+                _attached_pastes.pop(sel)
+            else:
+                _attached_images.pop(sel - len(_attached_pastes))
+
+            total = _attachment_count()
+            if total == 0:
+                _redraw_prompt_area(selected=-1)
+                return
+            sel = min(sel, total - 1)
+            _redraw_prompt_area(selected=sel)
+            continue
+
+        if ch in ("\x1b", "\r", "\n"):  # Escape or Enter — exit
+            _redraw_prompt_area(selected=-1)
+            return
+
+        if ch == "\x03":  # Ctrl+C — exit
+            _redraw_prompt_area(selected=-1)
+            return
+
+
+# ── Raw single-line input (Windows) ───────────────────────────────────
+
+def _line_redraw_tail(buf: list[str], cursor: int) -> None:
+    """Rewrite everything from *cursor* to end-of-buffer, clear one extra
+    character (to erase a deleted char), then move the terminal cursor
+    back to *cursor*."""
+    tail = "".join(buf[cursor:])
+    sys.stdout.write(tail + " ")            # overwrite + clear one
+    move_back = len(buf) - cursor + 1
+    if move_back > 0:
+        sys.stdout.write(f"\033[{move_back}D")  # return to cursor pos
+    sys.stdout.flush()
+
+
+def _prompt_line_raw(prompt_ansi: str, primary: bool = False):
+    """Read one line using raw keypresses (Windows ``msvcrt``).
+
+    Supports full cursor movement (←/→, Home, End, Delete) so the prompt
+    feels like a normal shell.  When *primary* is True the slash-command
+    menu and ↑-to-select attachment mode are enabled.
+
+    Returns
+    -------
+    (text, paste_lines, action)
+        *text*        – the typed string.
+        *paste_lines* – ``list[str]`` of **all** pasted lines when a
+                        multi-line paste is detected, otherwise ``None``.
+        *action*      – ``'submit'`` | ``'ctrl-c'``.
+    """
+    import msvcrt
+
+    sys.stdout.write(prompt_ansi)
+    sys.stdout.flush()
+
+    buf: list[str] = []
+    cursor = 0                # position inside buf
+    menu_n = 0                # slash-menu lines currently displayed
+
+    while True:
+        ch = msvcrt.getwch()
+
+        # ── Enter ─────────────────────────────────────────────────
+        if ch in ("\r", "\n"):
+            if menu_n:
+                _clear_below_cursor(menu_n)
+                menu_n = 0
+            sys.stdout.write("\r\n")
+            sys.stdout.flush()
+
+            text = "".join(buf)
+
+            # Paste detection: any data left in the buffer after Enter?
+            time.sleep(0.03)
+            if msvcrt.kbhit():
+                all_lines = [text]
+                current: list[str] = []
+                while msvcrt.kbhit():
+                    c = msvcrt.getwch()
+                    if c in ("\r", "\n"):
+                        all_lines.append("".join(current))
+                        current = []
+                    else:
+                        current.append(c)
+                if current:
+                    all_lines.append("".join(current))
+                while all_lines and not all_lines[-1].strip():
+                    all_lines.pop()
+                return (text, all_lines, "submit")
+
+            return (text, None, "submit")
+
+        # ── Ctrl+C ────────────────────────────────────────────────
+        if ch == "\x03":
+            if menu_n:
+                _clear_below_cursor(menu_n)
+            sys.stdout.write("\r\n")
+            sys.stdout.flush()
+            return ("", None, "ctrl-c")
+
+        # ── Backspace ─────────────────────────────────────────────
+        if ch == "\x08":
+            if cursor > 0:
+                buf.pop(cursor - 1)
+                cursor -= 1
+                sys.stdout.write("\033[D")          # move left 1
+                _line_redraw_tail(buf, cursor)
+                if primary:
+                    text = "".join(buf)
+                    if text.startswith("/"):
+                        menu_n = _render_slash_menu(text, menu_n)
+                    elif menu_n:
+                        _clear_below_cursor(menu_n)
+                        menu_n = 0
+            continue
+
+        # ── Special keys (arrows, Home, End, Delete) ──────────────
+        if ch in ("\x00", "\xe0"):
+            ch2 = msvcrt.getwch()
+
+            if ch2 == "K":          # ← Left
+                if cursor > 0:
+                    cursor -= 1
+                    sys.stdout.write("\033[D")
+                    sys.stdout.flush()
+
+            elif ch2 == "M":        # → Right
+                if cursor < len(buf):
+                    cursor += 1
+                    sys.stdout.write("\033[C")
+                    sys.stdout.flush()
+
+            elif ch2 == "H":        # ↑ Up
+                if primary and not buf and _attachment_count() > 0:
+                    if menu_n:
+                        _clear_below_cursor(menu_n)
+                        menu_n = 0
+                    _run_selection_mode()
+                    # selection mode redraws with `> ` — keep reading
+                # else: no-op (no history implemented)
+
+            elif ch2 == "P":        # ↓ Down
+                pass                # no-op
+
+            elif ch2 == "G":        # Home
+                if cursor > 0:
+                    sys.stdout.write(f"\033[{cursor}D")
+                    cursor = 0
+                    sys.stdout.flush()
+
+            elif ch2 == "O":        # End
+                if cursor < len(buf):
+                    sys.stdout.write(f"\033[{len(buf) - cursor}C")
+                    cursor = len(buf)
+                    sys.stdout.flush()
+
+            elif ch2 == "S":        # Delete
+                if cursor < len(buf):
+                    buf.pop(cursor)
+                    _line_redraw_tail(buf, cursor)
+
+            continue
+
+        # ── Tab (autocomplete slash command) ──────────────────────
+        if ch == "\t":
+            if primary and buf:
+                text = "".join(buf)
+                base = text.split()[0] if text.split() else text
+                if base.startswith("/"):
+                    hits = [c.split()[0] for c, _ in _SLASH_COMMANDS
+                            if c.split()[0].startswith(base)]
+                    if len(hits) == 1:
+                        comp = hits[0][len(base):]
+                        if comp:
+                            extra = comp + " "
+                            for c in extra:
+                                buf.insert(cursor, c)
+                                cursor += 1
+                            sys.stdout.write(extra)
+                            sys.stdout.flush()
+                            menu_n = _render_slash_menu("".join(buf), menu_n)
+            continue
+
+        # ── Escape ────────────────────────────────────────────────
+        if ch == "\x1b":
+            if menu_n:
+                _clear_below_cursor(menu_n)
+                menu_n = 0
+            continue
+
+        # ── Regular printable character ───────────────────────────
+        if ord(ch) < 32:
+            continue
+
+        buf.insert(cursor, ch)
+        cursor += 1
+        # Write new char + everything after, then reposition cursor
+        sys.stdout.write(ch + "".join(buf[cursor:]))
+        if cursor < len(buf):
+            sys.stdout.write(f"\033[{len(buf) - cursor}D")
+        sys.stdout.flush()
+
+        if primary:
+            text = "".join(buf)
+            if text.startswith("/"):
+                menu_n = _render_slash_menu(text, menu_n)
+            elif menu_n:
+                _clear_below_cursor(menu_n)
+                menu_n = 0
+
+
+# ── Fallback single-line input (non-Windows) ──────────────────────────
+
+def _prompt_line_fallback(prompt_markup: str):
+    """Read one line with ``console.input`` (no special key handling)."""
+    try:
+        text = console.input(prompt_markup)
+    except EOFError:
+        return ("", None, "submit")
+
+    stripped = text.strip()
+    time.sleep(0.05)
+    if _has_stdin_data():
+        remaining = _drain_stdin_lines()
+        return (text, [text] + remaining, "submit")
+    return (text, None, "submit")
+
+
+# ── Full prompt ───────────────────────────────────────────────────────
+
+def _prompt_task() -> str:
+    """Multiline task prompt.
+
+    * Pasted text collapses into a ``[Pasted text #N +M lines]`` badge and
+      is stored as an attachment — the prompt loops back so the user can
+      type instructions that reference the paste.
+    * ``/image <path>`` or drag-and-drop attaches images.
+    * ↑ on empty prompt enters **selection mode**: ←/→ to navigate
+      attachments, Backspace to delete the selected one, Esc/Enter to exit.
+    * Typing ``/`` shows an interactive slash-command picker with Tab
+      completion.
+    * Manually typed multi-line input: empty line (double-Enter) submits.
+    """
+    global _paste_counter
+
+    use_raw = os.name == "nt"
+
     while True:
         lines: list[str] = []
+
+        # ── Save cursor before the entire prompt area ────────────
+        # (used by selection mode / paste erase to redraw cleanly)
+        sys.stdout.write("\0337")  # DEC save cursor (DECSC)
+        sys.stdout.flush()
+
         # Dim horizontal rule above prompt
         console.rule(style="bright_black")
+
+        # Show pending attachments with hint
+        has_attachments = _attachment_count() > 0
+        idx = 0
+        total_att = _attachment_count()
+        for num, plines in _attached_pastes:
+            badge = f"\\[Pasted text #{num} +{len(plines)} lines]"
+            hint = " [dim](↑ to select)[/]" if idx == total_att - 1 else ""
+            console.print(
+                f"  [bold cyan on grey23] {badge} [/]{hint}"
+            )
+            idx += 1
+        for num, img_path in _attached_images:
+            hint = " [dim](↑ to select)[/]" if idx == total_att - 1 else ""
+            console.print(f"  {_image_badge(num, img_path)}{hint}")
+            idx += 1
+
         try:
-            # First line with bold magenta `> ` prompt
-            first = console.input("[bold magenta]> [/]")
-            if first.strip():
-                lines.append(first)
+            # ── Read first line ──────────────────────────────────
+            if use_raw:
+                text, paste, action = _prompt_line_raw(
+                    "\033[1;35m> \033[0m", primary=True,
+                )
             else:
-                console.print("[dim]Please enter a task.[/]")
+                text, paste, action = _prompt_line_fallback(
+                    "[bold magenta]> [/]",
+                )
+
+            if action == "ctrl-c":
+                # Forward to the double-press Ctrl+C handler directly
+                # (signal.SIGINT doesn't fire when msvcrt eats \x03).
+                _sigint_handler(None, None)
                 continue
 
-            # Continuation lines with dim `... ` prefix
+            stripped = text.strip()
+
+            # ── Slash commands ────────────────────────────────────
+            if stripped.lower().startswith("/image"):
+                _handle_image_command(stripped)
+                continue
+            if stripped.lower() in ("/clear-images", "/clear-paste", "/clear"):
+                if stripped.lower() in ("/clear-images", "/clear"):
+                    _attached_images.clear()
+                if stripped.lower() in ("/clear-paste", "/clear"):
+                    _attached_pastes.clear()
+                console.print("[dim]  Attachments cleared.[/]")
+                continue
+
+            # ── Auto-detect image path ────────────────────────────
+            # Pure heuristic: looks like a path + has image extension.
+            # Works for typed text AND single-line pastes.
+            if _try_attach_image(stripped):
+                _erase_screen_from(saved=True)
+                continue
+
+            # ── Paste detected ────────────────────────────────────
+            if paste:
+                # Multi-line drag-drop image path (e.g. & 'C:\...\img.png'\n)
+                if _paste_is_image_path(paste):
+                    _erase_screen_from(saved=True)
+                    continue
+                # Single-line paste that is an image path was already
+                # caught above.  Multi-line or non-image → attach as text.
+                _paste_counter += 1
+                _attached_pastes.append((_paste_counter, paste))
+                _erase_screen_from(saved=True)
+                continue  # loop back — user types instructions next
+
+            if not stripped:
+                if _attached_pastes or _attached_images:
+                    pass  # submit with just attachments
+                else:
+                    console.print("[dim]Please enter a task.[/]")
+                    continue
+
+            if stripped:
+                lines.append(text)
+
+            # ── Continuation lines (manual multiline) ────────────
             while True:
-                cont = console.input("[dim]... [/]")
-                if not cont.strip():
+                if use_raw:
+                    cont, cpaste, cact = _prompt_line_raw(
+                        "\033[2m... \033[0m", primary=False,
+                    )
+                else:
+                    cont, cpaste, cact = _prompt_line_fallback(
+                        "[dim]... [/]",
+                    )
+                if cact == "ctrl-c":
+                    _sigint_handler(None, None)
+                    break
+
+                cont_stripped = cont.strip()
+
+                # Slash commands / images in continuation
+                if cont_stripped.lower().startswith("/image"):
+                    _handle_image_command(cont_stripped)
+                    continue
+                if _try_attach_image(cont_stripped):
+                    continue
+
+                # Paste on continuation line → attach it
+                if cpaste:
+                    # Multi-line drag-drop image path
+                    if _paste_is_image_path(cpaste):
+                        continue
+                    _paste_counter += 1
+                    _attached_pastes.append((_paste_counter, cpaste))
+                    console.print(
+                        f"  [bold cyan on grey23]"
+                        f" \\[Pasted text #{_paste_counter}"
+                        f" +{len(cpaste)} lines] [/]"
+                    )
+                    continue
+
+                # Empty line → submit
+                if not cont_stripped:
                     break
                 lines.append(cont)
 
-        except EOFError:
-            if not lines:
+        except (EOFError, KeyboardInterrupt):
+            if not lines and not _attached_pastes and not _attached_images:
                 continue
 
         task = "\n".join(lines).strip()
-        if not task:
+        if not task and not _attached_pastes and not _attached_images:
             console.print("[dim]Please enter a task.[/]")
             continue
 
         # Colored gradient underline after submission
         console.print(_prompt_gradient_line())
 
-        if len(lines) > 3:
-            console.print(f"[dim]  [{len(lines)} lines][/]")
+        # Prepend pasted text attachments
+        if _attached_pastes:
+            for num, plines in _attached_pastes:
+                paste_block = "\n".join(plines)
+                task = (
+                    f"[Pasted text #{num} — {len(plines)} lines]:\n"
+                    f"{paste_block}\n\n{task}"
+                )
+            _attached_pastes.clear()
+
+        # Prepend image attachments
+        if _attached_images:
+            img_lines = "\n".join(
+                f"[Attached image #{num}: {path}]" for num, path in _attached_images
+            )
+            task = (
+                f"{img_lines}\n"
+                f"(Use the Read tool to view the attached images above.)\n\n"
+                f"{task}"
+            )
+            _attached_images.clear()
 
         return task
 
@@ -585,6 +1307,7 @@ def main(
             else:
                 console.print()
                 current_task = _prompt_task()
+                _flush_stdin()  # discard leftover paste data
 
             _run_task(current_task, cfg, work_dir, claude, codex, qwen, phase)
 

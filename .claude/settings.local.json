@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "WebSearch",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(grep:*)",
+      "Bash(python3:*)",
+      "WebFetch(domain:rich.readthedocs.io)",
+      "Bash(pip show:*)",
+      "Bash(echo:*)",
+      "Bash(CLAUDECODE= claude --help)"
+    ]
+  }
+}
