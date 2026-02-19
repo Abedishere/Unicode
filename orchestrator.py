@@ -461,40 +461,58 @@ _SLASH_COMMANDS = [
 ]
 
 
-def _clear_below_cursor(n: int) -> None:
-    """Clear *n* lines below the cursor (menu area) using SCO save/restore."""
+def _clear_below_cursor(n: int, restore_col: int = 0) -> None:
+    """Erase everything below the prompt line and return the cursor.
+
+    Uses ``\\r\\n`` to reach column 1 of the next line, then ``\\033[J``
+    (erase-from-cursor-to-end-of-display) to nuke all content below.
+    ``\\033[A`` returns to the prompt line; *restore_col* repositions
+    horizontally.  *n* only needs to be > 0 to trigger the erase.
+    """
     if n <= 0:
         return
-    sys.stdout.write("\033[s")  # SCO save cursor
-    for _ in range(n):
-        sys.stdout.write("\n\033[2K")
-    sys.stdout.write("\033[u")  # SCO restore cursor
+    sys.stdout.write("\r\n\033[J")  # col 1 of next line, erase to end
+    sys.stdout.write("\033[A")      # back up to prompt line
+    if restore_col > 0:
+        sys.stdout.write(f"\033[{restore_col}G")
     sys.stdout.flush()
 
 
-def _render_slash_menu(typed: str, prev_n: int) -> int:
-    """Show/update the slash-command picker below the cursor.
+def _render_slash_menu(typed: str, prev_n: int, restore_col: int = 0) -> int:
+    """Show the slash-command picker below the prompt line.
 
-    Returns the number of terminal lines used by the menu (0 if hidden).
-    Uses SCO save/restore so it doesn't interfere with the DEC pair used
-    by the outer prompt area.
+    Returns a positive count if a menu was drawn (for *prev_n* tracking),
+    0 if nothing matched.  Always erases below the cursor first via
+    ``\\033[J``, so stale lines can never accumulate.
     """
-    if prev_n:
-        _clear_below_cursor(prev_n)
-
     # Match against the command keyword only (before any space/arg)
     base = typed.split()[0] if typed.split() else typed
     matches = [(c, d) for c, d in _SLASH_COMMANDS if c.split()[0].startswith(base)]
+
+    # ── Nuke everything below the prompt line ────────────────────
+    sys.stdout.write("\r\n\033[J\033[A")     # down, erase-to-end, back up
+
     if not matches:
+        if restore_col > 0:
+            sys.stdout.write(f"\033[{restore_col}G")
+        sys.stdout.flush()
         return 0
 
-    sys.stdout.write("\033[s")   # SCO save cursor
-    sys.stdout.write("\n")       # blank line gap
+    # ── Draw menu: blank gap + match lines ───────────────────────
+    # We'll count newlines so we know exactly how many rows to go back.
+    rows_down = 0
+    sys.stdout.write("\r\n")                 # blank gap line
+    rows_down += 1
     for cmd, desc in matches:
-        sys.stdout.write(f"  \033[1;35m{cmd:<22}\033[0m \033[2m{desc}\033[0m\n")
-    sys.stdout.write("\033[u")   # SCO restore cursor
+        sys.stdout.write(f"\r\n  \033[1;35m{cmd:<22}\033[0m \033[2m{desc}\033[0m")
+        rows_down += 1
+
+    # ── Return to prompt line ────────────────────────────────────
+    sys.stdout.write(f"\033[{rows_down}A")
+    if restore_col > 0:
+        sys.stdout.write(f"\033[{restore_col}G")
     sys.stdout.flush()
-    return len(matches) + 1      # +1 for the blank-line gap
+    return rows_down                          # > 0 signals "menu visible"
 
 
 # ── Attachment selection-mode rendering ────────────────────────────────
@@ -659,7 +677,7 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False):
         # ── Enter ─────────────────────────────────────────────────
         if ch in ("\r", "\n"):
             if menu_n:
-                _clear_below_cursor(menu_n)
+                _clear_below_cursor(menu_n, 0)
                 menu_n = 0
             sys.stdout.write("\r\n")
             sys.stdout.flush()
@@ -689,7 +707,7 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False):
         # ── Ctrl+C ────────────────────────────────────────────────
         if ch == "\x03":
             if menu_n:
-                _clear_below_cursor(menu_n)
+                _clear_below_cursor(menu_n, 0)
             sys.stdout.write("\r\n")
             sys.stdout.flush()
             return ("", None, "ctrl-c")
@@ -703,10 +721,11 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False):
                 _line_redraw_tail(buf, cursor)
                 if primary:
                     text = "".join(buf)
+                    col = cursor + 3
                     if text.startswith("/"):
-                        menu_n = _render_slash_menu(text, menu_n)
+                        menu_n = _render_slash_menu(text, menu_n, col)
                     elif menu_n:
-                        _clear_below_cursor(menu_n)
+                        _clear_below_cursor(menu_n, col)
                         menu_n = 0
             continue
 
@@ -729,7 +748,7 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False):
             elif ch2 == "H":        # ↑ Up
                 if primary and not buf and _attachment_count() > 0:
                     if menu_n:
-                        _clear_below_cursor(menu_n)
+                        _clear_below_cursor(menu_n, 3)
                         menu_n = 0
                     _run_selection_mode()
                     # selection mode redraws with `> ` — keep reading
@@ -774,13 +793,13 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False):
                                 cursor += 1
                             sys.stdout.write(extra)
                             sys.stdout.flush()
-                            menu_n = _render_slash_menu("".join(buf), menu_n)
+                            menu_n = _render_slash_menu("".join(buf), menu_n, cursor + 3)
             continue
 
         # ── Escape ────────────────────────────────────────────────
         if ch == "\x1b":
             if menu_n:
-                _clear_below_cursor(menu_n)
+                _clear_below_cursor(menu_n, cursor + 3)
                 menu_n = 0
             continue
 
@@ -796,12 +815,47 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False):
             sys.stdout.write(f"\033[{len(buf) - cursor}D")
         sys.stdout.flush()
 
+        # ── Paste / drag-and-drop burst detection ─────────────────
+        # When more characters are immediately available the input
+        # is a paste or drag-and-drop, not manual typing.  Collect
+        # the entire burst, then check whether the result is an
+        # image path and, if so, auto-submit without requiring Enter.
+        if primary and msvcrt.kbhit():
+            time.sleep(0.025)           # let the burst fully arrive
+            got_enter = False
+            while msvcrt.kbhit():
+                c = msvcrt.getwch()
+                if c in ("\r", "\n"):
+                    got_enter = True    # Enter came with the paste
+                elif ord(c) >= 32:
+                    buf.insert(cursor, c)
+                    cursor += 1
+            # Repaint the whole prompt line cleanly
+            sys.stdout.write(f"\r{prompt_ansi}{''.join(buf)}\033[K")
+            sys.stdout.flush()
+            candidate = "".join(buf)
+            # Auto-submit if the pasted content is an image path
+            if _is_image_path(candidate):
+                if menu_n:
+                    _clear_below_cursor(menu_n, 0)
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                return (candidate, None, "submit")
+            # Enter arrived inside the paste — submit as normal line
+            if got_enter:
+                if menu_n:
+                    _clear_below_cursor(menu_n, 0)
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                return (candidate, None, "submit")
+
         if primary:
             text = "".join(buf)
+            col = cursor + 3
             if text.startswith("/"):
-                menu_n = _render_slash_menu(text, menu_n)
+                menu_n = _render_slash_menu(text, menu_n, col)
             elif menu_n:
-                _clear_below_cursor(menu_n)
+                _clear_below_cursor(menu_n, col)
                 menu_n = 0
 
 
