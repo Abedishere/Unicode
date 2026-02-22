@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.png" alt="Unicode" width="600"/>
+</p>
+
 # Unicode — AI Agent Orchestrator
 
 Multi-agent orchestrator that coordinates **Claude Code**, **Codex CLI**, and **Qwen CLI** to collaboratively plan, implement, and review code — with persistent memory, structured project notes, and an extensible skills ecosystem.
