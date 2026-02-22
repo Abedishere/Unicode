@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png?v=2" alt="Unicode" width="800"/>
+  <img src="assets/newbanner.png?v=2" alt="Unicode" width="800"/>
 </p>
 
 # Unicode — AI Agent Orchestrator
