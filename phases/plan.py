@@ -22,6 +22,7 @@ def consolidate_plan(
     working_dir: str,
     discussion: list[dict[str, str]] | None = None,
     memory_context: str = "",
+    final: bool = False,
 ) -> tuple[str, bool]:
     """Create an implementation plan. Codex drafts, Claude reviews.
 
@@ -99,12 +100,14 @@ def consolidate_plan(
     if len(final_plan) < len(plan_draft) // 2:
         final_plan = plan_draft
 
-    # Save internal plan
-    plan_dir = Path(working_dir) / ".orchestrator"
-    plan_dir.mkdir(parents=True, exist_ok=True)
-    plan_path = plan_dir / "plan.md"
-    plan_path.write_text(final_plan, encoding="utf-8")
-    log_info(f"Internal plan saved to {plan_path}")
+    # Save internal plan — only when agreed or this is the final re-plan call.
+    # Avoids writing a disagreed draft before discussion resolves the plan.
+    if agreed or final:
+        plan_dir = Path(working_dir) / ".orchestrator"
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        plan_path = plan_dir / "plan.md"
+        plan_path.write_text(final_plan, encoding="utf-8")
+        log_info(f"Internal plan saved to {plan_path}")
 
     if agreed:
         log_info("Both admins agree on the plan.")

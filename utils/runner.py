@@ -1,13 +1,15 @@
-"""Subprocess runner with live spinner, elapsed time, and ESC-to-cancel."""
+"""Subprocess runner with live spinner, ESC-to-pause, and process tree management."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 import time
 
 import click
 import msvcrt
+import psutil
 from rich.console import Console
 from rich.live import Live
 from rich.spinner import Spinner
@@ -17,11 +19,87 @@ console = Console()
 
 
 class CancelledByUser(Exception):
-    """Raised when the user presses ESC to cancel the current operation."""
+    """Raised when the user presses ESC and then chooses to kill."""
 
 
 class TimeoutSkipToReview(Exception):
     """Raised when the user chooses to skip to review after a timeout."""
+
+
+# ── Process tree helpers ────────────────────────────────────────────
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill a subprocess and its entire child tree.
+
+    On Windows with ``shell=True``, ``proc.terminate()`` only kills the
+    ``cmd.exe`` wrapper, leaving the actual CLI process (claude, codex,
+    qwen) alive.  This helper uses *psutil* to find every descendant and
+    kill them all, then falls back to ``taskkill /T /F`` if needed.
+    """
+    try:
+        parent = psutil.Process(proc.pid)
+        children = parent.children(recursive=True)
+        for child in children:
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
+        try:
+            parent.kill()
+            parent.wait(timeout=5)
+        except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+            pass
+    except psutil.NoSuchProcess:
+        pass
+    except Exception:
+        # Fallback: Windows taskkill with tree flag
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except Exception:
+            try:
+                os.kill(proc.pid, 9)
+            except OSError:
+                pass
+
+
+def _suspend_tree(proc: subprocess.Popen) -> None:
+    """Suspend (freeze) a subprocess and its entire child tree.
+
+    When suspended the process consumes zero CPU and makes no API calls.
+    """
+    try:
+        parent = psutil.Process(proc.pid)
+        for child in parent.children(recursive=True):
+            try:
+                child.suspend()
+            except psutil.NoSuchProcess:
+                pass
+        parent.suspend()
+    except psutil.NoSuchProcess:
+        pass
+
+
+def _resume_tree(proc: subprocess.Popen) -> None:
+    """Resume a previously suspended subprocess and its children."""
+    try:
+        parent = psutil.Process(proc.pid)
+        parent.resume()
+        for child in parent.children(recursive=True):
+            try:
+                child.resume()
+            except psutil.NoSuchProcess:
+                pass
+    except psutil.NoSuchProcess:
+        pass
+
+
+# ── CLI runner (piped I/O, spinner) ─────────────────────────────────
 
 
 def run_cli(
@@ -30,14 +108,20 @@ def run_cli(
     input_text: str | None = None,
     timeout: int = 600,
     cwd: str | None = None,
+    env: dict | None = None,
 ) -> tuple[str, str]:
-    """Run a CLI subprocess with a live spinner and ESC-to-cancel.
+    """Run a CLI subprocess with a live spinner and ESC-to-pause.
 
-    Shows: [spinner] Claude thinking... (1m 23s) — press ESC to cancel
+    Shows: [spinner] Claude thinking... (1m 23s) — press ESC to pause
+
+    On ESC the process tree is *suspended* (frozen, not killed) and the
+    user is prompted to **resume** or **kill**.  Only "kill" raises
+    ``CancelledByUser``; "resume" continues seamlessly.
 
     Returns (stdout, stderr).
-    Raises CancelledByUser if the user presses ESC.
-    Raises RuntimeError on non-zero exit code.
+    Raises CancelledByUser  if the user chooses to kill.
+    Raises TimeoutSkipToReview  if the user chooses "skip" on timeout.
+    Raises TimeoutError  if the user chooses "kill" on timeout.
     """
     cancelled = threading.Event()
     stdout_result = ""
@@ -73,6 +157,7 @@ def run_cli(
         encoding="utf-8",
         shell=True,
         cwd=cwd,
+        env=env,
     )
 
     # Use communicate() in a thread to avoid deadlocks from full pipe buffers
@@ -98,15 +183,43 @@ def run_cli(
     try:
         with Live(console=console, refresh_per_second=4, transient=True) as live:
             while not communicate_done.is_set():
+                # ── ESC pressed: suspend and prompt ──
                 if cancelled.is_set():
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    raise CancelledByUser(
-                        f"{agent_name} operation cancelled by user (ESC)"
+                    _suspend_tree(proc)
+                    live.stop()
+
+                    console.print()
+                    console.print(
+                        f"[bold yellow]⏸  Paused:[/] {agent_name}  "
+                        f"[dim](subprocess frozen — not consuming tokens)[/]"
                     )
+                    console.print()
+
+                    choice = click.prompt(
+                        click.style("What now?", fg="yellow", bold=True),
+                        type=click.Choice(
+                            ["resume", "kill"],
+                            case_sensitive=False,
+                        ),
+                        default="resume",
+                    )
+
+                    if choice == "resume":
+                        console.print(f"[dim]Resuming {agent_name} ...[/]")
+                        _resume_tree(proc)
+                        # Reset for another ESC press
+                        cancelled.clear()
+                        esc_thread = threading.Thread(
+                            target=_watch_esc, daemon=True
+                        )
+                        esc_thread.start()
+                        live.start()
+                        continue
+                    else:  # kill
+                        _kill_tree(proc)
+                        raise CancelledByUser(
+                            f"{agent_name} operation killed by user (ESC)"
+                        )
 
                 elapsed = time.time() - start
                 mins, secs = divmod(int(elapsed), 60)
@@ -118,7 +231,7 @@ def run_cli(
                     (f"({time_str})", "dim"),
                     " — press ",
                     ("ESC", "bold yellow"),
-                    " to cancel",
+                    " to pause",
                 )
                 live.update(Spinner("dots", text=spinner_text))
 
@@ -126,10 +239,13 @@ def run_cli(
                 if elapsed > timeout:
                     live.stop()
                     mins_t, secs_t = divmod(int(timeout), 60)
-                    timeout_str = f"{mins_t}m {secs_t:02d}s" if mins_t else f"{secs_t}s"
+                    timeout_str = (
+                        f"{mins_t}m {secs_t:02d}s" if mins_t else f"{secs_t}s"
+                    )
                     console.print()
                     console.print(
-                        f"[bold yellow]⏱  {agent_name} timed out after {timeout_str}.[/]"
+                        f"[bold yellow]⏱  {agent_name} timed out "
+                        f"after {timeout_str}.[/]"
                     )
                     choice = click.prompt(
                         click.style("What now?", fg="yellow", bold=True),
@@ -140,26 +256,21 @@ def run_cli(
                         default="continue",
                     )
                     if choice == "continue":
-                        # Extend the deadline by the original timeout duration
                         timeout += original_timeout
-                        console.print(f"[dim]Extended timeout — resuming {agent_name} ...[/]")
+                        console.print(
+                            f"[dim]Extended timeout — resuming "
+                            f"{agent_name} ...[/]"
+                        )
                         live.start()
                         continue
                     elif choice == "skip":
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
+                        _kill_tree(proc)
                         raise TimeoutSkipToReview(
-                            f"{agent_name} timed out — user chose to skip to review"
+                            f"{agent_name} timed out — user chose to "
+                            f"skip to review"
                         )
                     else:  # kill
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
+                        _kill_tree(proc)
                         raise TimeoutError(
                             f"{agent_name} timed out after {timeout_str}"
                         )
@@ -175,6 +286,9 @@ def run_cli(
     console.print(f"  [dim]{agent_name} finished in {time_str}[/]")
 
     return stdout_result, stderr_result
+
+
+# ── Interactive runner (inherited stdio, no capture) ────────────────
 
 
 def run_interactive(
@@ -220,10 +334,13 @@ def run_interactive(
         elapsed = time.time() - start
         if elapsed > timeout:
             mins_t, secs_t = divmod(int(timeout), 60)
-            timeout_str = f"{mins_t}m {secs_t:02d}s" if mins_t else f"{secs_t}s"
+            timeout_str = (
+                f"{mins_t}m {secs_t:02d}s" if mins_t else f"{secs_t}s"
+            )
             console.print()
             console.print(
-                f"[bold yellow]⏱  {agent_name} timed out after {timeout_str}.[/]"
+                f"[bold yellow]⏱  {agent_name} timed out "
+                f"after {timeout_str}.[/]"
             )
             choice = click.prompt(
                 click.style("What now?", fg="yellow", bold=True),
@@ -235,23 +352,17 @@ def run_interactive(
             )
             if choice == "continue":
                 timeout += original_timeout
-                console.print(f"[dim]Extended timeout — resuming {agent_name} ...[/]")
+                console.print(
+                    f"[dim]Extended timeout — resuming {agent_name} ...[/]"
+                )
                 continue
             elif choice == "skip":
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+                _kill_tree(proc)
                 raise TimeoutSkipToReview(
                     f"{agent_name} timed out — user chose to skip to review"
                 )
             else:  # kill
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+                _kill_tree(proc)
                 raise TimeoutError(
                     f"{agent_name} timed out after {timeout_str}"
                 )

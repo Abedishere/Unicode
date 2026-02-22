@@ -68,7 +68,11 @@ def run_implementation(
         f"{context_brief}"
         f"TASK:\n{task}\n\n"
         f"IMPLEMENTATION PLAN:\n{plan}\n\n"
-        "Implement the plan exactly. Follow every step."
+        "Implement the plan exactly. Follow every step.\n\n"
+        "IMPORTANT: When creating or modifying requirements.txt or pyproject.toml, "
+        "always pin package versions with a minimum version constraint "
+        "(e.g. `click>=8.1.0`, not just `click`). "
+        "Look up the current stable version of each package and use it as the lower bound."
     )
     result = claude.implement(implement_prompt)
     log_success("Claude Code finished implementation.")

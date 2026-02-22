@@ -28,9 +28,11 @@ from utils.history import append_history, agent_update_md, init_agent_md, write_
 from utils.logger import init_transcript, log_error, log_info, log_phase, log_success
 from utils.memory import (
     add_learning, add_task_to_index, extract_keywords_from_task,
-    get_context_for_task, load_memory, save_memory,
+    get_context_for_task, init_project_notes, load_memory,
+    log_bug, log_decision, log_issue, log_key_fact, save_memory,
 )
 from utils.runner import CancelledByUser, TimeoutSkipToReview
+from utils.session import Session, save_session, load_session, list_sessions
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -145,13 +147,28 @@ def _print_banner(cfg: dict, work_dir: str) -> None:
 _last_ctrl_c: float = 0.0
 _DOUBLE_PRESS_WINDOW = 2.0  # seconds
 
+# Current session — saved on hard exit so the user can resume later.
+_current_session: Session | None = None
+_current_work_dir: str | None = None
+
 
 def _sigint_handler(signum, frame):
-    """Handle Ctrl+C: first press does nothing, second press within 2s exits."""
+    """Handle Ctrl+C: first press does nothing, second press within 2s exits.
+
+    On double-press, saves the current session (if any) so it can be resumed.
+    """
     global _last_ctrl_c
     now = time.time()
     if now - _last_ctrl_c <= _DOUBLE_PRESS_WINDOW:
-        console.print("\n[bold red]Ctrl+C ×2 — exiting unicode.[/]")
+        # Save session before hard exit
+        if _current_session and _current_work_dir:
+            _current_session.status = "paused"
+            save_session(_current_work_dir, _current_session)
+            console.print(
+                f"\n[bold yellow]Session [cyan]{_current_session.session_id}[/cyan] "
+                f"saved.  Resume with:[/]  unicode --resume {_current_session.session_id}"
+            )
+        console.print("[bold red]Ctrl+C ×2 — exiting unicode.[/]")
         os._exit(0)
     _last_ctrl_c = now
     console.print("\n[bold yellow]Press Ctrl+C again within 2s to exit.[/]")
@@ -287,10 +304,36 @@ def _print_phase_banner(label: str, role: str, desc: str, color: str = "cyan") -
     console.print()
 
 
+def _show_sessions() -> None:
+    """Print a summary table of saved sessions."""
+    if _current_work_dir is None:
+        console.print("[dim]  No working directory set yet.[/]")
+        return
+    sessions = list_sessions(_current_work_dir)
+    if not sessions:
+        console.print("[dim]  No saved sessions.[/]")
+        return
+    console.print()
+    for s in sessions[:15]:
+        color = {
+            "running": "yellow", "paused": "yellow",
+            "completed": "green", "failed": "red",
+        }.get(s.status, "dim")
+        phase = s.current_phase or s.next_incomplete_phase() or "done"
+        task_preview = s.task[:55].replace("\n", " ")
+        console.print(
+            f"  [bold cyan]{s.session_id}[/]  "
+            f"[{color}]{s.status:<10}[/] "
+            f"[dim]phase: {phase:<12}[/] "
+            f"[dim]{task_preview}[/]"
+        )
+    console.print()
+
+
 def _run_phase(label: str, fn, *args, **kwargs):
     """Run a phase function, catching ESC cancellation gracefully.
 
-    On ESC: pauses and asks retry / skip / clarify.
+    On ESC → kill: asks retry / skip / clarify.
     Returns the function result, or None if skipped.
     """
     while True:
@@ -298,7 +341,7 @@ def _run_phase(label: str, fn, *args, **kwargs):
             return fn(*args, **kwargs)
         except CancelledByUser:
             console.print()
-            console.print(f"[bold yellow]Paused:[/] {label}")
+            console.print(f"[bold yellow]Stopped:[/] {label}")
             console.print()
             choice = click.prompt(
                 click.style("What now?", fg="yellow", bold=True),
@@ -348,6 +391,10 @@ _paste_counter: int = 0
 _image_counter: int = 0
 _attached_images: list[tuple[int, str]] = []  # (image_number, absolute_path)
 _attached_pastes: list[tuple[int, list[str]]] = []  # (paste_number, lines)
+# Badge count when the prompt area was last drawn.  Used by _erase_screen_from
+# and _redraw_prompt_area to move the cursor back with relative movement
+# (scroll-safe) instead of the DEC save/restore that breaks near screen bottom.
+_prompt_draw_badge_count: int = 0
 
 
 def _clean_path(text: str) -> str:
@@ -538,14 +585,23 @@ def _drain_stdin_lines() -> list[str]:
 
 
 def _erase_screen_from(saved: bool = True) -> None:
-    """Erase all terminal content from the DEC-saved cursor position onward.
+    """Erase all terminal content from before the prompt area.
 
-    If *saved* is True, uses DEC restore-cursor (\\0338) first. Then clears
-    from cursor to end of screen. Works on Windows Terminal, iTerm2, etc.
+    Uses relative cursor movement (scroll-safe) instead of DEC save/restore.
+    Must be called after _prompt_line_raw has returned — cursor is on the line
+    after the prompt (due to the \\r\\n written before returning).
+
+    Layout when called (N = _prompt_draw_badge_count):
+        ...                 ← want cursor here, then erase ↓
+        ── rule ──          (1 line)
+        badge 1 … badge N  (N lines)
+        > <text>           (1 line, prompt)
+        <cursor here>      (new line from \\r\\n)
+
+    Lines to move up: N + 3  (rule + badges + prompt + \\r\\n line)
     """
-    if saved:
-        sys.stdout.write("\0338")  # DEC restore cursor (DECRC)
-    sys.stdout.write("\033[J")     # Erase from cursor to end of screen
+    n_up = _prompt_draw_badge_count + 3
+    sys.stdout.write(f"\033[{n_up}A\033[J")
     sys.stdout.flush()
 
 
@@ -556,6 +612,10 @@ _SLASH_COMMANDS = [
     ("/clear-images", "Remove attached images only"),
     ("/clear-paste", "Remove pasted text only"),
     ("/auto", "Toggle auto-approve mode"),
+    ("/sessions", "Browse & resume a saved session"),
+    ("/resume <id>", "Resume a saved session by ID"),
+    ("/pause", "Save & pause current session"),
+    ("/stop", "Stop orchestrator (no save)"),
 ]
 
 
@@ -613,6 +673,123 @@ def _render_slash_menu(typed: str, prev_n: int, restore_col: int = 0) -> int:
     return rows_down                          # > 0 signals "menu visible"
 
 
+# ── Session picker (same visual style as attachment selection) ─────────
+
+def _run_session_picker() -> str | None:
+    """Interactive session picker rendered below the current cursor position.
+
+    ↑/↓ navigate sessions, Enter to resume selected, Esc/Backspace to cancel.
+
+    Uses **relative** cursor movement (``\\033[nA\\033[J``) rather than DEC
+    save/restore so the menu redraws correctly even when the terminal has
+    scrolled since the picker was first opened.
+
+    Returns the ``session_id`` of the chosen session, or ``None`` if cancelled.
+    """
+    import msvcrt
+
+    if _current_work_dir is None:
+        console.print("[dim]  No working directory set yet.[/]")
+        return None
+
+    sessions = list_sessions(_current_work_dir)
+    if not sessions:
+        console.print("[dim]  No saved sessions.[/]")
+        return None
+
+    sessions = sessions[:15]
+    total = len(sessions)
+    sel = 0
+    menu_height = 0   # lines drawn by the last _draw call (0 = not yet drawn)
+
+    _ANSI_STATUS = {
+        "running":   "\033[33m",   # yellow
+        "paused":    "\033[33m",
+        "completed": "\033[32m",   # green
+        "failed":    "\033[31m",   # red
+    }
+    _W = max(console.width, 40)
+
+    def _draw(selected: int) -> None:
+        nonlocal menu_height
+        out: list[str] = []
+
+        # ── Erase previous render (if any) ────────────────────────
+        if menu_height > 0:
+            out.append(f"\033[{menu_height}A\033[J")
+
+        rows = 0
+
+        # Separator rule
+        out.append(f"\r\033[2m{'─' * _W}\033[0m\r\n")
+        rows += 1
+
+        # Header hint
+        out.append(
+            "\r  \033[2mSessions — ↑/↓ navigate · Enter to resume"
+            " · Esc to cancel\033[0m\r\n"
+        )
+        rows += 1
+
+        # Session rows
+        for i, s in enumerate(sessions):
+            st_ansi = _ANSI_STATUS.get(s.status, "\033[2m")
+            phase = s.current_phase or s.next_incomplete_phase() or "done"
+            task_preview = s.task[:40].replace("\n", " ")
+            row_text = (
+                f"  {st_ansi}{s.status:<10}\033[0m "
+                f"\033[36m{s.session_id:<14}\033[0m "
+                f"\033[2mphase:{phase:<10}\033[0m "
+                f"\033[2m{task_preview}\033[0m"
+            )
+            if i == selected:
+                # Bold white on blue, padded to terminal width
+                plain = (
+                    f"  {s.status:<10} {s.session_id:<14} "
+                    f"phase:{phase:<10} {task_preview}"
+                )
+                out.append(f"\r\033[1;37;44m{plain:<{_W}}\033[0m\r\n")
+            else:
+                out.append(f"\r{row_text}\r\n")
+            rows += 1
+
+        # Prompt marker (no trailing newline — cursor stays on this line)
+        out.append("\r\033[1;35m> \033[0m")
+
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+        menu_height = rows   # save line count for next erase
+
+    def _erase() -> None:
+        """Erase the picker and leave cursor on a clean line."""
+        if menu_height > 0:
+            sys.stdout.write(f"\033[{menu_height}A\033[J")
+            sys.stdout.flush()
+
+    _draw(sel)
+
+    while True:
+        ch = msvcrt.getwch()
+
+        if ch in ("\x00", "\xe0"):
+            ch2 = msvcrt.getwch()
+            if ch2 == "H":      # ↑ Up
+                sel = max(0, sel - 1)
+                _draw(sel)
+            elif ch2 == "P":    # ↓ Down
+                sel = min(total - 1, sel + 1)
+                _draw(sel)
+            continue
+
+        if ch in ("\r", "\n"):  # Enter — select and return
+            _erase()
+            return sessions[sel].session_id
+
+        if ch in ("\x1b", "\x08", "\x03"):  # Esc / Backspace / Ctrl+C — cancel
+            _erase()
+            return None
+
+
 # ── Attachment selection-mode rendering ────────────────────────────────
 
 def _attachment_count() -> int:
@@ -621,16 +798,28 @@ def _attachment_count() -> int:
 
 
 def _redraw_prompt_area(selected: int = -1) -> None:
-    """Erase & redraw the full prompt area from the DEC-saved position.
+    """Erase & redraw the full prompt area using scroll-safe relative movement.
 
     Parameters
     ----------
     selected : int
         Index into the combined attachment list to highlight.
         -1 means no selection (normal display).
+
+    Must be called while the cursor is on the ``> `` prompt line (i.e. from
+    within selection mode / _prompt_line_raw before a \\r\\n is written).
+
+    Layout when called (N = _prompt_draw_badge_count):
+        ...                 ← want cursor here, then erase ↓
+        ── rule ──          (1 line)
+        badge 1 … badge N  (N lines)
+        > <cursor>          (prompt line — cursor is here)
+
+    Lines to move up: N + 2  (rule + badges + prompt line we're sitting on)
     """
-    # Restore DEC cursor → clear everything below → re-save at same spot.
-    sys.stdout.write("\0338\033[J\0337")
+    global _prompt_draw_badge_count
+    n_up = _prompt_draw_badge_count + 2
+    sys.stdout.write(f"\033[{n_up}A\033[J")
     sys.stdout.flush()
 
     console.rule(style="bright_black")
@@ -672,6 +861,10 @@ def _redraw_prompt_area(selected: int = -1) -> None:
     # Print prompt prefix
     sys.stdout.write("\033[1;35m> \033[0m")
     sys.stdout.flush()
+
+    # Record how many badge lines were just drawn so the next erase/redraw
+    # knows exactly how far up to move the cursor.
+    _prompt_draw_badge_count = _attachment_count()
 
 
 def _run_selection_mode() -> None:
@@ -745,12 +938,16 @@ def _line_redraw_tail(buf: list[str], cursor: int) -> None:
     sys.stdout.flush()
 
 
-def _prompt_line_raw(prompt_ansi: str, primary: bool = False):
+def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
+                     initial_text: str = ""):
     """Read one line using raw keypresses (Windows ``msvcrt``).
 
     Supports full cursor movement (←/→, Home, End, Delete) so the prompt
     feels like a normal shell.  When *primary* is True the slash-command
     menu and ↑-to-select attachment mode are enabled.
+
+    *initial_text* pre-fills the buffer (used to restore text that was in
+    the prompt when an image/paste was auto-attached mid-typing).
 
     Returns
     -------
@@ -763,11 +960,13 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False):
     import msvcrt
 
     sys.stdout.write(prompt_ansi)
+    if initial_text:
+        sys.stdout.write(initial_text)
     sys.stdout.flush()
 
-    buf: list[str] = []
-    cursor = 0                # position inside buf
-    menu_n = 0                # slash-menu lines currently displayed
+    buf: list[str] = list(initial_text)
+    cursor = len(initial_text)    # position inside buf
+    menu_n = 0                    # slash-menu lines currently displayed
 
     while True:
         ch = msvcrt.getwch()
@@ -919,34 +1118,52 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False):
         # the entire burst, then check whether the result is an
         # image path and, if so, auto-submit without requiring Enter.
         if primary and msvcrt.kbhit():
-            pre_burst_len = len(buf)     # text typed before the burst
             pre_burst_cursor = cursor
             time.sleep(0.025)           # let the burst fully arrive
             got_enter = False
+            _past_first_nl = False          # have we crossed the first newline?
+            _burst_extra_lines: list[str] = []   # lines after the first newline
+            _burst_cur_extra: list[str] = []     # chars for current extra line
             while msvcrt.kbhit():
                 c = msvcrt.getwch()
                 if c in ("\r", "\n"):
-                    got_enter = True    # Enter came with the paste
+                    if not _past_first_nl:
+                        got_enter = True
+                        _past_first_nl = True
+                    else:
+                        _burst_extra_lines.append("".join(_burst_cur_extra))
+                        _burst_cur_extra = []
                 elif ord(c) >= 32:
-                    buf.insert(cursor, c)
-                    cursor += 1
+                    if not _past_first_nl:
+                        buf.insert(cursor, c)
+                        cursor += 1
+                    else:
+                        _burst_cur_extra.append(c)
+            if _burst_cur_extra:
+                _burst_extra_lines.append("".join(_burst_cur_extra))
             # Repaint the whole prompt line cleanly
             sys.stdout.write(f"\r{prompt_ansi}{''.join(buf)}\033[K")
             sys.stdout.flush()
             candidate = "".join(buf)
 
-            # Extract just the pasted/dropped portion
-            pasted_part = "".join(buf[pre_burst_cursor:cursor])
-            had_prior_text = pre_burst_cursor > 0
+            # Extract the full pasted/dropped portion.
+            # IMPORTANT: the regular char handler consumed the first character
+            # of the paste BEFORE the burst fired, so the pasted region begins
+            # one position earlier than pre_burst_cursor.
+            pasted_start = pre_burst_cursor - 1
+            pasted_part = "".join(buf[pasted_start:cursor])
+            # True only when the user had typed text before the paste started.
+            had_prior_text = pasted_start > 0
 
             # Check if the PASTED portion alone is an image path
             if _is_image_path(pasted_part):
                 if had_prior_text:
                     # User had typed text before the drag-drop.
-                    # Strip the image path from the buffer, keeping
+                    # Strip the *entire* image path from the buffer (including
+                    # the first char that leaked in before the burst), keeping
                     # the original text intact, and auto-attach.
-                    del buf[pre_burst_cursor:cursor]
-                    cursor = pre_burst_cursor
+                    del buf[pasted_start:cursor]
+                    cursor = pasted_start
                     _try_attach_image(pasted_part)
                     img_path = _attached_images[-1][1]
                     img_num = _attached_images[-1][0]
@@ -977,7 +1194,8 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False):
                     sys.stdout.flush()
                     return (pasted_part, None, "submit")
 
-            # Also check the full buffer (for case where user typed nothing)
+            # Fallback: check full buffer when no prior text was typed
+            # (handles the case where pasted_part check above didn't fire)
             if not had_prior_text and _is_image_path(candidate):
                 if menu_n:
                     _clear_below_cursor(menu_n, 0)
@@ -991,6 +1209,19 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False):
                     _clear_below_cursor(menu_n, 0)
                 sys.stdout.write("\r\n")
                 sys.stdout.flush()
+                # Multi-line paste: return all lines so _prompt_task
+                # can attach them as a [Pasted text #N +M lines] badge.
+                if _burst_extra_lines:
+                    all_lines = [candidate] + _burst_extra_lines
+                    while all_lines and not all_lines[-1].strip():
+                        all_lines.pop()
+                    if len(all_lines) > 1:
+                        # For pure pastes (no prior typed text), return empty
+                        # text so _prompt_task doesn't treat the first paste
+                        # line as typed instructions and pre-fill it via
+                        # _pending_text on the next iteration.
+                        ret_text = candidate if had_prior_text else ""
+                        return (ret_text, all_lines, "submit")
                 return (candidate, None, "submit")
 
         if primary:
@@ -1039,13 +1270,18 @@ def _prompt_task() -> str:
 
     use_raw = os.name == "nt"
 
+    # Text the user had typed when an image/paste was auto-attached.
+    # Restored as initial_text on the very next prompt call so it isn't lost.
+    _pending_text: str = ""
+
     while True:
         lines: list[str] = []
 
-        # ── Save cursor before the entire prompt area ────────────
-        # (used by selection mode / paste erase to redraw cleanly)
-        sys.stdout.write("\0337")  # DEC save cursor (DECSC)
-        sys.stdout.flush()
+        # ── Record badge count before drawing the prompt area ────
+        # _erase_screen_from and _redraw_prompt_area use this to compute
+        # how far to move the cursor upward (scroll-safe relative movement).
+        global _prompt_draw_badge_count
+        _prompt_draw_badge_count = _attachment_count()
 
         # Dim horizontal rule above prompt
         console.rule(style="bright_black")
@@ -1071,11 +1307,13 @@ def _prompt_task() -> str:
             if use_raw:
                 text, paste, action = _prompt_line_raw(
                     "\033[1;35m> \033[0m", primary=True,
+                    initial_text=_pending_text,
                 )
             else:
                 text, paste, action = _prompt_line_fallback(
                     "[bold magenta]> [/]",
                 )
+            _pending_text = ""   # consumed (or unused on fallback path)
 
             if action == "ctrl-c":
                 # Forward to the double-press Ctrl+C handler directly
@@ -1102,6 +1340,32 @@ def _prompt_task() -> str:
                 state_str = "ON" if new_state else "OFF"
                 console.print(f"[bold cyan]  Auto-approve mode: {state_str}[/]")
                 continue
+            if stripped.lower() == "/sessions":
+                sid = _run_session_picker()
+                if sid:
+                    return f"__RESUME__{sid}"
+                continue
+            if stripped.lower().startswith("/resume"):
+                parts = stripped.split(maxsplit=1)
+                if len(parts) > 1 and parts[1].strip():
+                    return f"__RESUME__{parts[1].strip()}"
+                console.print("[dim]  Usage: /resume <session-id>[/]")
+                continue
+            if stripped.lower() == "/pause":
+                if _current_session and _current_work_dir:
+                    _current_session.status = "paused"
+                    save_session(_current_work_dir, _current_session)
+                    console.print(
+                        f"[bold yellow]Session [cyan]{_current_session.session_id}[/cyan] "
+                        f"paused and saved.  Resume with:[/]  "
+                        f"unicode --resume {_current_session.session_id}"
+                    )
+                else:
+                    console.print("[dim]  No active session to pause.[/]")
+                return "__PAUSE__"
+            if stripped.lower() == "/stop":
+                console.print("[bold red]Stopping orchestrator.[/]")
+                return "__STOP__"
 
             # ── Auto-detect image path ────────────────────────────
             # Pure heuristic: looks like a path + has image extension.
@@ -1112,14 +1376,21 @@ def _prompt_task() -> str:
 
             # ── Paste detected ────────────────────────────────────
             if paste:
+                # If the user had typed instructions before the paste/image
+                # arrived (via Enter+burst), save that text so the next
+                # prompt iteration pre-fills it.  Don't save if stripped IS
+                # itself an image path (that was already handled above).
+                _saved = stripped if (stripped and not _is_image_path(stripped)) else ""
+
                 # Multi-line drag-drop image path (e.g. & 'C:\...\img.png'\n)
                 if _paste_is_image_path(paste):
+                    _pending_text = _saved
                     _erase_screen_from(saved=True)
                     continue
-                # Single-line paste that is an image path was already
-                # caught above.  Multi-line or non-image → attach as text.
+                # Multi-line or non-image text → attach as paste badge.
                 _paste_counter += 1
                 _attached_pastes.append((_paste_counter, paste))
+                _pending_text = _saved
                 _erase_screen_from(saved=True)
                 continue  # loop back — user types instructions next
 
@@ -1249,6 +1520,13 @@ def _extract_review_learnings(
             for lesson in lessons[:3]:
                 if isinstance(lesson, str) and lesson.strip():
                     add_learning(work_dir, "past_mistakes", lesson.strip())
+                    # Mirror to human-readable bug log (docs/project_notes/bugs.md)
+                    log_bug(
+                        working_dir=work_dir,
+                        issue=lesson.strip(),
+                        root_cause="Extracted from code review",
+                        solution="See review feedback above",
+                    )
     except Exception:
         pass  # Non-critical — don't break the pipeline
 
@@ -1262,14 +1540,30 @@ def _run_task(
     qwen: QwenAgent,
     phase: str = "all",
     tier: str = "standard",
+    session: Session | None = None,
 ) -> None:
-    """Execute one full orchestration run for the given task."""
+    """Execute one full orchestration run for the given task.
+
+    If *session* is provided the task resumes from the last completed
+    checkpoint — phases that already have a stored result are skipped.
+    """
+    global _current_session, _current_work_dir
+
     # Reset per-session approvals for each new task
     reset_session_approvals()
+
+    # ── Session bookkeeping ──
+    if session is None:
+        session = Session(task=task, tier=tier, cfg=cfg)
+    session.status = "running"
+    save_session(work_dir, session)
+    _current_session = session
+    _current_work_dir = work_dir
 
     transcript_path = init_transcript(work_dir)
     log_info(f"Transcript: {transcript_path}")
     log_info(f"Task: {task}")
+    log_info(f"Session: {session.session_id}")
     log_info(f"Tier: {tier} | Dev model: {claude.dev_model}")
     start_time = time.time()
 
@@ -1284,15 +1578,33 @@ def _run_task(
     approved = False
     skip_to_review = False
 
+    # ── Restore completed phases from session ──
+    if session.phase_done("plan"):
+        plan_data = session.phases["plan"]
+        plan = plan_data.get("plan", "")
+        agreed = plan_data.get("agreed", True)
+        log_info("Restored plan from saved session.")
+    else:
+        agreed = True  # default — overridden below if plan runs
+
+    if session.phase_done("discussion"):
+        disc_data = session.phases["discussion"]
+        if isinstance(disc_data, dict):
+            discussion = disc_data.get("discussion", [])
+            plan = disc_data.get("plan", plan)
+        log_info("Restored discussion from saved session.")
+
     # For standalone implement/review, load saved plan
-    if phase in ("implement", "review"):
+    if phase in ("implement", "review") and not plan:
         plan = _load_saved_plan(work_dir)
 
     # ── Phase 1: Plan (Codex drafts, Claude reviews) ──
-    run_plan = phase in ("all", "plan", "discuss")
+    run_plan = phase in ("all", "plan", "discuss") and not session.phase_done("plan")
     if run_plan and phase == "all":
         _print_phase_banner("Planning", "admins", "Claude & Codex will draft the plan", "cyan")
     if run_plan:
+        session.current_phase = "plan"
+        save_session(work_dir, session)
         result, extra = request_approval("plan",
             "Codex (GPT) will draft a plan, then Claude will review it.")
         if result == "proceed":
@@ -1309,14 +1621,20 @@ def _run_task(
         else:
             log_info("Skipping plan phase.")
             agreed = True
-    else:
-        agreed = True
+        session.mark_phase_done("plan", {"plan": plan, "agreed": agreed})
+        save_session(work_dir, session)
 
     # ── Phase 2: Discussion (only if admins disagree on the plan) ──
-    run_discuss = phase in ("all", "discuss")
-    if run_discuss and not agreed and phase == "all":
+    run_discuss = (
+        phase in ("all", "discuss")
+        and not agreed
+        and not session.phase_done("discussion")
+    )
+    if run_discuss and phase == "all":
         _print_phase_banner("Discussion", "admins", "Claude & Codex will discuss the plan", "cyan")
-    if run_discuss and not agreed:
+    if run_discuss:
+        session.current_phase = "discussion"
+        save_session(work_dir, session)
         log_info("Admins disagree — starting discussion to resolve.")
         disc_rounds = cfg.get("discussion_rounds", 2)
         result, extra = request_approval("discussion",
@@ -1332,19 +1650,28 @@ def _run_task(
             if disc is not None:
                 discussion = disc
 
-            # Re-plan after discussion
+            # Re-plan after discussion — always save to disk (final plan)
             log_info("Re-planning after discussion ...")
             plan_result = _run_phase("Re-Plan",
                 consolidate_plan, task, claude, codex, work_dir, discussion,
-                memory_context=memory_context)
+                memory_context=memory_context, final=True)
             if plan_result is not None:
-                plan, _ = plan_result
+                plan, replan_agreed = plan_result
+                if not replan_agreed:
+                    log_info(
+                        "Admins still disagree after re-planning — "
+                        "proceeding with best available plan."
+                    )
         else:
             log_info("Skipping discussion — proceeding with current plan.")
-    elif not agreed:
-        log_info("Admins agree — skipping discussion.")
-    else:
-        log_info("Admins agree — skipping discussion.")
+        session.mark_phase_done("discussion", {
+            "discussion": discussion, "plan": plan,
+        })
+        save_session(work_dir, session)
+    elif not session.phase_done("discussion"):
+        # No discussion needed — mark done so resume skips it
+        session.mark_phase_done("discussion", {"discussion": [], "plan": plan})
+        save_session(work_dir, session)
 
     # Stop here if the user only wanted plan or discuss
     if phase in ("plan", "discuss"):
@@ -1352,10 +1679,16 @@ def _run_task(
         duration = time.time() - start_time
         mins, secs = divmod(int(duration), 60)
         log_info(f"Finished in {mins}m {secs:02d}s.")
+        session.status = "completed"
+        save_session(work_dir, session)
+        _current_session = None
         return
 
     # ── Phase 3: Implementation (Claude as developer, with Qwen available) ──
-    run_impl = phase in ("all", "implement")
+    run_impl = (
+        phase in ("all", "implement")
+        and not session.phase_done("implement")
+    )
     if run_impl and phase == "all":
         _print_phase_banner(
             "Implementation", "developer",
@@ -1363,6 +1696,8 @@ def _run_task(
             "magenta",
         )
     if run_impl:
+        session.current_phase = "implement"
+        save_session(work_dir, session)
         result, extra = request_approval("implement",
             f"Claude (dev:{claude.dev_model}) will now implement the plan with full file access.")
         if result == "proceed":
@@ -1383,6 +1718,8 @@ def _run_task(
                 skip_to_review = True
         else:
             log_info("Skipping implementation phase.")
+        session.mark_phase_done("implement", True)
+        save_session(work_dir, session)
 
     # Stop here if the user only wanted implement (and didn't skip to review)
     if phase == "implement" and not skip_to_review:
@@ -1390,28 +1727,41 @@ def _run_task(
         duration = time.time() - start_time
         mins, secs = divmod(int(duration), 60)
         log_info(f"Finished in {mins}m {secs:02d}s.")
+        session.status = "completed"
+        save_session(work_dir, session)
+        _current_session = None
         return
 
     # ── Phase 4: Code Review (Codex reviews with Claude validation) ──
-    if phase == "all":
-        _print_phase_banner("Code Review", "reviewer",
-            "Codex reviews, Claude validates", "green")
-    log_info("First code review is mandatory.")
-    rev = _run_phase("Code Review",
-        run_review, task, plan, claude, codex, work_dir,
-        cfg["max_review_iterations"])
-    approved = rev if rev is not None else True
+    if not session.phase_done("review"):
+        session.current_phase = "review"
+        save_session(work_dir, session)
+        if phase == "all":
+            _print_phase_banner("Code Review", "reviewer",
+                "Part 1: Codex reviews  →  Part 2: Claude validates", "green")
+        log_info("First code review is mandatory.")
+        rev = _run_phase("Code Review",
+            run_review, task, plan, claude, codex, work_dir,
+            cfg["max_review_iterations"])
+        approved = rev if rev is not None else True
+        session.mark_phase_done("review", approved)
+        save_session(work_dir, session)
+    else:
+        approved = session.phases["review"]
+        log_info("Restored review result from saved session.")
 
     # ── Phase 5: Finalization ──
+    session.current_phase = "finalize"
+    save_session(work_dir, session)
     log_phase("Phase 5: Finalization")
     outcome = "APPROVED" if approved else "NOT APPROVED"
 
     if approved:
         log_success("Implementation approved!")
 
-        # Each agent updates its own MD file
-        _run_phase("Claude updating CLAUDE.md",
-            agent_update_md, work_dir, task, plan, discussion, claude, "CLAUDE.md")
+        # Codex (GPT) synthesizes and updates both agent MD files
+        _run_phase("Codex updating CLAUDE.md",
+            agent_update_md, work_dir, task, plan, discussion, codex, "CLAUDE.md")
         _run_phase("Codex updating AGENTS.md",
             agent_update_md, work_dir, task, plan, discussion, codex, "AGENTS.md")
 
@@ -1465,10 +1815,27 @@ def _run_task(
     add_task_to_index(work_dir, task, outcome, keywords)
     log_info("Task indexed in shared memory.")
 
+    # Mirror to human-readable work log (docs/project_notes/issues.md)
+    log_issue(work_dir, task, outcome)
+
     # Extract learnings from the task
     if plan:
         add_learning(work_dir, "architecture_decisions",
             f"[{outcome}] {task[:100]}: {plan[:200]}")
+        # Mirror to human-readable ADR (docs/project_notes/decisions.md)
+        log_decision(
+            working_dir=work_dir,
+            title=task[:60].replace("\n", " ").strip(),
+            context=f"Task: {task[:300]}",
+            decision=plan[:400],
+            consequences=f"Outcome: {outcome}",
+        )
+
+    # ── Mark session complete ──
+    session.mark_phase_done("finalize", outcome)
+    session.status = "completed"
+    save_session(work_dir, session)
+    _current_session = None
 
     if approved:
         log_success("Task complete!")
@@ -1497,6 +1864,8 @@ def _run_task(
     help="Auto-approve all phases except git commit.")
 @click.option("--dev-model", default=None,
     help="Override developer model (e.g. sonnet, opus).")
+@click.option("--resume", "resume_id", default=None,
+    help="Resume a saved session by ID.")
 def main(
     task: str | None,
     config_path: str,
@@ -1508,6 +1877,7 @@ def main(
     tier: str | None,
     auto_mode: bool,
     dev_model: str | None,
+    resume_id: str | None,
 ):
     """Orchestrate Claude Code and Codex to collaboratively complete TASK."""
     # Install double Ctrl+C handler
@@ -1538,8 +1908,15 @@ def main(
     # Initialize agent MD files (header + orchestrator.md reference)
     init_agent_md(work_dir)
 
+    # Initialize docs/project_notes/ memory files (project-memory skill)
+    init_project_notes(work_dir)
+
     # Print the banner with info box
     _print_banner(cfg, work_dir)
+
+    # Make work_dir available for session listing
+    global _current_work_dir
+    _current_work_dir = work_dir
 
     # Auto mode from CLI
     if auto_mode:
@@ -1552,17 +1929,39 @@ def main(
             "plan":      ("Planning",       "admins",   "Claude & Codex will draft the plan",      "cyan"),
             "discuss":   ("Discussion",     "admins",   "Claude & Codex will discuss the plan",    "cyan"),
             "implement": ("Implementation", "developer","Claude Code (developer) will implement",  "magenta"),
-            "review":    ("Code Review",    "reviewer", "Codex will review the implementation",    "green"),
+            "review":    ("Code Review",    "reviewer", "Codex reviews (Part 1), Claude validates (Part 2)", "green"),
         }
         label, role, desc, color = _phase_banners.get(phase, (phase, "agents", "", "cyan"))
         _print_phase_banner(label, role, desc, color)
+
+    # ── Handle --resume from CLI ──
+    resume_session: Session | None = None
+    if resume_id:
+        resume_session = load_session(work_dir, resume_id)
+        if resume_session is None:
+            console.print(f"[bold red]Session {resume_id} not found.[/]")
+            return
+        next_phase = resume_session.next_incomplete_phase() or "done"
+        console.print(
+            f"[bold cyan]Resuming session [yellow]{resume_session.session_id}[/yellow] "
+            f"from phase: {next_phase}[/]"
+        )
 
     # ── Main loop: keep accepting tasks until double Ctrl+C ──
     first_task = task  # from CLI argument, if any
 
     while True:
         try:
-            if first_task:
+            # ── Determine the task for this iteration ──
+            current_session: Session | None = None
+
+            if resume_session:
+                # --resume or /resume: use the saved session
+                current_task = resume_session.task
+                selected_tier = resume_session.tier
+                current_session = resume_session
+                resume_session = None  # consume — only first iteration
+            elif first_task:
                 current_task = first_task
                 first_task = None  # only use CLI arg for the first run
             else:
@@ -1570,22 +1969,52 @@ def main(
                 current_task = _prompt_task()
                 _flush_stdin()  # discard leftover paste data
 
+            # Handle /resume from prompt
+            if isinstance(current_task, str) and current_task.startswith("__RESUME__"):
+                sid = current_task[len("__RESUME__"):]
+                loaded = load_session(work_dir, sid)
+                if loaded is None:
+                    console.print(f"[bold red]Session {sid} not found.[/]")
+                    continue
+                next_phase = loaded.next_incomplete_phase() or "done"
+                console.print(
+                    f"[bold cyan]Resuming session [yellow]{loaded.session_id}[/yellow] "
+                    f"from phase: {next_phase}[/]"
+                )
+                current_task = loaded.task
+                current_session = loaded
+                selected_tier = loaded.tier
+
+            # Handle /pause and /stop from prompt
+            if isinstance(current_task, str) and current_task == "__PAUSE__":
+                console.print("[dim]Paused. Enter a new task or Ctrl+C twice to exit.[/]")
+                continue
+            if isinstance(current_task, str) and current_task == "__STOP__":
+                os._exit(0)
+
             # ── Tier & mode selection (interactive, per-task) ──
-            if tier:
-                # CLI-specified tier — apply once
-                selected_tier = tier
+            if current_session is None:
+                # Normal flow — not resuming
+                if tier:
+                    # CLI-specified tier — apply once
+                    selected_tier = tier
+                    tier_cfg = cfg.get("tiers", _DEFAULT_TIERS).get(selected_tier, {})
+                    for key, val in tier_cfg.items():
+                        cfg[key] = val
+                else:
+                    # Interactive tier selection
+                    selected_tier = _prompt_tier(cfg)
+
+                # Interactive auto-mode selection (if not already set via CLI)
+                if not is_auto_all() and not auto_mode:
+                    if _prompt_auto_mode():
+                        set_auto_all(True)
+                        console.print("[bold cyan]  Auto-approve mode: ON[/]")
+            else:
+                # Resuming — apply tier from session
                 tier_cfg = cfg.get("tiers", _DEFAULT_TIERS).get(selected_tier, {})
                 for key, val in tier_cfg.items():
                     cfg[key] = val
-            else:
-                # Interactive tier selection
-                selected_tier = _prompt_tier(cfg)
-
-            # Interactive auto-mode selection (if not already set via CLI)
-            if not is_auto_all() and not auto_mode:
-                if _prompt_auto_mode():
-                    set_auto_all(True)
-                    console.print("[bold cyan]  Auto-approve mode: ON[/]")
 
             # Create/update agents with current config (tier may have changed dev_model)
             claude = ClaudeAgent(
@@ -1606,7 +2035,7 @@ def main(
             )
 
             _run_task(current_task, cfg, work_dir, claude, codex, qwen, phase,
-                      tier=selected_tier)
+                      tier=selected_tier, session=current_session)
 
             # Reset auto-all after each task (unless set via CLI)
             if not auto_mode:

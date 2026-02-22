@@ -1,189 +1,284 @@
+"""Phase 4: Code Review — two-pass sequential review.
+
+Review Part 1 — Codex (GPT) performs the primary diff review.
+Review Part 2 — Claude validates and aggregates Codex's findings.
+
+Confirmed issues are sent to the developer (Claude) for fixes.
+The cycle repeats until Codex approves or max iterations are exhausted.
+"""
 from __future__ import annotations
 
 import re
 
 import click
+from rich.console import Console
 
-from agents.base import BaseAgent
 from agents.claude_agent import ClaudeAgent
+from agents.codex_agent import CodexAgent
 from utils.git_utils import get_diff
 from utils.logger import log_agent, log_error, log_info, log_phase, log_success
 
-# Patterns that mean "code looks good, nothing to change"
+console = Console()
+
+# Codex verdict patterns — match on the first non-blank line
+_APPROVED_PAT = re.compile(r"^\s*APPROVED\b", re.IGNORECASE | re.MULTILINE)
+_CHANGES_PAT = re.compile(r"^\s*CHANGES[_ ]REQUESTED\b", re.IGNORECASE | re.MULTILINE)
+
+# Claude verdict patterns
+_CONFIRMED_PAT = re.compile(r"^\s*CONFIRMED\b", re.IGNORECASE | re.MULTILINE)
+_CLAUDE_APPROVED_PAT = re.compile(r"^\s*APPROVED\b", re.IGNORECASE | re.MULTILINE)
+
+# Fallback: heuristic "looks good" signals when Codex skips the verdict line
 _LOOKS_GOOD = re.compile(
-    r"(approved|looks good|no issues|no comments|no changes|lgtm|good to go"
-    r"|nothing to change|no feedback|all good|ship it|no problems|satisf"
-    r"|complete|correct|well.implemented|properly.implemented|solid"
-    r"|code is (fine|good|correct|solid|clean))",
-    re.IGNORECASE,
-)
-
-# Patterns that clearly indicate changes are needed
-_CHANGES_NEEDED = re.compile(
-    r"(changes?.requested|fix|bug|wrong|incorrect|missing|broken|error"
-    r"|should be|needs? to|must be|replace|remove|add\s)",
+    r"(looks good|no issues|lgtm|good to go|all good|ship it|no problems"
+    r"|no changes needed|satisf|well.implemented|complete and correct)",
     re.IGNORECASE,
 )
 
 
-def _validate_review_with_claude(
+# ── Review Part 1: Codex primary review ──────────────────────────────────────
+
+def _codex_primary_review(
+    codex: CodexAgent,
+    diff: str,
+    task: str,
+    plan: str,
+    iteration: int,
+    max_iterations: int,
+) -> tuple[str, bool]:
+    """Have Codex review the diff.
+
+    Returns (review_text, is_approved).
+    Returns ("", True) if the user chose approve/skip after a failure.
+    Returns ("", False) if the user chose retry (caller should continue loop).
+    """
+    # The NO-TOOLS preamble is critical: Codex in exec mode tends to run git
+    # commands to inspect context even when the diff is provided inline.
+    # Placing this instruction first — before any task content — maximises
+    # the chance Codex treats this as a pure text task.
+    prompt = (
+        "=== IMPORTANT: TEXT-ONLY TASK — DO NOT RUN ANY SHELL COMMANDS ===\n"
+        "You are a senior technical lead doing a code review.\n"
+        "ALL information you need is in this prompt.\n"
+        "DO NOT use any tools. DO NOT run git, cat, ls, or any other command.\n"
+        "Respond with plain text only.\n"
+        "=== END IMPORTANT ===\n\n"
+        "REVIEW RULES:\n"
+        "- Flag ONLY: actual bugs, logic errors, deviations from the plan.\n"
+        "- Do NOT flag: missing tests, documentation, comments, or style.\n"
+        "- If the implementation correctly follows the plan, reply APPROVED.\n"
+        f"- This is review cycle {iteration} of {max_iterations}. Be decisive.\n\n"
+        f"TASK:\n{task}\n\n"
+        f"PLAN:\n{plan[:2000]}\n\n"
+        f"DIFF (this is ALL the code — do not inspect any files):\n"
+        f"```diff\n{diff[:4000]}\n```\n\n"
+        "Your response MUST start with exactly one of these two lines:\n"
+        "APPROVED\n"
+        "CHANGES_REQUESTED\n\n"
+        "If CHANGES_REQUESTED, list each confirmed issue as a numbered bullet.\n"
+        "Reference specific lines/functions. No style or test requests."
+    )
+
+    console.print("[bold green]▶  Codex is reviewing the diff ...[/]")
+    try:
+        review = codex.review_query(prompt)
+        console.print("[bold green]✓  Codex review received.[/]")
+        log_agent("Codex (Review Part 1)", review)
+    except RuntimeError as exc:
+        log_error(f"Codex review failed: {exc}")
+        choice = click.prompt(
+            click.style(
+                "Codex review failed. What now?",
+                fg="yellow", bold=True,
+            ),
+            type=click.Choice(["approve", "retry", "skip"], case_sensitive=False),
+            default="retry",
+        )
+        if choice == "retry":
+            return "", False  # caller: continue to next iteration
+        # approve or skip → treat as approved
+        return "", True
+
+    # Determine verdict
+    if _APPROVED_PAT.search(review) and not _CHANGES_PAT.search(review):
+        return review, True
+    if _LOOKS_GOOD.search(review) and not _CHANGES_PAT.search(review):
+        return review, True
+    if not _CHANGES_PAT.search(review):
+        # No explicit changes requested → treat as approved
+        log_info("Codex did not request changes — treating as approved.")
+        return review, True
+
+    return review, False
+
+
+# ── Review Part 2: Claude secondary review ───────────────────────────────────
+
+def _claude_secondary_review(
     claude: ClaudeAgent,
     codex_review: str,
     diff: str,
     task: str,
     plan: str,
-) -> tuple[bool, str]:
-    """Have Claude validate Codex's review comments before acting on them.
+) -> tuple[str, bool]:
+    """Have Claude validate and aggregate Codex's findings.
 
-    Returns (should_apply, validated_feedback). If Claude agrees the feedback
-    is valid, should_apply is True and validated_feedback contains only the
-    legitimate issues. If Claude disagrees, should_apply is False.
+    Returns (aggregated_feedback, has_confirmed_issues).
+    Falls back to trusting Codex directly if Claude's query fails.
     """
-    validate_prompt = (
-        "You are Claude, a senior technical lead. Codex reviewed a developer's "
-        "implementation and requested changes. Your job is to VALIDATE whether "
-        "Codex's feedback is legitimate.\n\n"
-        "RULES:\n"
-        "- Only actual bugs, logic errors, or plan deviations are valid.\n"
-        "- Requests for tests, docs, style changes, or hypothetical issues are NOT valid.\n"
-        "- If Codex is hallucinating issues that don't exist in the diff, reject them.\n"
-        "- If even ONE issue is legitimate, return VALID and list only the real issues.\n"
-        "- If ALL issues are invalid, return INVALID.\n\n"
-        f"TASK: {task}\n\n"
+    prompt = (
+        "You are a senior technical lead doing a secondary code review.\n"
+        "Codex (another lead) reviewed the diff and flagged issues.\n"
+        "Your job: validate each finding against the actual diff.\n\n"
+        "VALIDATION RULES:\n"
+        "- VALID: actual bugs, logic errors, plan deviations visible in the diff.\n"
+        "- INVALID: requests for tests, docs, comments, style, or anything not\n"
+        "  visible in the diff below.\n"
+        "- Reject hallucinated issues (issues Codex claims exist but the diff\n"
+        "  shows are already handled or don't exist at all).\n\n"
+        f"TASK:\n{task}\n\n"
         f"PLAN:\n{plan[:2000]}\n\n"
         f"DIFF:\n```diff\n{diff[:3000]}\n```\n\n"
-        f"CODEX REVIEW:\n{codex_review}\n\n"
-        "Reply with EXACTLY one line first:\n"
-        "VALID — or — INVALID\n\n"
-        "If VALID, list only the legitimate issues as bullet points."
+        f"CODEX FINDINGS:\n{codex_review}\n\n"
+        "Your response MUST start with exactly one of:\n"
+        "CONFIRMED — at least one issue is valid\n"
+        "APPROVED  — all issues are invalid, implementation is correct\n\n"
+        "If CONFIRMED, list ONLY the confirmed issues as numbered bullets.\n"
+        "One sentence each. Actionable. No new issues beyond what Codex flagged."
     )
 
-    log_info("Claude is validating Codex's review ...")
+    log_info("Review Part 2 — Claude is validating Codex's findings ...")
     try:
-        validation = claude.query(validate_prompt)
-        log_agent("Claude (review validation)", validation)
-    except RuntimeError:
-        log_info("Claude validation failed — proceeding with Codex review as-is.")
-        return True, codex_review
+        result = claude.query(prompt)
+        log_agent("Claude (Review Part 2)", result)
+    except RuntimeError as exc:
+        log_error(f"Claude secondary review failed: {exc} — using Codex review as-is.")
+        return codex_review, True  # fall back to trusting Codex's findings
 
-    upper = validation.strip().upper()
-    if upper.startswith("INVALID"):
-        return False, validation
-    return True, validation
+    has_issues = bool(_CONFIRMED_PAT.search(result)) and not bool(_CLAUDE_APPROVED_PAT.search(result.split("\n")[0]))
+    return result, has_issues
 
+
+# ── Main review loop ─────────────────────────────────────────────────────────
 
 def run_review(
     task: str,
     plan: str,
     claude: ClaudeAgent,
-    codex: BaseAgent,
+    codex: CodexAgent,
     working_dir: str,
     max_iterations: int,
 ) -> bool:
-    """Have Codex review Claude's implementation with dual-admin validation.
+    """Two-phase code review loop.
 
-    Codex performs the primary review. If changes are requested, Claude
-    validates the feedback before applying it — preventing hallucinated
-    review comments from breaking working code.
+    Each cycle:
+      Part 1 — Codex reviews the diff → APPROVED or CHANGES_REQUESTED
+      Part 2 — Claude validates Codex's findings → CONFIRMED or APPROVED
+      Developer (Claude) implements all confirmed fixes.
 
-    Max iterations capped at config value. If Codex doesn't clearly request
-    changes, the review is treated as approved.
+    The loop repeats until Codex approves or max_iterations is reached.
     """
     log_phase("Phase 4: Code Review")
     max_iterations = min(max_iterations, 3)
 
     for iteration in range(1, max_iterations + 1):
-        log_info(f"Review iteration {iteration}/{max_iterations}")
+        log_info(f"Review cycle {iteration}/{max_iterations}")
 
-        diff = get_diff(working_dir)
-        if not diff:
-            log_info("No changes detected — skipping review.")
-            return True
-
-        review_prompt = (
-            "You are a senior technical lead (admin) reviewing a developer's work.\n"
-            "You do NOT write code, edit files, or run shell commands. "
-            "Do NOT inspect the repo. You review ONLY the diff below.\n"
-            "Claude (another admin) wrote the plan. A developer implemented it.\n\n"
-            "RULES:\n"
-            "- Do NOT request tests or test files. Testing is a separate workflow.\n"
-            "- Do NOT request documentation or comments unless the code is unclear.\n"
-            "- Only flag actual bugs, logic errors, or deviations from the plan.\n"
-            "- If the code correctly implements the plan, you MUST approve it.\n"
-            f"- You have {max_iterations} iterations total. Make a decision.\n\n"
-            f"TASK: {task}\n\n"
-            f"PLAN:\n{plan}\n\n"
-            f"DIFF:\n```diff\n{diff[:4000]}\n```\n\n"
-            "Reply with EXACTLY one line first:\n"
-            "APPROVED — or — CHANGES_REQUESTED\n\n"
-            "If CHANGES_REQUESTED, list ONLY actual bugs or logic errors as bullet points. "
-            "Do NOT request tests, docs, or stylistic changes."
-        )
-
-        log_info("Codex is reviewing ...")
+        # ── Collect diff ──────────────────────────────────────────────────
+        log_info(f"Staging and collecting diff (working dir: {working_dir}) ...")
         try:
-            review = codex.query(review_prompt)
+            diff = get_diff(working_dir)
         except RuntimeError as exc:
-            log_error(f"Codex review failed: {exc}")
-            choice = click.prompt(
-                click.style(
-                    "Codex returned nothing. Approve anyway, retry, or skip?",
-                    fg="yellow", bold=True,
-                ),
-                type=click.Choice(["approve", "retry", "skip"], case_sensitive=False),
-                default="retry",
+            log_error(f"Could not collect diff: {exc}")
+            log_info("Skipping review — diff unavailable.")
+            return True
+        if not diff:
+            console.print()
+            console.print(
+                "[bold yellow]⚠  No changes detected in the diff — "
+                "Codex review will be skipped and the task auto-approved.[/]"
             )
-            if choice == "approve":
-                log_success("Code review: APPROVED (by user)")
-                return True
-            elif choice == "retry":
-                continue
-            else:
-                log_info("Review skipped by user.")
-                return True
-        log_agent("Codex", review)
-
-        # Check for explicit approval
-        review_upper = review.strip().upper()
-        if review_upper.startswith("APPROVED") or _LOOKS_GOOD.search(review):
-            log_success("Code review: APPROVED")
+            console.print(
+                f"[dim]  Working dir: {working_dir}\n"
+                "  This usually means Claude's implementation produced no file changes,\n"
+                "  all changes were in excluded build dirs, or the working directory\n"
+                "  does not match where files were written.[/]"
+            )
+            console.print()
             return True
 
-        # Only treat as changes requested if there are clear fix requests
-        if not _CHANGES_NEEDED.search(review):
-            log_info("No clear changes requested — treating as approved.")
-            log_success("Code review: APPROVED")
-            return True
-
-        # Last iteration: don't send to Claude, just approve
-        if iteration == max_iterations:
-            log_info("Final review iteration — approving to proceed.")
-            log_success("Code review: APPROVED (max iterations)")
-            return True
-
-        # Dual-admin validation: Claude checks if Codex's feedback is legitimate
-        should_apply, validated = _validate_review_with_claude(
-            claude, review, diff, task, plan,
+        # Show diff statistics so the user can confirm Codex is reviewing real changes
+        diff_lines = diff.splitlines()
+        files_changed = sum(1 for l in diff_lines if l.startswith("diff --git"))
+        added = sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++"))
+        removed = sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("---"))
+        console.print(
+            f"  [bold green]Diff collected:[/] [dim]{files_changed} file(s) · "
+            f"+{added} / -{removed} lines[/]"
         )
 
-        if not should_apply:
-            log_info("Claude rejected Codex's review — feedback was invalid.")
-            log_success("Code review: APPROVED (validated by Claude)")
+        # ── Review Part 1: Codex primary review ──────────────────────────
+        log_phase(
+            f"Review Part 1 — Codex primary review "
+            f"(cycle {iteration}/{max_iterations})"
+        )
+        codex_review, approved = _codex_primary_review(
+            codex, diff, task, plan, iteration, max_iterations,
+        )
+
+        if approved and codex_review:
+            log_success("Code review: APPROVED (Codex)")
             return True
 
-        # Changes validated — send to developer for fixes
-        log_info("Changes validated — sending to developer ...")
+        if approved and not codex_review:
+            # Codex failed; user chose approve/skip
+            log_success("Code review: APPROVED (user)")
+            return True
+
+        if not codex_review:
+            # Codex failed; user chose retry → continue to next iteration
+            log_info("Retrying review in next cycle ...")
+            continue
+
+        # ── Review Part 2: Claude secondary review ────────────────────────
+        # NOTE: this always runs even on the last iteration so that Codex's
+        # findings are validated and fixes are sent to Claude at least once.
+        # The max-cycles bailout moves to AFTER the fix phase below.
+        log_phase(
+            f"Review Part 2 — Claude validates Codex's findings "
+            f"(cycle {iteration}/{max_iterations})"
+        )
+        aggregated, has_issues = _claude_secondary_review(
+            claude, codex_review, diff, task, plan,
+        )
+
+        if not has_issues:
+            log_info("Claude found no valid issues in Codex's review.")
+            log_success("Code review: APPROVED (Claude validation)")
+            return True
+
+        # ── Developer fix ─────────────────────────────────────────────────
+        log_info("Confirmed issues found — sending to developer for fixes ...")
         fix_prompt = (
-            "You are the developer. The admins reviewed your work and requested changes.\n\n"
-            f"Review feedback (validated by both admins):\n{validated}\n\n"
-            f"TASK: {task}\n"
+            "You are the developer. Two senior technical leads reviewed your "
+            "implementation.\n\n"
+            "Codex flagged issues and Claude confirmed each one is a real bug "
+            "or logic error — not style, tests, or documentation.\n\n"
+            "CONFIRMED ISSUES (fix every one of these):\n"
+            f"{aggregated}\n\n"
+            f"TASK:\n{task}\n\n"
             f"PLAN:\n{plan}\n\n"
-            "Fix ONLY actual bugs or logic errors. Ignore requests for tests or docs. "
-            "No commentary, just fix the code."
+            "Fix ONLY the confirmed issues listed above.\n"
+            "Do not touch anything else. No commentary, just implement the fixes."
         )
         fix_output = claude.implement(fix_prompt)
-        log_agent("Claude (developer)", fix_output)
+        log_agent("Claude (developer fix)", fix_output)
 
-    # Should not reach here, but just in case
+        # Max cycles reached — approve after this fix rather than re-reviewing
+        if iteration == max_iterations:
+            log_info("Max review cycles reached — approving after final fix.")
+            log_success("Code review: APPROVED (max cycles, fixes applied)")
+            return True
+
     log_success("Code review: APPROVED")
     return True

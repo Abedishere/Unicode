@@ -13,7 +13,12 @@
       "WebFetch(domain:rich.readthedocs.io)",
       "Bash(pip show:*)",
       "Bash(echo:*)",
-      "Bash(CLAUDECODE= claude --help)"
+      "Bash(CLAUDECODE= claude --help)",
+      "WebFetch(domain:developers.openai.com)",
+      "Bash(cd /c/Users/user/ai-orchestrator && npx skills add https://github.com/vercel-labs/skills --skill find-skills 2>&1)",
+      "Bash(cd /c/Users/user/ai-orchestrator && npx skills add https://github.com/vercel-labs/skills --skill find-skills -y 2>&1)",
+      "Bash(npx skills:*)",
+      "Bash(echo no codex config:*)"
     ]
   }
 }

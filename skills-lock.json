@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "skills": {
+    "find-skills": {
+      "source": "vercel-labs/skills",
+      "sourceType": "github",
+      "computedHash": "25872a21881a950edc3db1f3329664d60405d539660ce05b3265db2de06a7dfd"
+    },
+    "project-memory": {
+      "source": "spillwavesolutions/project-memory",
+      "sourceType": "github",
+      "computedHash": "3ab50b3c8e9f3cdce9c2b6e59bdbf04362281d50160a7c51ff598b3dfe4c05f3"
+    }
+  }
+}
