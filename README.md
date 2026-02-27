@@ -149,7 +149,7 @@ npx skills add https://github.com/vercel-labs/skills --skill find-skills -g
 Agents can run `npx skills find [query]` to discover skills on demand.
 
 ### project-memory
-Defines a structured format for persistent project notes in `docs/project_notes/`. The orchestrator writes to these files automatically at the end of every task.
+Defines a structured format for persistent project notes in `.orchestrator/`. The orchestrator writes to these files automatically at the end of every task.
 
 ```bash
 # Install (already included, but to update)
@@ -165,7 +165,7 @@ After each run, unicode maintains two parallel memory stores in your working dir
 **YAML index** (`.orchestrator/memory.yaml`) — machine-queryable, auto-injected into every agent prompt:
 - Architecture decisions, codebase conventions, past mistakes, task history
 
-**Markdown notes** (`docs/project_notes/`) — human-readable, follows `project-memory` skill format:
+**Markdown notes** (`.orchestrator/`) — human-readable, follows `project-memory` skill format:
 
 | File | Contents |
 |---|---|
@@ -183,10 +183,10 @@ Relevant entries from both stores are automatically surfaced in agent prompts fo
 | `CLAUDE.md` | Codex (synthesized) | Project context for Claude Code CLI |
 | `AGENTS.md` | Codex (synthesized) | Project context for Codex CLI |
 | `orchestrator.md` | Qwen | Full project summary, architecture, folder structure |
-| `docs/project_notes/bugs.md` | Orchestrator | Structured bug log |
-| `docs/project_notes/decisions.md` | Orchestrator | Architectural Decision Records |
-| `docs/project_notes/key_facts.md` | Orchestrator | Project config and key facts |
-| `docs/project_notes/issues.md` | Orchestrator | Work log |
+| `.orchestrator/bugs.md` | Orchestrator | Structured bug log |
+| `.orchestrator/decisions.md` | Orchestrator | Architectural Decision Records |
+| `.orchestrator/key_facts.md` | Orchestrator | Project config and key facts |
+| `.orchestrator/issues.md` | Orchestrator | Work log |
 | `.orchestrator/history.md` | Orchestrator | Run history |
 | `.orchestrator/plan.md` | Orchestrator | Latest implementation plan |
 | `.orchestrator/memory.yaml` | Orchestrator | Machine-queryable memory index |

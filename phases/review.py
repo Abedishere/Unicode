@@ -168,7 +168,7 @@ def run_review(
     codex: CodexAgent,
     working_dir: str,
     max_iterations: int,
-) -> bool:
+) -> tuple[bool, str]:
     """Two-phase code review loop.
 
     Each cycle:
@@ -177,9 +177,13 @@ def run_review(
       Developer (Claude) implements all confirmed fixes.
 
     The loop repeats until Codex approves or max_iterations is reached.
+
+    Returns (approved, review_text) where review_text is the accumulated
+    review feedback (used by the orchestrator to extract learnings).
     """
     log_phase("Phase 4: Code Review")
     max_iterations = min(max_iterations, 3)
+    review_feedback: list[str] = []
 
     for iteration in range(1, max_iterations + 1):
         log_info(f"Review cycle {iteration}/{max_iterations}")
@@ -191,7 +195,7 @@ def run_review(
         except RuntimeError as exc:
             log_error(f"Could not collect diff: {exc}")
             log_info("Skipping review — diff unavailable.")
-            return True
+            return True, "\n\n".join(review_feedback)
         if not diff:
             console.print()
             console.print(
@@ -205,7 +209,7 @@ def run_review(
                 "  does not match where files were written.[/]"
             )
             console.print()
-            return True
+            return True, "\n\n".join(review_feedback)
 
         # Show diff statistics so the user can confirm Codex is reviewing real changes
         diff_lines = diff.splitlines()
@@ -226,14 +230,17 @@ def run_review(
             codex, diff, task, plan, iteration, max_iterations,
         )
 
+        if codex_review:
+            review_feedback.append(f"Codex Review (cycle {iteration}):\n{codex_review}")
+
         if approved and codex_review:
             log_success("Code review: APPROVED (Codex)")
-            return True
+            return True, "\n\n".join(review_feedback)
 
         if approved and not codex_review:
             # Codex failed; user chose approve/skip
             log_success("Code review: APPROVED (user)")
-            return True
+            return True, "\n\n".join(review_feedback)
 
         if not codex_review:
             # Codex failed; user chose retry → continue to next iteration
@@ -252,10 +259,13 @@ def run_review(
             claude, codex_review, diff, task, plan,
         )
 
+        if aggregated:
+            review_feedback.append(f"Claude Validation (cycle {iteration}):\n{aggregated}")
+
         if not has_issues:
             log_info("Claude found no valid issues in Codex's review.")
             log_success("Code review: APPROVED (Claude validation)")
-            return True
+            return True, "\n\n".join(review_feedback)
 
         # ── Developer fix ─────────────────────────────────────────────────
         log_info("Confirmed issues found — sending to developer for fixes ...")
@@ -278,7 +288,7 @@ def run_review(
         if iteration == max_iterations:
             log_info("Max review cycles reached — approving after final fix.")
             log_success("Code review: APPROVED (max cycles, fixes applied)")
-            return True
+            return True, "\n\n".join(review_feedback)
 
     log_success("Code review: APPROVED")
-    return True
+    return True, "\n\n".join(review_feedback)

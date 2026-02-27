@@ -5,7 +5,7 @@ Maintains two complementary stores:
 1. **YAML machine index** (``.orchestrator/memory.yaml``) — queryable, auto-injected
    into every agent prompt via ``get_context_for_task()``.
 
-2. **Markdown notes** (``docs/project_notes/``) — human-readable, structured entries
+2. **Markdown notes** (``.orchestrator/``) — human-readable, structured entries
    per the project-memory skill format:
        bugs.md       — bug log with root cause, solution, prevention
        decisions.md  — Architectural Decision Records (ADRs)
@@ -124,7 +124,7 @@ def search_past_tasks(working_dir: str, query: str) -> list[dict]:
 
 # ── Markdown notes store (project-memory skill) ───────────────────────────────
 
-_PROJECT_NOTES_DIR = "docs/project_notes"
+_PROJECT_NOTES_DIR = ".orchestrator"
 
 _NOTE_INITIAL_CONTENT = {
     "bugs.md": (
@@ -151,7 +151,7 @@ _NOTE_INITIAL_CONTENT = {
 
 
 def _notes_path(working_dir: str, filename: str) -> Path:
-    """Return the Path to a docs/project_notes/ file."""
+    """Return the Path to a .orchestrator/ file."""
     return Path(working_dir) / _PROJECT_NOTES_DIR / filename
 
 
@@ -169,7 +169,7 @@ def _next_adr_number(working_dir: str) -> int:
 
 
 def init_project_notes(working_dir: str) -> None:
-    """Create ``docs/project_notes/`` with the four memory files if absent.
+    """Create ``.orchestrator/`` with the four memory files if absent.
 
     Idempotent — safe to call on every startup.  Existing files are never
     overwritten; only missing ones are created.
@@ -199,7 +199,7 @@ def log_bug(
     solution: str = "",
     prevention: str = "",
 ) -> None:
-    """Append a structured bug entry to ``docs/project_notes/bugs.md``.
+    """Append a structured bug entry to ``.orchestrator/bugs.md``.
 
     Format::
 
@@ -229,7 +229,7 @@ def log_decision(
     alternatives: str = "",
     consequences: str = "",
 ) -> None:
-    """Append an ADR to ``docs/project_notes/decisions.md`` with auto-numbering.
+    """Append an ADR to ``.orchestrator/decisions.md`` with auto-numbering.
 
     Format::
 
@@ -269,7 +269,7 @@ def log_issue(
     url: str = "",
     notes: str = "",
 ) -> None:
-    """Append a work log entry to ``docs/project_notes/issues.md``.
+    """Append a work log entry to ``.orchestrator/issues.md``.
 
     Format::
 
@@ -293,7 +293,7 @@ def log_issue(
 
 
 def log_key_fact(working_dir: str, category: str, fact: str) -> None:
-    """Append a key fact bullet under *category* in ``docs/project_notes/key_facts.md``.
+    """Append a key fact bullet under *category* in ``.orchestrator/key_facts.md``.
 
     Always appends a new ``### <category>`` block.  Human review can
     consolidate duplicate sections over time.
@@ -306,7 +306,7 @@ def log_key_fact(working_dir: str, category: str, fact: str) -> None:
 # ── Markdown context reader ───────────────────────────────────────────────────
 
 def _read_markdown_context(working_dir: str, task: str) -> str:
-    """Search ``docs/project_notes/`` and return relevant excerpts for *task*.
+    """Search ``.orchestrator/`` and return relevant excerpts for *task*.
 
     Splits each file into ``###`` sections and scores them by keyword overlap
     with the task.  Returns a formatted string of the top matches, or ``""``
@@ -343,13 +343,13 @@ def _read_markdown_context(working_dir: str, task: str) -> str:
     parts = []
     bug_hits = _top_sections("bugs.md")
     if bug_hits:
-        parts.append("RELEVANT BUGS (docs/project_notes/bugs.md):\n" + "\n".join(bug_hits))
+        parts.append("RELEVANT BUGS (.orchestrator/bugs.md):\n" + "\n".join(bug_hits))
     dec_hits = _top_sections("decisions.md")
     if dec_hits:
-        parts.append("RELEVANT DECISIONS (docs/project_notes/decisions.md):\n" + "\n".join(dec_hits))
+        parts.append("RELEVANT DECISIONS (.orchestrator/decisions.md):\n" + "\n".join(dec_hits))
     fact_hits = _top_sections("key_facts.md")
     if fact_hits:
-        parts.append("KEY FACTS (docs/project_notes/key_facts.md):\n" + "\n".join(fact_hits))
+        parts.append("KEY FACTS (.orchestrator/key_facts.md):\n" + "\n".join(fact_hits))
 
     return "\n\n".join(parts)
 
@@ -361,7 +361,7 @@ def get_context_for_task(working_dir: str, task: str) -> str:
 
     Combines:
     - YAML index: architecture decisions, conventions, past mistakes, related tasks
-    - Markdown notes: relevant bugs, decisions, and key facts from docs/project_notes/
+    - Markdown notes: relevant bugs, decisions, and key facts from .orchestrator/
 
     Returns a formatted string to prepend to agent prompts.
     """
@@ -398,7 +398,7 @@ def get_context_for_task(working_dir: str, task: str) -> str:
         lines = [f"  - [{e['date']}] {e['task']} ({e['outcome']})" for e in related]
         sections.append("RELATED PAST TASKS:\n" + "\n".join(lines))
 
-    # Markdown notes (keyword-matched excerpts from docs/project_notes/)
+    # Markdown notes (keyword-matched excerpts from .orchestrator/)
     md_context = _read_markdown_context(working_dir, task)
     if md_context:
         sections.append(md_context)

@@ -37,7 +37,7 @@ Finalization         — Commit, push (optional), update CLAUDE.md / AGENTS.md /
 - Role separation: Qwen plans, Claude implements and reviews, Codex reviews and implements minor fixes
 - Every approval gate is interactive (or auto-approved in `--auto` mode)
 - Agents communicate via prompt construction — no direct API calls between agents
-- Persistent state survives between sessions via `.orchestrator/` and `docs/project_notes/`
+- Persistent state survives between sessions via `.orchestrator/` (all memory, notes, history, and YAML index live there)
 
 ---
 
@@ -69,28 +69,28 @@ ai-orchestrator/
 │   ├── git_utils.py         git add/diff/commit/push helpers. Windows-safe (junction points).
 │   ├── history.py           Run history (.orchestrator/history.md), CLAUDE.md / AGENTS.md synthesis.
 │   ├── logger.py            Structured terminal logging (Rich). Transcript file writer.
+│   ├── init_project.py      /init command: scans codebase, Qwen fills all memory files.
 │   ├── memory.py            Dual-write memory system (YAML index + markdown notes).
 │   ├── runner.py            Subprocess runner with timeout, streaming, cancel support.
 │   └── session.py           Session save/resume (.orchestrator/sessions/).
 │
-├── .orchestrator/           Auto-generated run data (gitignored)
+├── .orchestrator/           All auto-generated and persistent state (gitignored)
+│   ├── memory.yaml          Machine-queryable memory index — injected into every prompt.
 │   ├── history.md           Log of every completed run with task, outcome, duration.
-│   ├── memory.yaml          Machine-queryable memory index (YAML).
 │   ├── plan.md              Most recent implementation plan.
+│   ├── bugs.md              Bug log: date, issue, root cause, solution, prevention.
+│   ├── decisions.md         Architectural Decision Records (ADR-001, ADR-002, ...).
+│   ├── key_facts.md         Project config, ports, URLs, conventions — filled by Qwen /init.
+│   ├── issues.md            Work log: completed tasks with outcomes.
+│   ├── sessions/            Saved session checkpoints (JSON).
 │   └── transcript_*.log     Full conversation transcripts per run.
 │
 ├── .agents/skills/          Universal agent skills directory (npx skills convention)
 │   ├── find-skills/         Meta-skill: agents can search for and install new skills.
-│   └── project-memory/      Memory skill: structured note-taking in docs/project_notes/.
+│   └── project-memory/      Memory skill: structured note-taking format reference.
 │
 ├── .claude/skills/          Claude Code skills (symlinks → .agents/skills/)
 ├── .qwen/skills/            Qwen skills (symlinks → .agents/skills/)
-│
-├── docs/project_notes/      Human-readable persistent memory (project-memory skill format)
-│   ├── bugs.md              Bug log: date, issue, root cause, solution, prevention.
-│   ├── decisions.md         Architectural Decision Records (ADR-001, ADR-002, ...).
-│   ├── key_facts.md         Project config, ports, URLs, conventions.
-│   └── issues.md            Work log: completed tasks with outcomes.
 │
 ├── CLAUDE.md                Claude Code context file — read on every startup.
 └── AGENTS.md                Codex/generic agent context file — read on every startup.
@@ -125,7 +125,7 @@ The orchestrator integrates with the `npx skills` ecosystem so that agents can d
 
 ### project-memory
 - **Source:** `npx skills add https://github.com/spillwavesolutions/project-memory --skill project-memory`
-- **Purpose:** Structured persistent memory in `docs/project_notes/`. Defines format for bug logs (with root cause / solution / prevention), ADRs (Architectural Decision Records), key facts, and work logs.
+- **Purpose:** Defines the structured format for memory entries. All notes now live in `.orchestrator/` (bugs.md, decisions.md, key_facts.md, issues.md). Qwen populates them on `/init`; the orchestrator appends automatically at finalization.
 - **Installed at:** `.agents/skills/project-memory`, `.claude/skills/project-memory`, `.qwen/skills/project-memory`
 - **Global (Codex):** `~/.agents/skills/project-memory`, `~/.codex/skills/project-memory`
 - **Orchestrator integration:** `utils/memory.py` implements all four note types (`log_bug`, `log_decision`, `log_issue`, `log_key_fact`) following the exact skill format. Notes are written automatically at finalization.
@@ -141,12 +141,12 @@ Two complementary stores run in parallel and are both written at the end of ever
 - Categories: `patterns_learned`, `codebase_conventions`, `past_mistakes`, `architecture_decisions`, `task_index`
 - Keyword-searched to find relevant past tasks and surface them in future prompts
 
-**Markdown notes** (`docs/project_notes/`)
-- Human-readable; follows `project-memory` skill format
-- `bugs.md` — structured bug log with root causes and prevention notes
-- `decisions.md` — ADRs with context, decision, alternatives, consequences
-- `key_facts.md` — project config, credentials, ports, important URLs
-- `issues.md` — work log with completed tasks and outcomes
+**Markdown notes** (`.orchestrator/`) — same directory as the YAML index
+- Human-readable; Qwen fills them on first run via `/init`, orchestrator appends on every task
+- `.orchestrator/bugs.md` — structured bug log with root causes and prevention notes
+- `.orchestrator/decisions.md` — ADRs with context, decision, alternatives, consequences
+- `.orchestrator/key_facts.md` — project config, credentials, ports, important URLs
+- `.orchestrator/issues.md` — work log with completed tasks and outcomes
 - Also keyword-searched and excerpted into agent prompts
 
 **Context injection:** `get_context_for_task(working_dir, task)` combines both stores and prepends the most relevant entries to every agent prompt, giving agents institutional knowledge from past runs.
