@@ -1917,8 +1917,9 @@ def _run_task(
         log_error("Task finished — implementation was not approved.")
 
 
-@click.command()
-@click.argument("task", required=False, default=None)
+@click.group(invoke_without_command=True)
+@click.pass_context
+@click.option("--task", default=None, help="Task to perform (or enter interactively).")
 @click.option("--config", "config_path", default="config.yaml", help="Config file path.")
 @click.option("--rounds", type=int, default=None, help="Override discussion rounds.")
 @click.option("--auto-commit", is_flag=True, default=None, help="Auto-commit on approval.")
@@ -1941,6 +1942,7 @@ def _run_task(
 @click.option("--resume", "resume_id", default=None,
     help="Resume a saved session by ID.")
 def main(
+    ctx: click.Context,
     task: str | None,
     config_path: str,
     rounds: int | None,
@@ -1954,6 +1956,12 @@ def main(
     resume_id: str | None,
 ):
     """Orchestrate Claude Code and Codex to collaboratively complete TASK."""
+    if ctx.invoked_subcommand is not None:
+        return  # delegate to subcommand (e.g. `unicode activate <key>`)
+
+    from utils.license import check_license
+    check_license()
+
     # Install double Ctrl+C handler
     signal.signal(signal.SIGINT, _sigint_handler)
 
@@ -2158,6 +2166,14 @@ def main(
             log_error(f"Orchestrator failed: {exc}")
             console.print("[dim]Enter a new task or Ctrl+C twice to exit.[/]")
             continue
+
+
+@main.command("activate")
+@click.argument("key")
+def activate_cmd(key: str):
+    """Activate a license key (unicode activate <key>)."""
+    from utils.license import activate
+    activate(key)
 
 
 if __name__ == "__main__":
