@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.env
+.orchestrator/
+.idea/
+assets/
+AGENTS.md
+CLAUDE.md
+orchestrator.md
+pyproject.toml

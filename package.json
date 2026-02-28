@@ -1,0 +1,26 @@
+{
+  "name": "ai-orchestrator",
+  "version": "0.1.0",
+  "description": "Orchestrate Claude Code and Codex CLI into an automated agentic workflow",
+  "bin": {
+    "unicode": "./bin/unicode.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "orchestrator.py",
+    "config.yaml",
+    "requirements.txt",
+    "agents/",
+    "phases/",
+    "utils/"
+  ],
+  "keywords": ["ai", "orchestrator", "claude", "codex", "automation", "unicode"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=14"
+  }
+}
