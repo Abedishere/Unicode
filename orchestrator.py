@@ -639,8 +639,10 @@ def _clear_below_cursor(n: int, restore_col: int = 0) -> None:
     sys.stdout.flush()
 
 
-def _render_slash_menu(typed: str, prev_n: int, restore_col: int = 0) -> int:
+def _render_slash_menu(typed: str, prev_n: int, restore_col: int = 0, sel: int = -1) -> int:
     """Show the slash-command picker below the prompt line.
+
+    *sel* is the 0-based index of the highlighted row (-1 = none).
 
     Returns a positive count if a menu was drawn (for *prev_n* tracking),
     0 if nothing matched.  Always erases below the cursor first via
@@ -664,8 +666,11 @@ def _render_slash_menu(typed: str, prev_n: int, restore_col: int = 0) -> int:
     rows_down = 0
     sys.stdout.write("\r\n")                 # blank gap line
     rows_down += 1
-    for cmd, desc in matches:
-        sys.stdout.write(f"\r\n  \033[1;35m{cmd:<22}\033[0m \033[2m{desc}\033[0m")
+    for i, (cmd, desc) in enumerate(matches):
+        if i == sel:
+            sys.stdout.write(f"\r\n \033[1;35m>\033[0m \033[1;35;7m{cmd:<22}\033[0m \033[2m{desc}\033[0m")
+        else:
+            sys.stdout.write(f"\r\n   \033[1;35m{cmd:<22}\033[0m \033[2m{desc}\033[0m")
         rows_down += 1
 
     # ── Return to prompt line ────────────────────────────────────
@@ -970,12 +975,38 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
     buf: list[str] = list(initial_text)
     cursor = len(initial_text)    # position inside buf
     menu_n = 0                    # slash-menu lines currently displayed
+    menu_sel = -1                 # currently highlighted slash-menu row (-1 = none)
 
     while True:
         ch = msvcrt.getwch()
 
         # ── Enter ─────────────────────────────────────────────────
         if ch in ("\r", "\n"):
+            # If a menu item is highlighted, fill it in (and submit if no args needed).
+            if primary and menu_n and menu_sel >= 0:
+                text = "".join(buf)
+                base = text.split()[0] if text.split() else text
+                matches = [(c, d) for c, d in _SLASH_COMMANDS
+                           if c.split()[0].startswith(base)]
+                if 0 <= menu_sel < len(matches):
+                    sel_cmd, _ = matches[menu_sel]
+                    keyword = sel_cmd.split()[0]        # e.g. "/ask"
+                    needs_args = "<" in sel_cmd         # e.g. "/ask <question>"
+                    _clear_below_cursor(menu_n, 0)
+                    menu_n = 0
+                    menu_sel = -1
+                    if needs_args:
+                        # Fill keyword + space into buffer so the user can add the argument.
+                        buf = list(keyword + " ")
+                        cursor = len(buf)
+                        sys.stdout.write(f"\r{prompt_ansi}{keyword} \033[K")
+                        sys.stdout.flush()
+                        continue
+                    else:
+                        # No arguments needed — submit immediately.
+                        sys.stdout.write("\r\n")
+                        sys.stdout.flush()
+                        return (keyword, None, "submit")
             if menu_n:
                 _clear_below_cursor(menu_n, 0)
                 menu_n = 0
@@ -1023,10 +1054,12 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
                     text = "".join(buf)
                     col = cursor + 3
                     if text.startswith("/"):
+                        menu_sel = -1
                         menu_n = _render_slash_menu(text, menu_n, col)
                     elif menu_n:
                         _clear_below_cursor(menu_n, col)
                         menu_n = 0
+                        menu_sel = -1
             continue
 
         # ── Special keys (arrows, Home, End, Delete) ──────────────
@@ -1046,16 +1079,26 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
                     sys.stdout.flush()
 
             elif ch2 == "H":        # ↑ Up
-                if primary and not buf and _attachment_count() > 0:
-                    if menu_n:
-                        _clear_below_cursor(menu_n, 3)
-                        menu_n = 0
+                if primary and menu_n:
+                    text = "".join(buf)
+                    base = text.split()[0] if text.split() else text
+                    n_m = sum(1 for c, _ in _SLASH_COMMANDS if c.split()[0].startswith(base))
+                    if n_m:
+                        menu_sel = (menu_sel - 1) % n_m
+                        menu_n = _render_slash_menu(text, menu_n, cursor + 3, sel=menu_sel)
+                elif primary and not buf and _attachment_count() > 0:
                     _run_selection_mode()
                     # selection mode redraws with `> ` — keep reading
                 # else: no-op (no history implemented)
 
             elif ch2 == "P":        # ↓ Down
-                pass                # no-op
+                if primary and menu_n:
+                    text = "".join(buf)
+                    base = text.split()[0] if text.split() else text
+                    n_m = sum(1 for c, _ in _SLASH_COMMANDS if c.split()[0].startswith(base))
+                    if n_m:
+                        menu_sel = (menu_sel + 1) % n_m
+                        menu_n = _render_slash_menu(text, menu_n, cursor + 3, sel=menu_sel)
 
             elif ch2 == "G":        # Home
                 if cursor > 0:
@@ -1084,8 +1127,16 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
                 if base.startswith("/"):
                     hits = [c.split()[0] for c, _ in _SLASH_COMMANDS
                             if c.split()[0].startswith(base)]
-                    if len(hits) == 1:
-                        comp = hits[0][len(base):]
+                    # Use highlighted item if one is selected, else fall back
+                    # to the only match (original behaviour).
+                    if 0 <= menu_sel < len(hits):
+                        target = hits[menu_sel]
+                    elif len(hits) == 1:
+                        target = hits[0]
+                    else:
+                        target = None
+                    if target:
+                        comp = target[len(base):]
                         if comp:
                             extra = comp + " "
                             for c in extra:
@@ -1093,7 +1144,8 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
                                 cursor += 1
                             sys.stdout.write(extra)
                             sys.stdout.flush()
-                            menu_n = _render_slash_menu("".join(buf), menu_n, cursor + 3)
+                        menu_sel = -1
+                        menu_n = _render_slash_menu("".join(buf), menu_n, cursor + 3, sel=menu_sel)
             continue
 
         # ── Escape ────────────────────────────────────────────────
@@ -1101,6 +1153,7 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
             if menu_n:
                 _clear_below_cursor(menu_n, cursor + 3)
                 menu_n = 0
+                menu_sel = -1
             continue
 
         # ── Regular printable character ───────────────────────────
@@ -1231,10 +1284,12 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
             text = "".join(buf)
             col = cursor + 3
             if text.startswith("/"):
+                menu_sel = -1
                 menu_n = _render_slash_menu(text, menu_n, col)
             elif menu_n:
                 _clear_below_cursor(menu_n, col)
                 menu_n = 0
+                menu_sel = -1
 
 
 # ── Fallback single-line input (non-Windows) ──────────────────────────
