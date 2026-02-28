@@ -50,28 +50,11 @@ def append_history(
 
 
 _MEMORY_PROTOCOL_SECTION = (
-    "## Project Memory System\n\n"
-    "This project maintains institutional knowledge in `docs/project_notes/` "
-    "for consistency across sessions.\n\n"
-    "### Memory Files\n\n"
-    "- **bugs.md** — Bug log with dates, root causes, solutions, and prevention notes\n"
-    "- **decisions.md** — Architectural Decision Records (ADRs) with context and trade-offs\n"
-    "- **key_facts.md** — Project configuration, credentials, ports, important URLs\n"
-    "- **issues.md** — Work log with task descriptions and outcomes\n\n"
-    "### Memory-Aware Protocols\n\n"
-    "**Before proposing architectural changes:**\n"
-    "- Check `docs/project_notes/decisions.md` for existing decisions\n"
-    "- Verify the proposed approach doesn't conflict with past choices\n"
-    "- If it does conflict, acknowledge the existing decision and explain why a change is warranted\n\n"
-    "**When encountering errors or bugs:**\n"
-    "- Search `docs/project_notes/bugs.md` for similar issues\n"
-    "- Apply known solutions if found\n"
-    "- Document new bugs and their solutions when resolved\n\n"
-    "**When looking up project configuration:**\n"
-    "- Check `docs/project_notes/key_facts.md` for credentials, ports, URLs, service accounts\n"
-    "- Prefer documented facts over assumptions\n\n"
-    "**When completing work:**\n"
-    "- Outcomes are logged automatically by the orchestrator in `docs/project_notes/issues.md`\n\n"
+    "## Memory\n\n"
+    "All persistent memory lives in `.orchestrator/`:\n"
+    "- `bugs.md` · `decisions.md` · `key_facts.md` · `issues.md` · `memory.yaml`\n\n"
+    "Check these before making architectural changes or debugging known issues.\n"
+    "Run `/init` to have Qwen populate them from the codebase if they are empty.\n\n"
 )
 
 _CLAUDE_MD_HEADER = (

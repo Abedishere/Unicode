@@ -31,6 +31,7 @@ from utils.memory import (
     get_context_for_task, init_project_notes, load_memory,
     log_bug, log_decision, log_issue, log_key_fact, save_memory,
 )
+from utils.init_project import run_init
 from utils.runner import CancelledByUser, TimeoutSkipToReview
 from utils.session import Session, save_session, load_session, list_sessions
 
@@ -612,6 +613,8 @@ _SLASH_COMMANDS = [
     ("/clear-images", "Remove attached images only"),
     ("/clear-paste", "Remove pasted text only"),
     ("/auto", "Toggle auto-approve mode"),
+    ("/ask <question>", "Ask the admin agents a question (no task started)"),
+    ("/init", "Scan project & bootstrap all memory files from existing code"),
     ("/sessions", "Browse & resume a saved session"),
     ("/resume <id>", "Resume a saved session by ID"),
     ("/pause", "Save & pause current session"),
@@ -636,8 +639,10 @@ def _clear_below_cursor(n: int, restore_col: int = 0) -> None:
     sys.stdout.flush()
 
 
-def _render_slash_menu(typed: str, prev_n: int, restore_col: int = 0) -> int:
+def _render_slash_menu(typed: str, prev_n: int, restore_col: int = 0, sel: int = -1) -> int:
     """Show the slash-command picker below the prompt line.
+
+    *sel* is the 0-based index of the highlighted row (-1 = none).
 
     Returns a positive count if a menu was drawn (for *prev_n* tracking),
     0 if nothing matched.  Always erases below the cursor first via
@@ -661,8 +666,11 @@ def _render_slash_menu(typed: str, prev_n: int, restore_col: int = 0) -> int:
     rows_down = 0
     sys.stdout.write("\r\n")                 # blank gap line
     rows_down += 1
-    for cmd, desc in matches:
-        sys.stdout.write(f"\r\n  \033[1;35m{cmd:<22}\033[0m \033[2m{desc}\033[0m")
+    for i, (cmd, desc) in enumerate(matches):
+        if i == sel:
+            sys.stdout.write(f"\r\n \033[1;35m>\033[0m \033[1;35;7m{cmd:<22}\033[0m \033[2m{desc}\033[0m")
+        else:
+            sys.stdout.write(f"\r\n   \033[1;35m{cmd:<22}\033[0m \033[2m{desc}\033[0m")
         rows_down += 1
 
     # ── Return to prompt line ────────────────────────────────────
@@ -967,12 +975,38 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
     buf: list[str] = list(initial_text)
     cursor = len(initial_text)    # position inside buf
     menu_n = 0                    # slash-menu lines currently displayed
+    menu_sel = -1                 # currently highlighted slash-menu row (-1 = none)
 
     while True:
         ch = msvcrt.getwch()
 
         # ── Enter ─────────────────────────────────────────────────
         if ch in ("\r", "\n"):
+            # If a menu item is highlighted, fill it in (and submit if no args needed).
+            if primary and menu_n and menu_sel >= 0:
+                text = "".join(buf)
+                base = text.split()[0] if text.split() else text
+                matches = [(c, d) for c, d in _SLASH_COMMANDS
+                           if c.split()[0].startswith(base)]
+                if 0 <= menu_sel < len(matches):
+                    sel_cmd, _ = matches[menu_sel]
+                    keyword = sel_cmd.split()[0]        # e.g. "/ask"
+                    needs_args = "<" in sel_cmd         # e.g. "/ask <question>"
+                    _clear_below_cursor(menu_n, 0)
+                    menu_n = 0
+                    menu_sel = -1
+                    if needs_args:
+                        # Fill keyword + space into buffer so the user can add the argument.
+                        buf = list(keyword + " ")
+                        cursor = len(buf)
+                        sys.stdout.write(f"\r{prompt_ansi}{keyword} \033[K")
+                        sys.stdout.flush()
+                        continue
+                    else:
+                        # No arguments needed — submit immediately.
+                        sys.stdout.write("\r\n")
+                        sys.stdout.flush()
+                        return (keyword, None, "submit")
             if menu_n:
                 _clear_below_cursor(menu_n, 0)
                 menu_n = 0
@@ -1020,10 +1054,12 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
                     text = "".join(buf)
                     col = cursor + 3
                     if text.startswith("/"):
+                        menu_sel = -1
                         menu_n = _render_slash_menu(text, menu_n, col)
                     elif menu_n:
                         _clear_below_cursor(menu_n, col)
                         menu_n = 0
+                        menu_sel = -1
             continue
 
         # ── Special keys (arrows, Home, End, Delete) ──────────────
@@ -1043,16 +1079,26 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
                     sys.stdout.flush()
 
             elif ch2 == "H":        # ↑ Up
-                if primary and not buf and _attachment_count() > 0:
-                    if menu_n:
-                        _clear_below_cursor(menu_n, 3)
-                        menu_n = 0
+                if primary and menu_n:
+                    text = "".join(buf)
+                    base = text.split()[0] if text.split() else text
+                    n_m = sum(1 for c, _ in _SLASH_COMMANDS if c.split()[0].startswith(base))
+                    if n_m:
+                        menu_sel = (menu_sel - 1) % n_m
+                        menu_n = _render_slash_menu(text, menu_n, cursor + 3, sel=menu_sel)
+                elif primary and not buf and _attachment_count() > 0:
                     _run_selection_mode()
                     # selection mode redraws with `> ` — keep reading
                 # else: no-op (no history implemented)
 
             elif ch2 == "P":        # ↓ Down
-                pass                # no-op
+                if primary and menu_n:
+                    text = "".join(buf)
+                    base = text.split()[0] if text.split() else text
+                    n_m = sum(1 for c, _ in _SLASH_COMMANDS if c.split()[0].startswith(base))
+                    if n_m:
+                        menu_sel = (menu_sel + 1) % n_m
+                        menu_n = _render_slash_menu(text, menu_n, cursor + 3, sel=menu_sel)
 
             elif ch2 == "G":        # Home
                 if cursor > 0:
@@ -1081,8 +1127,16 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
                 if base.startswith("/"):
                     hits = [c.split()[0] for c, _ in _SLASH_COMMANDS
                             if c.split()[0].startswith(base)]
-                    if len(hits) == 1:
-                        comp = hits[0][len(base):]
+                    # Use highlighted item if one is selected, else fall back
+                    # to the only match (original behaviour).
+                    if 0 <= menu_sel < len(hits):
+                        target = hits[menu_sel]
+                    elif len(hits) == 1:
+                        target = hits[0]
+                    else:
+                        target = None
+                    if target:
+                        comp = target[len(base):]
                         if comp:
                             extra = comp + " "
                             for c in extra:
@@ -1090,7 +1144,8 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
                                 cursor += 1
                             sys.stdout.write(extra)
                             sys.stdout.flush()
-                            menu_n = _render_slash_menu("".join(buf), menu_n, cursor + 3)
+                        menu_sel = -1
+                        menu_n = _render_slash_menu("".join(buf), menu_n, cursor + 3, sel=menu_sel)
             continue
 
         # ── Escape ────────────────────────────────────────────────
@@ -1098,6 +1153,7 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
             if menu_n:
                 _clear_below_cursor(menu_n, cursor + 3)
                 menu_n = 0
+                menu_sel = -1
             continue
 
         # ── Regular printable character ───────────────────────────
@@ -1228,10 +1284,12 @@ def _prompt_line_raw(prompt_ansi: str, primary: bool = False,
             text = "".join(buf)
             col = cursor + 3
             if text.startswith("/"):
+                menu_sel = -1
                 menu_n = _render_slash_menu(text, menu_n, col)
             elif menu_n:
                 _clear_below_cursor(menu_n, col)
                 menu_n = 0
+                menu_sel = -1
 
 
 # ── Fallback single-line input (non-Windows) ──────────────────────────
@@ -1366,6 +1424,14 @@ def _prompt_task() -> str:
             if stripped.lower() == "/stop":
                 console.print("[bold red]Stopping orchestrator.[/]")
                 return "__STOP__"
+            if stripped.lower().startswith("/ask"):
+                parts = stripped.split(maxsplit=1)
+                if len(parts) > 1 and parts[1].strip():
+                    return f"__ASK__{parts[1].strip()}"
+                console.print("[dim]  Usage: /ask <question>[/]")
+                continue
+            if stripped.lower() == "/init":
+                return "__INIT__"
 
             # ── Auto-detect image path ────────────────────────────
             # Pure heuristic: looks like a path + has image extension.
@@ -1520,7 +1586,7 @@ def _extract_review_learnings(
             for lesson in lessons[:3]:
                 if isinstance(lesson, str) and lesson.strip():
                     add_learning(work_dir, "past_mistakes", lesson.strip())
-                    # Mirror to human-readable bug log (docs/project_notes/bugs.md)
+                    # Mirror to human-readable bug log (.orchestrator/bugs.md)
                     log_bug(
                         working_dir=work_dir,
                         issue=lesson.strip(),
@@ -1743,7 +1809,15 @@ def _run_task(
         rev = _run_phase("Code Review",
             run_review, task, plan, claude, codex, work_dir,
             cfg["max_review_iterations"])
-        approved = rev if rev is not None else True
+        if rev is None:
+            approved, review_text = True, ""
+        elif isinstance(rev, tuple):
+            approved, review_text = rev
+        else:
+            approved, review_text = bool(rev), ""
+        # Extract learnings from review feedback → writes to .orchestrator/bugs.md
+        if review_text:
+            _extract_review_learnings(qwen, review_text, task, work_dir)
         session.mark_phase_done("review", approved)
         save_session(work_dir, session)
     else:
@@ -1815,14 +1889,14 @@ def _run_task(
     add_task_to_index(work_dir, task, outcome, keywords)
     log_info("Task indexed in shared memory.")
 
-    # Mirror to human-readable work log (docs/project_notes/issues.md)
+    # Mirror to human-readable work log (.orchestrator/issues.md)
     log_issue(work_dir, task, outcome)
 
     # Extract learnings from the task
     if plan:
         add_learning(work_dir, "architecture_decisions",
             f"[{outcome}] {task[:100]}: {plan[:200]}")
-        # Mirror to human-readable ADR (docs/project_notes/decisions.md)
+        # Mirror to human-readable ADR (.orchestrator/decisions.md)
         log_decision(
             working_dir=work_dir,
             title=task[:60].replace("\n", " ").strip(),
@@ -1908,7 +1982,7 @@ def main(
     # Initialize agent MD files (header + orchestrator.md reference)
     init_agent_md(work_dir)
 
-    # Initialize docs/project_notes/ memory files (project-memory skill)
+    # Initialize .orchestrator/ memory files (project-memory skill)
     init_project_notes(work_dir)
 
     # Print the banner with info box
@@ -1991,6 +2065,45 @@ def main(
                 continue
             if isinstance(current_task, str) and current_task == "__STOP__":
                 os._exit(0)
+
+            # Handle /ask — quick admin Q&A using Claude (haiku), no task started
+            if isinstance(current_task, str) and current_task.startswith("__ASK__"):
+                question = current_task[len("__ASK__"):]
+                _print_phase_banner(
+                    "Admin Query", "Claude (haiku)",
+                    "Quick Q&A — no task pipeline started", "cyan",
+                )
+                ask_agent = ClaudeAgent(
+                    model="claude-haiku-4-5-20251001",
+                    timeout=60,
+                    working_dir=work_dir,
+                )
+                try:
+                    log_info("Claude (haiku) is answering your question ...")
+                    answer = ask_agent.query(question)
+                    console.print()
+                    console.print(Panel(
+                        answer,
+                        title="[bold cyan]Admin Response[/]",
+                        border_style="cyan",
+                        padding=(1, 2),
+                    ))
+                except Exception as exc:
+                    log_error(f"Admin query failed: {exc}")
+                continue
+
+            # Handle /init — bootstrap all memory files from the existing codebase
+            if isinstance(current_task, str) and current_task == "__INIT__":
+                init_agent = QwenAgent(
+                    model=cfg["qwen_model"],
+                    timeout=cfg["timeout_seconds"],
+                    working_dir=work_dir,
+                )
+                try:
+                    run_init(work_dir, init_agent)
+                except Exception as exc:
+                    log_error(f"Project init failed: {exc}")
+                continue
 
             # ── Tier & mode selection (interactive, per-task) ──
             if current_session is None:
