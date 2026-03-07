@@ -15,6 +15,8 @@ from rich.live import Live
 from rich.spinner import Spinner
 from rich.text import Text
 
+from utils.logger import format_duration
+
 console = Console()
 
 
@@ -222,8 +224,7 @@ def run_cli(
                         )
 
                 elapsed = time.time() - start
-                mins, secs = divmod(int(elapsed), 60)
-                time_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
+                time_str = format_duration(elapsed)
 
                 spinner_text = Text.assemble(
                     (f" {agent_name}", f"bold {style}"),
@@ -238,10 +239,7 @@ def run_cli(
                 # Check timeout — prompt user instead of crashing
                 if elapsed > timeout:
                     live.stop()
-                    mins_t, secs_t = divmod(int(timeout), 60)
-                    timeout_str = (
-                        f"{mins_t}m {secs_t:02d}s" if mins_t else f"{secs_t}s"
-                    )
+                    timeout_str = format_duration(timeout)
                     console.print()
                     console.print(
                         f"[bold yellow]⏱  {agent_name} timed out "
@@ -281,9 +279,7 @@ def run_cli(
         cancelled.set()  # Stop the ESC watcher
 
     elapsed = time.time() - start
-    mins, secs = divmod(int(elapsed), 60)
-    time_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
-    console.print(f"  [dim]{agent_name} finished in {time_str}[/]")
+    console.print(f"  [dim]{agent_name} finished in {format_duration(elapsed)}[/]")
 
     return stdout_result, stderr_result
 
@@ -324,19 +320,14 @@ def run_interactive(
             exit_code = proc.wait(timeout=1)
             # Process finished
             elapsed = time.time() - start
-            mins, secs = divmod(int(elapsed), 60)
-            time_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
-            console.print(f"  [dim]{agent_name} finished in {time_str}[/]")
+            console.print(f"  [dim]{agent_name} finished in {format_duration(elapsed)}[/]")
             return exit_code
         except subprocess.TimeoutExpired:
             pass
 
         elapsed = time.time() - start
         if elapsed > timeout:
-            mins_t, secs_t = divmod(int(timeout), 60)
-            timeout_str = (
-                f"{mins_t}m {secs_t:02d}s" if mins_t else f"{secs_t}s"
-            )
+            timeout_str = format_duration(timeout)
             console.print()
             console.print(
                 f"[bold yellow]⏱  {agent_name} timed out "

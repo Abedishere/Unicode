@@ -144,10 +144,3 @@ def list_sessions(working_dir: str) -> list[Session]:
     return sessions
 
 
-def delete_session(working_dir: str, session_id: str) -> bool:
-    """Delete a session file.  Returns ``True`` if deleted."""
-    path = _sessions_dir(working_dir) / f"{session_id}.json"
-    if path.exists():
-        path.unlink()
-        return True
-    return False

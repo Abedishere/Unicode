@@ -101,9 +101,15 @@ def add_learning(working_dir: str, category: str, entry: str) -> None:
         save_memory(working_dir, memory)
 
 
-def search_past_tasks(working_dir: str, query: str) -> list[dict]:
-    """Search the YAML task index for related past tasks."""
-    memory = load_memory(working_dir)
+def search_past_tasks(
+    working_dir: str, query: str, _memory: dict | None = None
+) -> list[dict]:
+    """Search the YAML task index for related past tasks.
+
+    Pass *_memory* to reuse an already-loaded memory dict and avoid a
+    redundant disk read (used by get_context_for_task).
+    """
+    memory = _memory if _memory is not None else load_memory(working_dir)
     query_lower = query.lower()
     words = set(re.findall(r'\w+', query_lower))
 
@@ -392,8 +398,8 @@ def get_context_for_task(working_dir: str, task: str) -> str:
         if lines:
             sections.append("PAST MISTAKES TO AVOID:\n" + "\n".join(lines))
 
-    # Related past tasks (YAML keyword search)
-    related = search_past_tasks(working_dir, task)
+    # Related past tasks (YAML keyword search — reuse already-loaded memory)
+    related = search_past_tasks(working_dir, task, _memory=memory)
     if related:
         lines = [f"  - [{e['date']}] {e['task']} ({e['outcome']})" for e in related]
         sections.append("RELATED PAST TASKS:\n" + "\n".join(lines))

@@ -23,6 +23,13 @@ def format_transcript(discussion: list[dict[str, str]]) -> str:
     """Render a discussion history as a plain-text transcript."""
     return "\n".join(f"[{e['agent']}]: {e['message']}" for e in discussion)
 
+
+def format_duration(seconds: float) -> str:
+    """Format a duration in seconds as '2m 05s' or '45s'."""
+    mins, secs = divmod(int(seconds), 60)
+    return f"{mins}m {secs:02d}s" if mins else f"{secs}s"
+
+
 _transcript_path: Path | None = None
 
 

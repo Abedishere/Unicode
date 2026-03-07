@@ -212,10 +212,14 @@ def run_review(
             return True, "\n\n".join(review_feedback)
 
         # Show diff statistics so the user can confirm Codex is reviewing real changes
-        diff_lines = diff.splitlines()
-        files_changed = sum(1 for l in diff_lines if l.startswith("diff --git"))
-        added = sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++"))
-        removed = sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("---"))
+        files_changed = added = removed = 0
+        for line in diff.splitlines():
+            if line.startswith("diff --git"):
+                files_changed += 1
+            elif line.startswith("+") and not line.startswith("+++"):
+                added += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                removed += 1
         console.print(
             f"  [bold green]Diff collected:[/] [dim]{files_changed} file(s) · "
             f"+{added} / -{removed} lines[/]"

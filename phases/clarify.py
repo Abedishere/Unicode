@@ -10,7 +10,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from agents.base import BaseAgent
-from utils.logger import log_agent, log_info, log_phase
+from utils.logger import log_info, log_phase
 
 console = Console()
 

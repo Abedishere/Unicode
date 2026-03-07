@@ -125,7 +125,3 @@ def request_approval(action: str, description: str) -> tuple[str, str | None]:
             # Loop back to the approval prompt
 
 
-def require_approval(action: str, description: str) -> bool:
-    """Simplified gate — returns True to proceed, False to skip."""
-    result, _ = request_approval(action, description)
-    return result == "proceed"

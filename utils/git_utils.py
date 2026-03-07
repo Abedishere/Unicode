@@ -18,6 +18,10 @@ _GIT_ENV = {
     "GIT_TERMINAL_PROMPT": "0",
 }
 
+# Paths already configured — avoid re-running 3 subprocess calls on every
+# Codex query or diff collection for the same working directory.
+_configured_dirs: set[str] = set()
+
 # Build artifact and dependency directories excluded from the review diff.
 # Staging them is fine (they should be .gitignored by the project anyway),
 # but including them in the diff sent to AI reviewers is useless and can
@@ -102,7 +106,11 @@ def configure_workspace_git(cwd: str) -> None:
 
     Also sets diff.renameLimit high so large diffs don't produce "too many
     files changed" warnings that break the diff output.
+
+    Results are cached per directory — safe to call on every agent invocation.
     """
+    if cwd in _configured_dirs:
+        return
     settings = {
         "core.autocrlf": "false",
         "core.safecrlf": "false",
@@ -119,6 +127,7 @@ def configure_workspace_git(cwd: str) -> None:
             )
         except Exception:
             pass  # Non-critical — best effort
+    _configured_dirs.add(cwd)
 
 
 def is_git_repo(cwd: str) -> bool:
@@ -132,10 +141,6 @@ def is_git_repo(cwd: str) -> bool:
 def init_repo(cwd: str) -> None:
     run_git(["init"], cwd)
     configure_workspace_git(cwd)
-
-
-def create_branch(branch_name: str, cwd: str) -> None:
-    run_git(["checkout", "-b", branch_name], cwd)
 
 
 def get_diff(cwd: str) -> str:

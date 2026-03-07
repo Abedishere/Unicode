@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import sys
@@ -25,7 +26,7 @@ from phases.review import run_review
 from utils.approval import request_approval, reset_session_approvals, set_auto_all, is_auto_all
 from utils.git_utils import commit, push, init_repo, is_git_repo
 from utils.history import append_history, agent_update_md, init_agent_md, write_orchestrator_md
-from utils.logger import init_transcript, log_error, log_info, log_phase, log_success
+from utils.logger import format_duration, init_transcript, log_error, log_info, log_phase, log_success
 from utils.memory import (
     add_learning, add_task_to_index, extract_keywords_from_task,
     get_context_for_task, init_project_notes, load_memory,
@@ -41,6 +42,8 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 console = Console()
 
 VERSION = "0.2.0"
+
+_MAX_SESSIONS_DISPLAYED = 15
 
 # 3-color gradient stops: orange (Claude) → teal (Codex) → purple (Qwen)
 _C = "#E8915C"  # Claude orange/amber
@@ -315,7 +318,7 @@ def _show_sessions() -> None:
         console.print("[dim]  No saved sessions.[/]")
         return
     console.print()
-    for s in sessions[:15]:
+    for s in sessions[:_MAX_SESSIONS_DISPLAYED]:
         color = {
             "running": "yellow", "paused": "yellow",
             "completed": "green", "failed": "red",
@@ -705,7 +708,7 @@ def _run_session_picker() -> str | None:
         console.print("[dim]  No saved sessions.[/]")
         return None
 
-    sessions = sessions[:15]
+    sessions = sessions[:_MAX_SESSIONS_DISPLAYED]
     total = len(sessions)
     sel = 0
     menu_height = 0   # lines drawn by the last _draw call (0 = not yet drawn)
@@ -1580,7 +1583,6 @@ def _extract_review_learnings(
     )
     try:
         result = qwen.query(prompt)
-        import json
         lessons = json.loads(result)
         if isinstance(lessons, list):
             for lesson in lessons[:3]:
@@ -1711,8 +1713,7 @@ def _run_task(
     if phase in ("plan", "discuss"):
         log_phase("Phase complete.")
         duration = time.time() - start_time
-        mins, secs = divmod(int(duration), 60)
-        log_info(f"Finished in {mins}m {secs:02d}s.")
+        log_info(f"Finished in {format_duration(duration)}.")
         session.status = "completed"
         save_session(work_dir, session)
         _current_session = None
@@ -1759,8 +1760,7 @@ def _run_task(
     if phase == "implement" and not skip_to_review:
         log_phase("Implementation phase complete.")
         duration = time.time() - start_time
-        mins, secs = divmod(int(duration), 60)
-        log_info(f"Finished in {mins}m {secs:02d}s.")
+        log_info(f"Finished in {format_duration(duration)}.")
         session.status = "completed"
         save_session(work_dir, session)
         _current_session = None
