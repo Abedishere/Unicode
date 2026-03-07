@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agents.base import BaseAgent
-from utils.logger import log_info
+from utils.logger import format_transcript, log_info
 
 
 def append_history(
@@ -141,9 +141,7 @@ def agent_update_md(
         except OSError:
             pass
 
-    transcript = "\n".join(
-        f"[{e['agent']}]: {e['message']}" for e in discussion
-    )
+    transcript = format_transcript(discussion)
 
     prompt = (
         f"TASK JUST COMPLETED: {task}\n\n"
@@ -199,9 +197,7 @@ def write_orchestrator_md(
     """
     work = Path(working_dir)
 
-    transcript = "\n".join(
-        f"[{e['agent']}]: {e['message']}" for e in discussion
-    )
+    transcript = format_transcript(discussion)
 
     prompt = (
         f"TASK: {task}\n\n"

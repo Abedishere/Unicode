@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from agents.base import BaseAgent
-from utils.logger import log_agent, log_info, log_phase
+from utils.logger import format_transcript, log_agent, log_info, log_phase
 
 
 def consolidate_plan(
@@ -12,22 +12,17 @@ def consolidate_plan(
     working_dir: str,
     discussion: list[dict[str, str]] | None = None,
     memory_context: str = "",
-) -> tuple[str, bool]:
+) -> str:
     """Create an implementation plan. Codex writes it based on the agreed discussion.
 
     *memory_context* is the shared memory string from past tasks, prepended
     to the prompt so Codex can leverage prior learnings.
-
-    Returns (plan, True) — the bool is always True since there is no review step.
     """
     log_phase("Phase 2: Plan")
 
     context = ""
     if discussion:
-        transcript = "\n".join(
-            f"[{e['agent']}]: {e['message']}" for e in discussion
-        )
-        context = f"\nAGREED DISCUSSION:\n{transcript}\n\n"
+        context = f"\nAGREED DISCUSSION:\n{format_transcript(discussion)}\n\n"
 
     codex_prompt = (
         f"{memory_context}"
@@ -52,4 +47,4 @@ def consolidate_plan(
     plan_path.write_text(plan, encoding="utf-8")
     log_info(f"Plan saved to {plan_path}")
 
-    return plan, True
+    return plan

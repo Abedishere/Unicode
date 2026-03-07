@@ -18,6 +18,11 @@ AGENT_STYLES = {
     "System": "bold yellow",
 }
 
+
+def format_transcript(discussion: list[dict[str, str]]) -> str:
+    """Render a discussion history as a plain-text transcript."""
+    return "\n".join(f"[{e['agent']}]: {e['message']}" for e in discussion)
+
 _transcript_path: Path | None = None
 
 

@@ -1645,13 +1645,10 @@ def _run_task(
     skip_to_review = False
 
     # ── Restore completed phases from session ──
-    agreed = False  # default — overridden below if discussion runs
-
     if session.phase_done("discussion"):
         disc_data = session.phases["discussion"]
         if isinstance(disc_data, dict):
             discussion = disc_data.get("discussion", [])
-            agreed = disc_data.get("agreed", True)
         log_info("Restored discussion from saved session.")
 
     if session.phase_done("plan"):
@@ -1682,13 +1679,10 @@ def _run_task(
                 run_discussion, task, claude, codex, disc_rounds,
                 allow_user_questions=cfg.get("allow_user_questions", True))
             if disc_result is not None:
-                discussion, agreed = disc_result
-            else:
-                discussion, agreed = [], True
+                discussion, _ = disc_result
         else:
             log_info("Skipping discussion.")
-            agreed = True
-        session.mark_phase_done("discussion", {"discussion": discussion, "agreed": agreed})
+        session.mark_phase_done("discussion", {"discussion": discussion})
         save_session(work_dir, session)
 
     # ── Phase 2: Plan (Codex writes the agreed plan) ──
@@ -1704,13 +1698,9 @@ def _run_task(
             if extra:
                 task = f"{task}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
                 log_info("Updated task with your instructions.")
-            plan_result = _run_phase("Plan",
+            plan = _run_phase("Plan",
                 consolidate_plan, task, codex, work_dir, discussion,
-                memory_context=memory_context)
-            if plan_result is not None:
-                plan, _ = plan_result
-            else:
-                plan = ""
+                memory_context=memory_context) or ""
         else:
             log_info("Skipping plan phase.")
         session.mark_phase_done("plan", {"plan": plan})

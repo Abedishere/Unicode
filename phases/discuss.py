@@ -44,18 +44,18 @@ def _has_agreement(text: str) -> bool:
     return bool(_AGREEMENT.search(text))
 
 
-def _both_agree(history: list[dict[str, str]]) -> bool:
-    """Return True if the most recent message from both Claude and Codex signals agreement."""
+def _both_agree(history: list[dict[str, str]], name_a: str, name_b: str) -> bool:
+    """Return True if the most recent message from both agents signals agreement."""
     last: dict[str, str] = {}
     for entry in reversed(history):
         agent = entry["agent"]
-        if agent in ("Claude", "Codex") and agent not in last:
+        if agent in (name_a, name_b) and agent not in last:
             last[agent] = entry["message"]
         if len(last) == 2:
             break
     if len(last) < 2:
         return False
-    return _has_agreement(last["Claude"]) and _has_agreement(last["Codex"])
+    return _has_agreement(last[name_a]) and _has_agreement(last[name_b])
 
 
 def _ask_user(agent_name: str, message: str) -> str | None:
@@ -84,19 +84,19 @@ def run_discussion(
     task: str,
     claude: BaseAgent,
     codex: BaseAgent,
-    rounds: int = 2,
+    max_rounds: int = 2,
     user_context: str | None = None,
     allow_user_questions: bool = True,
 ) -> tuple[list[dict[str, str]], bool]:
     """Run a multi-round discussion between Claude and Codex.
 
-    Runs up to *rounds* rounds but exits early once both agents signal
+    Runs up to *max_rounds* rounds but exits early once both agents signal
     agreement (by including an agreement phrase in their message).
 
     Returns (history, agreed) where agreed=True means both agents
     converged on an approach.
     """
-    log_phase(f"Phase 1: Discussion (up to {rounds} rounds)")
+    log_phase(f"Phase 1: Discussion (up to {max_rounds} rounds)")
     history: list[dict[str, str]] = []
 
     if user_context:
@@ -104,42 +104,42 @@ def run_discussion(
         log_info("User context injected into discussion.")
 
     agreed = False
-    for round_num in range(1, rounds + 1):
-        log_info(f"Round {round_num}/{rounds}")
+    for round_num in range(1, max_rounds + 1):
+        log_info(f"Round {round_num}/{max_rounds}")
 
         # Only allow user questions after the first full round
         can_ask = allow_user_questions and round_num > 1
 
         # --- Claude's turn ---
-        claude_prompt = _build_prompt(task, history, "Claude", "Codex", rounds)
-        log_info("Waiting for Claude ...")
+        claude_prompt = _build_prompt(task, history, claude.name, codex.name, max_rounds)
+        log_info(f"Waiting for {claude.name} ...")
         claude_reply = claude.query(claude_prompt)
-        history.append({"agent": "Claude", "message": claude_reply})
-        log_agent("Claude", claude_reply)
+        history.append({"agent": claude.name, "message": claude_reply})
+        log_agent(claude.name, claude_reply)
 
         if can_ask and _has_user_question(claude_reply):
-            answer = _ask_user("Claude", claude_reply)
+            answer = _ask_user(claude.name, claude_reply)
             if answer:
                 history.append({"agent": "User", "message": answer})
                 log_agent("User", answer)
 
         # --- Codex's turn ---
-        codex_prompt = _build_prompt(task, history, "Codex", "Claude", rounds)
-        log_info("Waiting for Codex ...")
+        codex_prompt = _build_prompt(task, history, codex.name, claude.name, max_rounds)
+        log_info(f"Waiting for {codex.name} ...")
         codex_reply = codex.query(codex_prompt)
-        history.append({"agent": "Codex", "message": codex_reply})
-        log_agent("Codex", codex_reply)
+        history.append({"agent": codex.name, "message": codex_reply})
+        log_agent(codex.name, codex_reply)
 
         if can_ask and _has_user_question(codex_reply):
-            answer = _ask_user("Codex", codex_reply)
+            answer = _ask_user(codex.name, codex_reply)
             if answer:
                 history.append({"agent": "User", "message": answer})
                 log_agent("User", answer)
 
         # Check if both agents agree — exit early if so
-        if _both_agree(history):
+        if _both_agree(history, claude.name, codex.name):
             agreed = True
-            log_info(f"Both admins agree after round {round_num} — stopping early.")
+            log_info(f"Both agents agree after round {round_num} — stopping early.")
             break
 
     if not agreed:
