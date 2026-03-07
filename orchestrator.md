@@ -15,11 +15,13 @@ User Task
 Phase 0: Clarify     — Claude asks 1-3 clarifying questions (optional, skipped in auto mode)
     │
     ▼
-Phase 1: Discuss     — Claude + Codex debate approach (N rounds per tier)
+Phase 1: Discuss     — Claude + Codex discuss the approach (N rounds per tier)
+    │                   Loop exits early once both agents signal agreement (AGREED vote)
     │
     ▼
-Phase 2: Plan        — Qwen synthesizes discussion into an implementation plan
+Phase 2: Plan        — Codex writes the implementation plan from the agreed discussion
     │                   Plan written to .orchestrator/plan.md and shown for approval
+    │                   (Claude does not re-review — agreement was reached in discussion)
     ▼
 Phase 3: Implement   — Claude Code implements the plan against the working directory
     │
