@@ -1,7 +1,7 @@
-"""Phase 1: Discussion — Claude and Codex discuss the task.
+"""Phase 1: Discussion — Claude and Codex agree on an approach.
 
-If either agent has questions for the user, the conversation pauses
-and the user can answer before it continues.
+They discuss freely and vote by ending their message with AGREED once
+both are satisfied. The loop exits early as soon as both have agreed.
 """
 
 from __future__ import annotations
@@ -26,10 +26,36 @@ _USER_QUESTION = re.compile(
     re.IGNORECASE,
 )
 
+# Patterns that indicate an agent is signalling agreement/consensus
+_AGREEMENT = re.compile(
+    r"\bAGREED\b|\bI agree\b|\bsounds good\b|\blooks good\b|\bapproved\b"
+    r"|\ball good\b|\bin agreement\b|\bwe agree\b|\bno objections\b",
+    re.IGNORECASE,
+)
+
 
 def _has_user_question(text: str) -> bool:
     """Check if an agent's reply contains a question directed at the user."""
     return bool(_USER_QUESTION.search(text))
+
+
+def _has_agreement(text: str) -> bool:
+    """Check if an agent's reply signals consensus."""
+    return bool(_AGREEMENT.search(text))
+
+
+def _both_agree(history: list[dict[str, str]], name_a: str, name_b: str) -> bool:
+    """Return True if the most recent message from both agents signals agreement."""
+    last: dict[str, str] = {}
+    for entry in reversed(history):
+        agent = entry["agent"]
+        if agent in (name_a, name_b) and agent not in last:
+            last[agent] = entry["message"]
+        if len(last) == 2:
+            break
+    if len(last) < 2:
+        return False
+    return _has_agreement(last[name_a]) and _has_agreement(last[name_b])
 
 
 def _ask_user(agent_name: str, message: str) -> str | None:
@@ -56,73 +82,78 @@ def _ask_user(agent_name: str, message: str) -> str | None:
 
 def run_discussion(
     task: str,
-    plan: str,
     claude: BaseAgent,
     codex: BaseAgent,
-    rounds: int = 2,
+    max_rounds: int = 2,
     user_context: str | None = None,
     allow_user_questions: bool = True,
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], bool]:
     """Run a multi-round discussion between Claude and Codex.
 
-    Max 2 rounds — they must reach a decision within that limit.
-    Returns the conversation history as a list of
-    {"agent": name, "message": text} dicts.
+    Runs up to *max_rounds* rounds but exits early once both agents signal
+    agreement (by including an agreement phrase in their message).
 
-    If allow_user_questions is False, agents never pause to ask the user.
-    Otherwise, user questions are only allowed after at least one full
-    round of back-and-forth (both agents have spoken once).
+    Returns (history, agreed) where agreed=True means both agents
+    converged on an approach.
     """
-    log_phase("Phase 2: Discussion (max 2 rounds)")
+    log_phase(f"Phase 1: Discussion (up to {max_rounds} rounds)")
     history: list[dict[str, str]] = []
 
     if user_context:
         history.append({"agent": "User", "message": user_context})
         log_info("User context injected into discussion.")
 
-    for round_num in range(1, rounds + 1):
-        log_info(f"Round {round_num}/{rounds}")
+    agreed = False
+    for round_num in range(1, max_rounds + 1):
+        log_info(f"Round {round_num}/{max_rounds}")
 
         # Only allow user questions after the first full round
         can_ask = allow_user_questions and round_num > 1
 
         # --- Claude's turn ---
-        claude_prompt = _build_prompt(task, plan, history, "Claude", "Codex")
-        log_info("Waiting for Claude ...")
+        claude_prompt = _build_prompt(task, history, claude.name, codex.name, max_rounds)
+        log_info(f"Waiting for {claude.name} ...")
         claude_reply = claude.query(claude_prompt)
-        history.append({"agent": "Claude", "message": claude_reply})
-        log_agent("Claude", claude_reply)
+        history.append({"agent": claude.name, "message": claude_reply})
+        log_agent(claude.name, claude_reply)
 
-        # Check if Claude is asking the user something
         if can_ask and _has_user_question(claude_reply):
-            answer = _ask_user("Claude", claude_reply)
+            answer = _ask_user(claude.name, claude_reply)
             if answer:
                 history.append({"agent": "User", "message": answer})
                 log_agent("User", answer)
 
         # --- Codex's turn ---
-        codex_prompt = _build_prompt(task, plan, history, "Codex", "Claude")
-        log_info("Waiting for Codex ...")
+        codex_prompt = _build_prompt(task, history, codex.name, claude.name, max_rounds)
+        log_info(f"Waiting for {codex.name} ...")
         codex_reply = codex.query(codex_prompt)
-        history.append({"agent": "Codex", "message": codex_reply})
-        log_agent("Codex", codex_reply)
+        history.append({"agent": codex.name, "message": codex_reply})
+        log_agent(codex.name, codex_reply)
 
-        # Check if Codex is asking the user something
         if can_ask and _has_user_question(codex_reply):
-            answer = _ask_user("Codex", codex_reply)
+            answer = _ask_user(codex.name, codex_reply)
             if answer:
                 history.append({"agent": "User", "message": answer})
                 log_agent("User", answer)
 
-    return history
+        # Check if both agents agree — exit early if so
+        if _both_agree(history, claude.name, codex.name):
+            agreed = True
+            log_info(f"Both agents agree after round {round_num} — stopping early.")
+            break
+
+    if not agreed:
+        log_info("Discussion complete — proceeding with best available approach.")
+
+    return history, agreed
 
 
 def _build_prompt(
     task: str,
-    plan: str,
     history: list[dict[str, str]],
     current_agent: str,
     other_agent: str,
+    max_rounds: int,
 ) -> str:
     lines = [
         f"You are {current_agent}, a senior technical lead (admin).",
@@ -130,9 +161,9 @@ def _build_prompt(
         "A separate developer will implement whatever you two agree on.",
         "You do NOT write code, create files, or delegate tasks. You may read the repo. You only discuss.",
         f"\nTASK: {task}\n",
-        f"CURRENT PLAN DRAFT:\n{plan}\n",
-        "You and " + other_agent + " DISAGREE on this plan. Resolve the disagreements.",
-        "IMPORTANT: You have a MAXIMUM of 2 rounds. Reach a decision as fast as possible — 1 round is fine. No stalling.\n",
+        "Your goal: reach agreement on the best implementation approach.",
+        f"IMPORTANT: You have a MAXIMUM of {max_rounds} rounds. "
+        "Once you are satisfied with the agreed approach, end your message with: AGREED\n",
     ]
     if history:
         lines.append("CONVERSATION SO FAR:")
@@ -143,10 +174,11 @@ def _build_prompt(
     lines.append(
         "RULES:\n"
         "- You are an ADMIN. You do NOT write code, create files, or delegate to anyone.\n"
-        "- Focus on resolving disagreements about the plan.\n"
+        "- Discuss the approach: files to touch, architecture, key decisions.\n"
         "- Be concise. Bullet points, not essays.\n"
         "- Make decisions, don't ramble about options.\n"
         "- If you need input from the user, prefix with @User and ask directly.\n"
+        "- When you are happy with the agreed approach, end your message with: AGREED\n"
         "- No philosophizing. No restating the task. Just actionable output.\n"
     )
     return "\n".join(lines)

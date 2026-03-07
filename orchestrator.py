@@ -1645,98 +1645,65 @@ def _run_task(
     skip_to_review = False
 
     # ── Restore completed phases from session ──
-    if session.phase_done("plan"):
-        plan_data = session.phases["plan"]
-        plan = plan_data.get("plan", "")
-        agreed = plan_data.get("agreed", True)
-        log_info("Restored plan from saved session.")
-    else:
-        agreed = True  # default — overridden below if plan runs
-
     if session.phase_done("discussion"):
         disc_data = session.phases["discussion"]
         if isinstance(disc_data, dict):
             discussion = disc_data.get("discussion", [])
-            plan = disc_data.get("plan", plan)
         log_info("Restored discussion from saved session.")
+
+    if session.phase_done("plan"):
+        plan_data = session.phases["plan"]
+        plan = plan_data.get("plan", "")
+        log_info("Restored plan from saved session.")
 
     # For standalone implement/review, load saved plan
     if phase in ("implement", "review") and not plan:
         plan = _load_saved_plan(work_dir)
 
-    # ── Phase 1: Plan (Codex drafts, Claude reviews) ──
+    # ── Phase 1: Discussion (Claude + Codex agree on the approach) ──
+    run_discuss = phase in ("all", "plan", "discuss") and not session.phase_done("discussion")
+    if run_discuss and phase == "all":
+        _print_phase_banner("Discussion", "admins", "Claude & Codex will agree on the approach", "cyan")
+    if run_discuss:
+        session.current_phase = "discussion"
+        save_session(work_dir, session)
+        disc_rounds = cfg.get("discussion_rounds", 2)
+        result, extra = request_approval("discussion",
+            f"Claude and Codex will discuss the task for up to {disc_rounds} rounds, "
+            f"stopping early once both agree.")
+        if result == "proceed":
+            if extra:
+                task = f"{task}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
+                log_info("Updated task with your instructions.")
+            disc_result = _run_phase("Discussion",
+                run_discussion, task, claude, codex, disc_rounds,
+                allow_user_questions=cfg.get("allow_user_questions", True))
+            if disc_result is not None:
+                discussion, _ = disc_result
+        else:
+            log_info("Skipping discussion.")
+        session.mark_phase_done("discussion", {"discussion": discussion})
+        save_session(work_dir, session)
+
+    # ── Phase 2: Plan (Codex writes the agreed plan) ──
     run_plan = phase in ("all", "plan", "discuss") and not session.phase_done("plan")
     if run_plan and phase == "all":
-        _print_phase_banner("Planning", "admins", "Claude & Codex will draft the plan", "cyan")
+        _print_phase_banner("Planning", "Codex", "Codex will write the agreed plan", "cyan")
     if run_plan:
         session.current_phase = "plan"
         save_session(work_dir, session)
         result, extra = request_approval("plan",
-            "Codex (GPT) will draft a plan, then Claude will review it.")
+            "Codex will write the implementation plan based on the discussion.")
         if result == "proceed":
             if extra:
                 task = f"{task}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
                 log_info("Updated task with your instructions.")
-            plan_result = _run_phase("Plan",
-                consolidate_plan, task, claude, codex, work_dir,
-                memory_context=memory_context)
-            if plan_result is not None:
-                plan, agreed = plan_result
-            else:
-                plan, agreed = "", True
+            plan = _run_phase("Plan",
+                consolidate_plan, task, codex, work_dir, discussion,
+                memory_context=memory_context) or ""
         else:
             log_info("Skipping plan phase.")
-            agreed = True
-        session.mark_phase_done("plan", {"plan": plan, "agreed": agreed})
-        save_session(work_dir, session)
-
-    # ── Phase 2: Discussion (only if admins disagree on the plan) ──
-    run_discuss = (
-        phase in ("all", "discuss")
-        and not agreed
-        and not session.phase_done("discussion")
-    )
-    if run_discuss and phase == "all":
-        _print_phase_banner("Discussion", "admins", "Claude & Codex will discuss the plan", "cyan")
-    if run_discuss:
-        session.current_phase = "discussion"
-        save_session(work_dir, session)
-        log_info("Admins disagree — starting discussion to resolve.")
-        disc_rounds = cfg.get("discussion_rounds", 2)
-        result, extra = request_approval("discussion",
-            f"Claude and Codex disagree on the plan. They'll discuss for "
-            f"{disc_rounds} rounds to resolve.")
-        if result == "proceed":
-            if extra:
-                task = f"{task}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
-                log_info("Updated task with your instructions.")
-            disc = _run_phase("Discussion",
-                run_discussion, task, plan, claude, codex, disc_rounds,
-                allow_user_questions=cfg.get("allow_user_questions", True))
-            if disc is not None:
-                discussion = disc
-
-            # Re-plan after discussion — always save to disk (final plan)
-            log_info("Re-planning after discussion ...")
-            plan_result = _run_phase("Re-Plan",
-                consolidate_plan, task, claude, codex, work_dir, discussion,
-                memory_context=memory_context, final=True)
-            if plan_result is not None:
-                plan, replan_agreed = plan_result
-                if not replan_agreed:
-                    log_info(
-                        "Admins still disagree after re-planning — "
-                        "proceeding with best available plan."
-                    )
-        else:
-            log_info("Skipping discussion — proceeding with current plan.")
-        session.mark_phase_done("discussion", {
-            "discussion": discussion, "plan": plan,
-        })
-        save_session(work_dir, session)
-    elif not session.phase_done("discussion"):
-        # No discussion needed — mark done so resume skips it
-        session.mark_phase_done("discussion", {"discussion": [], "plan": plan})
+        session.mark_phase_done("plan", {"plan": plan})
         save_session(work_dir, session)
 
     # Stop here if the user only wanted plan or discuss
