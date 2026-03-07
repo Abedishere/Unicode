@@ -14,7 +14,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from agents.base import BaseAgent
-from utils.logger import log_agent, log_info, log_phase
+from utils.logger import format_transcript, log_agent, log_info, log_phase
 
 console = Console()
 
@@ -26,12 +26,8 @@ _USER_QUESTION = re.compile(
     re.IGNORECASE,
 )
 
-# Patterns that indicate an agent is signalling agreement/consensus
-_AGREEMENT = re.compile(
-    r"\bAGREED\b|\bI agree\b|\bsounds good\b|\blooks good\b|\bapproved\b"
-    r"|\ball good\b|\bin agreement\b|\bwe agree\b|\bno objections\b",
-    re.IGNORECASE,
-)
+# Sentinel pattern: agents are instructed to end their message with "AGREED"
+_AGREEMENT = re.compile(r"\bAGREED\b|\bI agree\b")
 
 
 def _has_user_question(text: str) -> bool:
@@ -42,20 +38,6 @@ def _has_user_question(text: str) -> bool:
 def _has_agreement(text: str) -> bool:
     """Check if an agent's reply signals consensus."""
     return bool(_AGREEMENT.search(text))
-
-
-def _both_agree(history: list[dict[str, str]], name_a: str, name_b: str) -> bool:
-    """Return True if the most recent message from both agents signals agreement."""
-    last: dict[str, str] = {}
-    for entry in reversed(history):
-        agent = entry["agent"]
-        if agent in (name_a, name_b) and agent not in last:
-            last[agent] = entry["message"]
-        if len(last) == 2:
-            break
-    if len(last) < 2:
-        return False
-    return _has_agreement(last[name_a]) and _has_agreement(last[name_b])
 
 
 def _ask_user(agent_name: str, message: str) -> str | None:
@@ -137,7 +119,7 @@ def run_discussion(
                 log_agent("User", answer)
 
         # Check if both agents agree — exit early if so
-        if _both_agree(history, claude.name, codex.name):
+        if _has_agreement(claude_reply) and _has_agreement(codex_reply):
             agreed = True
             log_info(f"Both agents agree after round {round_num} — stopping early.")
             break
@@ -167,8 +149,7 @@ def _build_prompt(
     ]
     if history:
         lines.append("CONVERSATION SO FAR:")
-        for entry in history:
-            lines.append(f"[{entry['agent']}]: {entry['message']}")
+        lines.append(format_transcript(history))
         lines.append("")
 
     lines.append(

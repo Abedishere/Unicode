@@ -1662,15 +1662,16 @@ def _run_task(
 
     # ── Phase 1: Discussion (Claude + Codex agree on the approach) ──
     run_discuss = phase in ("all", "plan", "discuss") and not session.phase_done("discussion")
-    if run_discuss and phase == "all":
-        _print_phase_banner("Discussion", "admins", "Claude & Codex will agree on the approach", "cyan")
     if run_discuss:
+        if phase == "all":
+            _print_phase_banner("Discussion", "admins", "Claude & Codex will agree on the approach", "cyan")
         session.current_phase = "discussion"
         save_session(work_dir, session)
         disc_rounds = cfg.get("discussion_rounds", 2)
         result, extra = request_approval("discussion",
             f"Claude and Codex will discuss the task for up to {disc_rounds} rounds, "
             f"stopping early once both agree.")
+        agreed = False
         if result == "proceed":
             if extra:
                 task = f"{task}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
@@ -1679,17 +1680,17 @@ def _run_task(
                 run_discussion, task, claude, codex, disc_rounds,
                 allow_user_questions=cfg.get("allow_user_questions", True))
             if disc_result is not None:
-                discussion, _ = disc_result
+                discussion, agreed = disc_result
         else:
             log_info("Skipping discussion.")
-        session.mark_phase_done("discussion", {"discussion": discussion})
+        session.mark_phase_done("discussion", {"discussion": discussion, "agreed": agreed})
         save_session(work_dir, session)
 
     # ── Phase 2: Plan (Codex writes the agreed plan) ──
     run_plan = phase in ("all", "plan", "discuss") and not session.phase_done("plan")
-    if run_plan and phase == "all":
-        _print_phase_banner("Planning", "Codex", "Codex will write the agreed plan", "cyan")
     if run_plan:
+        if phase == "all":
+            _print_phase_banner("Planning", "Codex", "Codex will write the agreed plan", "cyan")
         session.current_phase = "plan"
         save_session(work_dir, session)
         result, extra = request_approval("plan",

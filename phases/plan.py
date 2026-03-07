@@ -41,10 +41,13 @@ def consolidate_plan(
     plan = codex.query(codex_prompt)
     log_agent("Codex", plan)
 
-    plan_dir = Path(working_dir) / ".orchestrator"
-    plan_dir.mkdir(parents=True, exist_ok=True)
-    plan_path = plan_dir / "plan.md"
-    plan_path.write_text(plan, encoding="utf-8")
-    log_info(f"Plan saved to {plan_path}")
+    if plan.strip():
+        plan_dir = Path(working_dir) / ".orchestrator"
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        plan_path = plan_dir / "plan.md"
+        plan_path.write_text(plan, encoding="utf-8")
+        log_info(f"Plan saved to {plan_path}")
+    else:
+        log_info("Warning: Codex returned empty plan — skipping disk write.")
 
     return plan
