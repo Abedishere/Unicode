@@ -11,10 +11,21 @@ Multi-agent orchestrator that coordinates **Claude Code**, **Codex CLI**, and **
 ```
 Phase 0: Clarify      — Claude asks clarifying questions (skipped in auto mode)
 Phase 1: Discuss      — Claude + Codex debate the approach (N rounds per tier)
-Phase 2: Plan         — Qwen synthesizes the discussion into a structured plan
+                          · Repo skeleton map injected for structural context
+                          · Sliding window keeps only last 2 exchanges verbatim;
+                            older rounds compressed to ~150-char summaries
+Phase 2: Plan         — Qwen synthesizes discussion into a structured plan
+                          · Outputs per-file specs (CREATE|MODIFY) with shared
+                            dependencies section
 Phase 3: Implement    — Claude implements the plan with full file access
-Phase 4: Review       — Two-pass review loop:
-                          · Codex reviews the git diff → APPROVED or CHANGES_REQUESTED
+                          · File-by-file generation when plan is structured
+                            (each file gets focused prompt with skeleton + its spec)
+                          · Falls back to monolithic implementation otherwise
+Phase 4: Review       — Tiered diff review loop:
+                          · Codex receives structured diff summary (files changed,
+                            functions added/modified/removed) instead of raw diff
+                          · Codex responds APPROVED, CHANGES_REQUESTED, or
+                            NEED_FULL_DIFF: <filename> to escalate specific files
                           · Claude validates Codex's findings → CONFIRMED or APPROVED
                           · Claude (developer) fixes all confirmed issues
                           · Repeats until approved or max cycles reached
@@ -119,6 +130,11 @@ codex_timeout_seconds: 300
 auto_commit: false
 working_directory: "."
 
+# Optimization settings
+repo_map_max_tokens: 2000
+discussion_summary_window: 4
+file_by_file_generation: true
+
 tiers:
   quick:
     dev_model: "sonnet"
@@ -133,6 +149,16 @@ tiers:
     max_review_iterations: 3
     discussion_rounds: 4
 ```
+
+## Token Optimization
+
+Unicode minimizes token usage across all phases:
+
+- **Repo skeleton map** — compressed AST-like view of the codebase (class names, function signatures, imports) injected into discussion, plan, and implementation prompts. Typically ~1-2K tokens for an entire codebase. Configurable via `repo_map_max_tokens`.
+- **Sliding window discussion** — old rounds are summarized to ~150 chars each; only the last 2 exchanges are kept verbatim. Token growth is linear instead of quadratic. Configurable via `discussion_summary_window`.
+- **File-by-file generation** — when the plan outputs structured per-file specs, implementation breaks into focused per-file calls (skeleton + shared deps + file spec only). Enables larger projects without hitting context limits. Falls back to monolithic if the plan doesn't parse. Configurable via `file_by_file_generation`.
+- **Tiered diff review** — reviewers receive a structured diff summary (files changed, functions added/modified/removed) instead of the full diff. They can request full diffs for specific files by responding with `NEED_FULL_DIFF: filename`. Roughly halves review tokens for clean implementations.
+- **Cached memory context** — memory context (YAML index + markdown notes) is computed once per task and reused across all phases. Previously recomputed redundantly per phase.
 
 ## Skills Ecosystem
 
