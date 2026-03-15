@@ -62,6 +62,33 @@ def _ask_user(agent_name: str, message: str) -> str | None:
     return answer.strip() if answer.strip() else None
 
 
+def _summarize_old_history(
+    history: list[dict[str, str]],
+    keep_recent: int = 4,
+) -> tuple[str, list[dict[str, str]]]:
+    """Split history into a compact summary of old entries and recent verbatim entries.
+
+    Returns (summary_text, recent_entries).  If the history is short enough,
+    returns ("", history) unchanged.
+    """
+    if len(history) <= keep_recent:
+        return "", history
+
+    old = history[:-keep_recent]
+    recent = history[-keep_recent:]
+
+    lines = []
+    for entry in old:
+        agent = entry.get("agent", "")
+        msg = entry.get("message", "")
+        snippet = msg[:150].replace("\n", " ").strip()
+        if len(msg) > 150:
+            snippet += "..."
+        lines.append(f"  [{agent}]: {snippet}")
+
+    return "\n".join(lines), recent
+
+
 def run_discussion(
     task: str,
     claude: BaseAgent,
@@ -69,6 +96,7 @@ def run_discussion(
     max_rounds: int = 2,
     user_context: str | None = None,
     allow_user_questions: bool = True,
+    repo_map: str = "",
 ) -> tuple[list[dict[str, str]], bool]:
     """Run a multi-round discussion between Claude and Codex.
 
@@ -92,21 +120,8 @@ def run_discussion(
         # Only allow user questions after the first full round
         can_ask = allow_user_questions and round_num > 1
 
-        # --- Claude's turn ---
-        claude_prompt = _build_prompt(task, history, claude.name, codex.name, max_rounds)
-        log_info(f"Waiting for {claude.name} ...")
-        claude_reply = claude.query(claude_prompt)
-        history.append({"agent": claude.name, "message": claude_reply})
-        log_agent(claude.name, claude_reply)
-
-        if can_ask and _has_user_question(claude_reply):
-            answer = _ask_user(claude.name, claude_reply)
-            if answer:
-                history.append({"agent": "User", "message": answer})
-                log_agent("User", answer)
-
-        # --- Codex's turn ---
-        codex_prompt = _build_prompt(task, history, codex.name, claude.name, max_rounds)
+        # --- Codex's turn (goes first) ---
+        codex_prompt = _build_prompt(task, history, codex.name, claude.name, max_rounds, repo_map)
         log_info(f"Waiting for {codex.name} ...")
         codex_reply = codex.query(codex_prompt)
         history.append({"agent": codex.name, "message": codex_reply})
@@ -118,8 +133,21 @@ def run_discussion(
                 history.append({"agent": "User", "message": answer})
                 log_agent("User", answer)
 
+        # --- Claude's turn (goes second) ---
+        claude_prompt = _build_prompt(task, history, claude.name, codex.name, max_rounds, repo_map)
+        log_info(f"Waiting for {claude.name} ...")
+        claude_reply = claude.query(claude_prompt)
+        history.append({"agent": claude.name, "message": claude_reply})
+        log_agent(claude.name, claude_reply)
+
+        if can_ask and _has_user_question(claude_reply):
+            answer = _ask_user(claude.name, claude_reply)
+            if answer:
+                history.append({"agent": "User", "message": answer})
+                log_agent("User", answer)
+
         # Check if both agents agree — exit early if so
-        if _has_agreement(claude_reply) and _has_agreement(codex_reply):
+        if _has_agreement(codex_reply) and _has_agreement(claude_reply):
             agreed = True
             log_info(f"Both agents agree after round {round_num} — stopping early.")
             break
@@ -136,6 +164,7 @@ def _build_prompt(
     current_agent: str,
     other_agent: str,
     max_rounds: int,
+    repo_map: str = "",
 ) -> str:
     lines = [
         f"You are {current_agent}, a senior technical lead (admin).",
@@ -143,13 +172,29 @@ def _build_prompt(
         "A separate developer will implement whatever you two agree on.",
         "You do NOT write code, create files, or delegate tasks. You may read the repo. You only discuss.",
         f"\nTASK: {task}\n",
+    ]
+    if repo_map:
+        lines.append("CODEBASE SKELETON:")
+        lines.append(repo_map)
+        lines.append("")
+
+    lines.extend([
         "Your goal: reach agreement on the best implementation approach.",
         f"IMPORTANT: You have a MAXIMUM of {max_rounds} rounds. "
         "Once you are satisfied with the agreed approach, end your message with: AGREED\n",
-    ]
+    ])
+
     if history:
-        lines.append("CONVERSATION SO FAR:")
-        lines.append(format_transcript(history))
+        summary, recent = _summarize_old_history(history)
+        if summary:
+            lines.append("EARLIER DISCUSSION (summary):")
+            lines.append(summary)
+            lines.append("")
+            lines.append("RECENT DISCUSSION:")
+            lines.append(format_transcript(recent))
+        else:
+            lines.append("CONVERSATION SO FAR:")
+            lines.append(format_transcript(history))
         lines.append("")
 
     lines.append(

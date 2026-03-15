@@ -186,6 +186,21 @@ def get_diff(cwd: str) -> str:
         # source files.  Fall back to the full diff so we don't silently skip.
         diff = run_git(["diff", "--cached"], cwd)
 
+    if not diff:
+        # Nothing staged — implementation may have already committed.
+        # Try the most recent commit vs its parent so the reviewer still
+        # sees the actual changes.
+        try:
+            diff = run_git(["diff", "HEAD~1..HEAD", "--"] + all_excludes, cwd)
+        except RuntimeError:
+            pass
+
+    if not diff:
+        try:
+            diff = run_git(["diff", "HEAD~1..HEAD"], cwd)
+        except RuntimeError:
+            pass
+
     return diff
 
 

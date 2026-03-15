@@ -36,6 +36,20 @@ from utils.init_project import run_init
 from utils.runner import CancelledByUser, TimeoutSkipToReview
 from utils.session import Session, save_session, load_session, list_sessions
 
+try:
+    from utils.repo_map import generate_repo_map
+except ImportError:
+    def generate_repo_map(working_dir, max_tokens=2000):
+        return ""
+
+try:
+    from utils.plan_parser import parse_plan, is_structured
+except ImportError:
+    def parse_plan(text):
+        return None
+    def is_structured(plan):
+        return False
+
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 
@@ -1635,13 +1649,19 @@ def _run_task(
     log_info(f"Tier: {tier} | Dev model: {claude.dev_model}")
     start_time = time.time()
 
-    # Load shared memory context for this task
+    # Load shared memory context for this task (cached once, reused by all phases)
     memory_context = get_context_for_task(work_dir, task)
     if memory_context:
         log_info("Loaded shared memory context from previous tasks.")
 
+    # Generate repo skeleton map (compressed AST-like view of the codebase)
+    repo_map = generate_repo_map(work_dir, cfg.get("repo_map_max_tokens", 2000))
+    if repo_map:
+        log_info("Generated repo skeleton map.")
+
     # Track state across phases
     discussion: list[dict[str, str]] = []
+    structured_plan = None
     plan = ""
     approved = False
     skip_to_review = False
@@ -1670,9 +1690,18 @@ def _run_task(
         session.current_phase = "discussion"
         save_session(work_dir, session)
         disc_rounds = cfg.get("discussion_rounds", 2)
+        if not is_auto_all():
+            try:
+                disc_rounds = click.prompt(
+                    click.style("How many discussion rounds?", fg="cyan", bold=True),
+                    default=disc_rounds,
+                    type=click.IntRange(1, 10),
+                )
+            except (EOFError, click.Abort):
+                pass
         result, extra = request_approval("discussion",
-            f"Claude and Codex will discuss the task for up to {disc_rounds} rounds, "
-            f"stopping early once both agree.")
+            f"Codex and Claude will discuss the task for up to {disc_rounds} rounds "
+            f"(Codex goes first), stopping early once both agree.")
         agreed = False
         if result == "proceed":
             if extra:
@@ -1680,7 +1709,8 @@ def _run_task(
                 log_info("Updated task with your instructions.")
             disc_result = _run_phase("Discussion",
                 run_discussion, task, claude, codex, disc_rounds,
-                allow_user_questions=cfg.get("allow_user_questions", True))
+                allow_user_questions=cfg.get("allow_user_questions", True),
+                repo_map=repo_map)
             if disc_result is not None:
                 discussion, agreed = disc_result
         else:
@@ -1703,7 +1733,14 @@ def _run_task(
                 log_info("Updated task with your instructions.")
             plan = _run_phase("Plan",
                 consolidate_plan, task, codex, work_dir, discussion,
-                memory_context=memory_context) or ""
+                memory_context=memory_context,
+                repo_map=repo_map) or ""
+            # Parse structured plan for file-by-file generation
+            structured_plan = parse_plan(plan)
+            if is_structured(structured_plan):
+                log_info(f"Structured plan parsed: {len(structured_plan.files)} file specs")
+            else:
+                log_info("Plan is unstructured — will use monolithic implementation.")
         else:
             log_info("Skipping plan phase.")
         session.mark_phase_done("plan", {"plan": plan})
@@ -1743,7 +1780,9 @@ def _run_task(
                 impl = _run_phase("Implementation",
                     run_implementation, task, plan, claude,
                     discussion=discussion,
-                    memory_context=memory_context)
+                    memory_context=memory_context,
+                    repo_map=repo_map,
+                    structured_plan=structured_plan)
                 if impl is not None:
                     # Qwen writes orchestrator.md (project summary)
                     _run_phase("Writing orchestrator.md",

@@ -35,6 +35,89 @@ _LOOKS_GOOD = re.compile(
     re.IGNORECASE,
 )
 
+# Reviewer requests full diff for specific files
+_NEED_FULL_DIFF = re.compile(r"NEED_FULL_DIFF:\s*(.+)", re.IGNORECASE)
+
+
+# ── Diff summarization ──────────────────────────────────────────────────────
+
+_CODE_DEF = re.compile(
+    r"^[+-]\s*(?:def |class |function |const |let |var |export )\s*(\w+)",
+)
+
+
+def _summarize_diff(diff: str) -> str:
+    """Parse a git diff into a structured file-level summary.
+
+    Returns a compact summary showing files changed, lines added/removed,
+    and key structural changes (functions/classes added/removed/modified).
+    """
+    if not diff:
+        return ""
+
+    sections = re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE)
+    file_summaries = []
+
+    for section in sections:
+        if not section.strip():
+            continue
+
+        # Extract filename
+        header = re.match(r"diff --git a/(.+?) b/(.+?)$", section, re.MULTILINE)
+        if not header:
+            continue
+        filename = header.group(2)
+
+        # Count changes
+        added = removed = 0
+        added_names: list[str] = []
+        removed_names: list[str] = []
+        for line in section.splitlines():
+            if line.startswith("+") and not line.startswith("+++"):
+                added += 1
+                m = _CODE_DEF.match(line)
+                if m:
+                    added_names.append(m.group(1))
+            elif line.startswith("-") and not line.startswith("---"):
+                removed += 1
+                m = _CODE_DEF.match(line)
+                if m:
+                    removed_names.append(m.group(1))
+
+        # Classify names as added, removed, or modified
+        added_set = set(added_names)
+        removed_set = set(removed_names)
+        modified = added_set & removed_set
+        only_added = added_set - modified
+        only_removed = removed_set - modified
+
+        lines = [f"{filename} (+{added} -{removed}):"]
+        for name in sorted(only_added):
+            lines.append(f"  Added: {name}")
+        for name in sorted(modified):
+            lines.append(f"  Modified: {name}")
+        for name in sorted(only_removed):
+            lines.append(f"  Removed: {name}")
+        if not (only_added or modified or only_removed) and (added or removed):
+            lines.append("  (configuration/data changes)")
+
+        file_summaries.append("\n".join(lines))
+
+    total_files = len(file_summaries)
+    return f"FILES CHANGED: {total_files}\n\n" + "\n\n".join(file_summaries)
+
+
+def _extract_file_diff(full_diff: str, filenames: list[str]) -> str:
+    """Extract diff hunks for specific files from the full diff."""
+    sections = re.split(r"(?=^diff --git )", full_diff, flags=re.MULTILINE)
+    matched = []
+    for section in sections:
+        for fname in filenames:
+            if fname in section:
+                matched.append(section.strip())
+                break
+    return "\n\n".join(matched) if matched else ""
+
 
 # ── Review Part 1: Codex primary review ──────────────────────────────────────
 
@@ -56,6 +139,7 @@ def _codex_primary_review(
     # commands to inspect context even when the diff is provided inline.
     # Placing this instruction first — before any task content — maximises
     # the chance Codex treats this as a pure text task.
+    diff_summary = _summarize_diff(diff)
     prompt = (
         "=== IMPORTANT: TEXT-ONLY TASK — DO NOT RUN ANY SHELL COMMANDS ===\n"
         "You are a senior technical lead doing a code review.\n"
@@ -70,9 +154,11 @@ def _codex_primary_review(
         f"- This is review cycle {iteration} of {max_iterations}. Be decisive.\n\n"
         f"TASK:\n{task}\n\n"
         f"PLAN:\n{plan[:2000]}\n\n"
-        f"DIFF (this is ALL the code — do not inspect any files):\n"
-        f"```diff\n{diff[:4000]}\n```\n\n"
-        "Your response MUST start with exactly one of these two lines:\n"
+        f"DIFF SUMMARY:\n{diff_summary}\n\n"
+        "If you need to see the full diff for specific files to make a judgment,\n"
+        "respond with NEED_FULL_DIFF: filename1, filename2\n"
+        "Those files' full diffs will be provided in a follow-up.\n\n"
+        "Otherwise, your response MUST start with exactly one of these two lines:\n"
         "APPROVED\n"
         "CHANGES_REQUESTED\n\n"
         "If CHANGES_REQUESTED, list each confirmed issue as a numbered bullet.\n"
@@ -98,6 +184,31 @@ def _codex_primary_review(
             return "", False  # caller: continue to next iteration
         # approve or skip → treat as approved
         return "", True
+
+    # Handle NEED_FULL_DIFF requests
+    full_diff_matches = _NEED_FULL_DIFF.findall(review)
+    if full_diff_matches:
+        requested_files = []
+        for match in full_diff_matches:
+            requested_files.extend(f.strip() for f in match.split(","))
+        log_info(f"Codex requested full diff for: {', '.join(requested_files)}")
+
+        extracted = _extract_file_diff(diff, requested_files)
+        if extracted:
+            followup = (
+                "=== IMPORTANT: TEXT-ONLY TASK — DO NOT RUN ANY SHELL COMMANDS ===\n"
+                "You previously reviewed a diff summary and requested full diffs.\n"
+                "Here are the full diffs you requested:\n\n"
+                f"```diff\n{extracted[:6000]}\n```\n\n"
+                f"Your original review so far:\n{review}\n\n"
+                "Now finalize your review with the full context. Same rules apply.\n"
+                "Your response MUST start with APPROVED or CHANGES_REQUESTED."
+            )
+            try:
+                review = codex.review_query(followup)
+                log_agent("Codex (Review Part 1 — follow-up)", review)
+            except RuntimeError:
+                log_info("Follow-up failed — using initial review.")
 
     # Determine verdict
     if _APPROVED_PAT.search(review) and not _CHANGES_PAT.search(review):
@@ -126,6 +237,7 @@ def _claude_secondary_review(
     Returns (aggregated_feedback, has_confirmed_issues).
     Falls back to trusting Codex directly if Claude's query fails.
     """
+    diff_summary = _summarize_diff(diff)
     prompt = (
         "You are a senior technical lead doing a secondary code review.\n"
         "Codex (another lead) reviewed the diff and flagged issues.\n"
@@ -138,9 +250,11 @@ def _claude_secondary_review(
         "  shows are already handled or don't exist at all).\n\n"
         f"TASK:\n{task}\n\n"
         f"PLAN:\n{plan[:2000]}\n\n"
-        f"DIFF:\n```diff\n{diff[:3000]}\n```\n\n"
+        f"DIFF SUMMARY:\n{diff_summary}\n\n"
         f"CODEX FINDINGS:\n{codex_review}\n\n"
-        "Your response MUST start with exactly one of:\n"
+        "If you need the full diff for specific files to validate a finding,\n"
+        "respond with NEED_FULL_DIFF: filename1, filename2\n\n"
+        "Otherwise, your response MUST start with exactly one of:\n"
         "CONFIRMED — at least one issue is valid\n"
         "APPROVED  — all issues are invalid, implementation is correct\n\n"
         "If CONFIRMED, list ONLY the confirmed issues as numbered bullets.\n"
@@ -154,6 +268,31 @@ def _claude_secondary_review(
     except RuntimeError as exc:
         log_error(f"Claude secondary review failed: {exc} — using Codex review as-is.")
         return codex_review, True  # fall back to trusting Codex's findings
+
+    # Handle NEED_FULL_DIFF requests
+    full_diff_matches = _NEED_FULL_DIFF.findall(result)
+    if full_diff_matches:
+        requested_files = []
+        for match in full_diff_matches:
+            requested_files.extend(f.strip() for f in match.split(","))
+        log_info(f"Claude requested full diff for: {', '.join(requested_files)}")
+
+        extracted = _extract_file_diff(diff, requested_files)
+        if extracted:
+            followup = (
+                "You previously reviewed a diff summary and requested full diffs.\n"
+                "Here are the full diffs you requested:\n\n"
+                f"```diff\n{extracted[:6000]}\n```\n\n"
+                f"CODEX FINDINGS:\n{codex_review}\n\n"
+                f"Your original assessment:\n{result}\n\n"
+                "Now finalize your validation with the full context.\n"
+                "Your response MUST start with CONFIRMED or APPROVED."
+            )
+            try:
+                result = claude.query(followup)
+                log_agent("Claude (Review Part 2 — follow-up)", result)
+            except RuntimeError:
+                log_info("Follow-up failed — using initial validation.")
 
     has_issues = bool(_CONFIRMED_PAT.search(result)) and not bool(_CLAUDE_APPROVED_PAT.search(result.split("\n")[0]))
     return result, has_issues
