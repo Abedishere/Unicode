@@ -14,9 +14,9 @@
     "orchestrator.py",
     "config.yaml",
     "requirements.txt",
-    "agents/",
-    "phases/",
-    "utils/"
+    "agents/*.py",
+    "phases/*.py",
+    "utils/*.py"
   ],
   "keywords": ["ai", "orchestrator", "claude", "codex", "automation", "unicode"],
   "license": "MIT",
