@@ -53,13 +53,27 @@ Make sure `claude`, `codex`, and `qwen` all work from your terminal before proce
 
 ## Install
 
+### via npm (recommended)
+
+```bash
+npm install -g ai-orchestrator
+```
+
+This installs the `unicode` command globally and automatically installs all Python dependencies.
+
+### via npx (no install required)
+
+```bash
+npx ai-orchestrator <task>
+```
+
+### from source
+
 ```bash
 git clone https://github.com/Abedishere/unicode.git
 cd unicode
 pip install -e .
 ```
-
-This gives you the `unicode` command globally.
 
 ## Usage
 
