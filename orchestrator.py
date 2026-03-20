@@ -23,6 +23,7 @@ from agents.qwen_agent import QwenAgent
 from phases.discuss import run_discussion
 from phases.implement import run_implementation
 from phases.plan import consolidate_plan
+from phases.research import run_research
 from phases.review import run_review
 from utils.approval import request_approval, reset_session_approvals, set_auto_all, is_auto_all
 from utils.git_utils import commit, push, init_repo, is_git_repo
@@ -1699,6 +1700,43 @@ def _run_task(
     # For standalone implement/review, load saved plan
     if phase in ("implement", "review") and not plan:
         plan = _load_saved_plan(work_dir)
+
+    # ── Phase 0.5: Research (3 agents in parallel → Haiku synthesizes) ──
+    if session.phase_done("research"):
+        enriched = session.phases.get("research", {}).get("enriched_task", "")
+        if enriched:
+            task = enriched
+            log_info("Restored enriched task from saved research session.")
+    elif phase in ("all", "plan", "discuss"):
+        if phase == "all":
+            _print_phase_banner(
+                "Research", "Codex × 2 + Qwen",
+                "Codex (×2) · Qwen (web) research in parallel → Haiku synthesizes",
+                "cyan",
+            )
+        session.current_phase = "research"
+        save_session(work_dir, session)
+        result, _ = request_approval(
+            "research",
+            "Two Codex instances and Qwen (DuckDuckGo web search) will research the task in parallel. "
+            "Haiku will distill their findings into background context prepended to the task prompt.",
+        )
+        if result == "proceed":
+            # Haiku is sufficient for distillation (no editorial judgment needed)
+            synthesizer = ClaudeAgent(
+                model="claude-haiku-4-5-20251001",
+                timeout=cfg.get("timeout_seconds", 120),
+                working_dir=work_dir,
+            )
+            wall = cfg.get("research_wall_seconds", 90)
+            enriched = _run_phase("Research", run_research, task, codex, qwen, synthesizer,
+                                  wall_seconds=wall)
+            if enriched and enriched != task:
+                task = enriched
+        else:
+            log_info("Skipping research phase.")
+        session.mark_phase_done("research", {"enriched_task": task})
+        save_session(work_dir, session)
 
     # ── Phase 1: Discussion (Claude + Codex agree on the approach) ──
     run_discuss = phase in ("all", "plan", "discuss") and not session.phase_done("discussion")

@@ -9,6 +9,11 @@ codex_timeout_seconds: 300
 auto_commit: false
 working_directory: "."
 
+# Research phase settings
+research_wall_seconds: 90  # hard deadline for parallel research agents (seconds)
+                           # agents that finish within this window contribute;
+                           # stragglers are skipped so the pipeline doesn't stall
+
 # Optimization settings
 repo_map_max_tokens: 2000
 discussion_summary_window: 4  # keep last N history entries verbatim

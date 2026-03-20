@@ -15,6 +15,13 @@ User Task
 Phase 0: Clarify     — Claude asks 1-3 clarifying questions (optional, skipped in auto mode)
     │
     ▼
+Phase 0.5: Research  — Codex (×2) + Qwen research in parallel (3 workers):
+    │                     Codex-A: similar products & libraries
+    │                     Codex-B: technical patterns & pitfalls
+    │                     Qwen:    architectural patterns (web search if key set)
+    │                   Claude synthesizes the 3 findings into one brief,
+    │                   which is prepended to the task prompt for all later phases
+    ▼
 Phase 1: Discuss     — Claude + Codex debate approach (N rounds per tier)
     │
     ▼
@@ -59,6 +66,7 @@ ai-orchestrator/
 │
 ├── phases/                  One module per pipeline phase
 │   ├── clarify.py           Phase 0: Claude asks clarifying questions before planning.
+│   ├── research.py          Phase 0.5: Codex searches for similar apps / patterns (implicit).
 │   ├── discuss.py           Phase 1: Multi-round Claude ↔ Codex discussion loop.
 │   ├── plan.py              Phase 2: Qwen consolidates discussion into structured plan.
 │   ├── implement.py         Phase 3: Claude implements the plan, handles timeout/cancel.

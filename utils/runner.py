@@ -292,6 +292,7 @@ def run_interactive(
     agent_name: str,
     timeout: int = 600,
     cwd: str | None = None,
+    env: dict | None = None,
 ) -> int:
     """Run a subprocess with inherited stdio (full TUI takes over terminal).
 
@@ -312,6 +313,7 @@ def run_interactive(
         stderr=None,
         shell=True,
         cwd=cwd,
+        env=env,
     )
 
     while True:

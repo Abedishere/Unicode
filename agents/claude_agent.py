@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import os
+
 from agents.base import BaseAgent
 from utils.runner import run_cli, run_interactive
+
+# Environment with CLAUDECODE stripped so Claude CLI can run as a subprocess
+# even when the orchestrator itself was launched from inside a Claude Code session.
+_CLAUDE_ENV = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
 
 
 class ClaudeAgent(BaseAgent):
@@ -30,6 +36,7 @@ class ClaudeAgent(BaseAgent):
             input_text=prompt,
             timeout=self.timeout,
             cwd=self.working_dir,
+            env=_CLAUDE_ENV,
         )
         return self.check_cli_output(stdout, stderr, self.name)
 
@@ -51,6 +58,7 @@ class ClaudeAgent(BaseAgent):
             input_text=plan,
             timeout=self.timeout,
             cwd=self.working_dir,
+            env=_CLAUDE_ENV,
         )
         return self.check_cli_output(stdout, stderr, agent_name)
 
@@ -71,4 +79,5 @@ class ClaudeAgent(BaseAgent):
             agent_name=f"{self.name} (dev:{self.dev_model})",
             timeout=self.timeout,
             cwd=self.working_dir,
+            env=_CLAUDE_ENV,
         )
