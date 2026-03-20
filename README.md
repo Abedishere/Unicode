@@ -71,6 +71,8 @@ npx ai-orchestrator@latest <task>
 npx ai-orchestrator <task>
 ```
 
+> This project is updated frequently. We recommend running `npx ai-orchestrator@latest` whenever you feel like picking up new improvements — no reinstall needed.
+
 ### from source
 
 ```bash
