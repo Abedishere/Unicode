@@ -128,6 +128,7 @@ def _codex_primary_review(
     plan: str,
     iteration: int,
     max_iterations: int,
+    diff_summary: str = "",
 ) -> tuple[str, bool]:
     """Have Codex review the diff.
 
@@ -139,7 +140,7 @@ def _codex_primary_review(
     # commands to inspect context even when the diff is provided inline.
     # Placing this instruction first — before any task content — maximises
     # the chance Codex treats this as a pure text task.
-    diff_summary = _summarize_diff(diff)
+    diff_summary = diff_summary or _summarize_diff(diff)
     prompt = (
         "=== IMPORTANT: TEXT-ONLY TASK — DO NOT RUN ANY SHELL COMMANDS ===\n"
         "You are a senior technical lead doing a code review.\n"
@@ -231,13 +232,14 @@ def _claude_secondary_review(
     diff: str,
     task: str,
     plan: str,
+    diff_summary: str = "",
 ) -> tuple[str, bool]:
     """Have Claude validate and aggregate Codex's findings.
 
     Returns (aggregated_feedback, has_confirmed_issues).
     Falls back to trusting Codex directly if Claude's query fails.
     """
-    diff_summary = _summarize_diff(diff)
+    diff_summary = diff_summary or _summarize_diff(diff)
     prompt = (
         "You are a senior technical lead doing a secondary code review.\n"
         "Codex (another lead) reviewed the diff and flagged issues.\n"
@@ -364,6 +366,9 @@ def run_review(
             f"+{added} / -{removed} lines[/]"
         )
 
+        # ── Pre-compute diff summary (shared by both review parts) ──────
+        diff_summary = _summarize_diff(diff)
+
         # ── Review Part 1: Codex primary review ──────────────────────────
         log_phase(
             f"Review Part 1 — Codex primary review "
@@ -371,6 +376,7 @@ def run_review(
         )
         codex_review, approved = _codex_primary_review(
             codex, diff, task, plan, iteration, max_iterations,
+            diff_summary=diff_summary,
         )
 
         if codex_review:
@@ -400,6 +406,7 @@ def run_review(
         )
         aggregated, has_issues = _claude_secondary_review(
             claude, codex_review, diff, task, plan,
+            diff_summary=diff_summary,
         )
 
         if aggregated:

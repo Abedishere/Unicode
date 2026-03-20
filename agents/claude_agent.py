@@ -31,9 +31,7 @@ class ClaudeAgent(BaseAgent):
             timeout=self.timeout,
             cwd=self.working_dir,
         )
-        if not stdout.strip() and stderr.strip():
-            raise RuntimeError(f"Claude CLI failed: {stderr}")
-        return stdout.strip()
+        return self.check_cli_output(stdout, stderr, self.name)
 
     def implement(self, plan: str) -> str:
         """Run Claude Code as the developer — full file access.
@@ -46,16 +44,15 @@ class ClaudeAgent(BaseAgent):
             "--model", self.dev_model,
             "--dangerously-skip-permissions",
         ]
+        agent_name = f"{self.name} (dev:{self.dev_model})"
         stdout, stderr = run_cli(
             cmd,
-            agent_name=f"{self.name} (dev:{self.dev_model})",
+            agent_name=agent_name,
             input_text=plan,
             timeout=self.timeout,
             cwd=self.working_dir,
         )
-        if not stdout.strip() and stderr.strip():
-            raise RuntimeError(f"Claude CLI failed: {stderr}")
-        return stdout.strip()
+        return self.check_cli_output(stdout, stderr, agent_name)
 
     def implement_interactive(self, task: str, plan: str) -> int:
         """Run Claude Code interactively — full TUI with streaming output.

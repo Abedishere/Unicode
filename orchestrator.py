@@ -7,6 +7,7 @@ import os
 import signal
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -17,7 +18,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from agents.claude_agent import ClaudeAgent
-from agents.codex_agent import CodexAgent
+from agents.codex_agent import CodexAgent, read_codex_config
 from agents.qwen_agent import QwenAgent
 from phases.discuss import run_discussion
 from phases.implement import run_implementation
@@ -28,7 +29,7 @@ from utils.git_utils import commit, push, init_repo, is_git_repo
 from utils.history import append_history, agent_update_md, init_agent_md, write_orchestrator_md
 from utils.logger import format_duration, init_transcript, log_error, log_info, log_phase, log_success
 from utils.memory import (
-    add_learning, add_task_to_index, extract_keywords_from_task,
+    add_learning, extract_keywords_from_task,
     get_context_for_task, init_project_notes, load_memory,
     log_bug, log_decision, log_issue, log_key_fact, save_memory,
 )
@@ -89,14 +90,16 @@ def _lerp_color(c1: tuple[int, int, int], c2: tuple[int, int, int], t: float) ->
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+_GRADIENT_STOPS = (_hex_to_rgb(_C), _hex_to_rgb(_X), _hex_to_rgb(_Q))
+
+
 def _gradient_char(col: int, width: int) -> str:
     """Return a hex color for column position using a 3-stop gradient."""
-    stops = [_hex_to_rgb(_C), _hex_to_rgb(_X), _hex_to_rgb(_Q)]
     t = col / max(width - 1, 1)  # 0.0 → 1.0
     if t <= 0.5:
-        return _lerp_color(stops[0], stops[1], t / 0.5)
+        return _lerp_color(_GRADIENT_STOPS[0], _GRADIENT_STOPS[1], t / 0.5)
     else:
-        return _lerp_color(stops[1], stops[2], (t - 0.5) / 0.5)
+        return _lerp_color(_GRADIENT_STOPS[1], _GRADIENT_STOPS[2], (t - 0.5) / 0.5)
 
 
 def _gradient_line(line: str, width: int) -> str:
@@ -117,7 +120,15 @@ def _build_gradient_art() -> str:
     return "\n".join(_gradient_line(line, max_width) for line in _art_lines)
 
 
-ASCII_ART = _build_gradient_art()
+_ASCII_ART_CACHE: str | None = None
+
+
+def _get_ascii_art() -> str:
+    """Lazily build and cache the gradient ASCII art."""
+    global _ASCII_ART_CACHE
+    if _ASCII_ART_CACHE is None:
+        _ASCII_ART_CACHE = _build_gradient_art()
+    return _ASCII_ART_CACHE
 
 
 def _print_banner(cfg: dict, work_dir: str) -> None:
@@ -134,8 +145,15 @@ def _print_banner(cfg: dict, work_dir: str) -> None:
     info_lines.append(f"  Claude ", style=f"bold {_C}")
     info_lines.append(f"{cfg['claude_model']}", style="dim")
     info_lines.append(f"  |  ", style="dim")
+    codex_display = cfg["codex_model"]
+    if not codex_display:
+        codex_cfg = read_codex_config()
+        codex_display = codex_cfg.get("model", "codex-default")
+        effort = codex_cfg.get("reasoning_effort")
+        if effort:
+            codex_display += f" ({effort})"
     info_lines.append(f"Codex ", style=f"bold {_X}")
-    info_lines.append(f"{cfg['codex_model']}", style="dim")
+    info_lines.append(f"{codex_display}", style="dim")
     info_lines.append(f"\n  Qwen ", style=f"bold {_Q}")
     info_lines.append(f"{cfg['qwen_model']}", style="dim")
     info_lines.append(f"  |  ", style="dim")
@@ -150,7 +168,7 @@ def _print_banner(cfg: dict, work_dir: str) -> None:
     )
 
     console.print(
-        Columns([ASCII_ART, info_panel], padding=(0, 2), expand=False),
+        Columns([_get_ascii_art(), info_panel], padding=(0, 2), expand=False),
     )
 
     console.print()
@@ -281,7 +299,7 @@ def load_config(config_path: str | None) -> dict:
         "discussion_rounds": 4,
         "max_review_iterations": 3,
         "claude_model": "opus",
-        "codex_model": "gpt-5.3-codex",
+        "codex_model": None,  # None → use ~/.codex/config.toml
         "qwen_model": "qwen3-coder",
         "dev_model": "sonnet",
         "timeout_seconds": 600,
@@ -1356,15 +1374,15 @@ def _prompt_task() -> str:
         # _erase_screen_from and _redraw_prompt_area use this to compute
         # how far to move the cursor upward (scroll-safe relative movement).
         global _prompt_draw_badge_count
-        _prompt_draw_badge_count = _attachment_count()
+        total_att = _attachment_count()
+        _prompt_draw_badge_count = total_att
 
         # Dim horizontal rule above prompt
         console.rule(style="bright_black")
 
         # Show pending attachments with hint
-        has_attachments = _attachment_count() > 0
+        has_attachments = total_att > 0
         idx = 0
-        total_att = _attachment_count()
         for num, plines in _attached_pastes:
             badge = f"\\[Pasted text #{num} +{len(plines)} lines]"
             hint = " [dim](↑ to select)[/]" if idx == total_att - 1 else ""
@@ -1891,18 +1909,28 @@ def _run_task(
     append_history(work_dir, task, outcome, duration, actions_summary, transcript_name)
     log_info("Appended run to .orchestrator/history.md")
 
-    # ── Save to shared memory ──
+    # ── Save to shared memory (single load/save cycle) ──
     keywords = extract_keywords_from_task(task)
-    add_task_to_index(work_dir, task, outcome, keywords)
+    memory = load_memory(work_dir)
+    memory["task_index"].append({
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "task": task[:200],
+        "outcome": outcome,
+        "keywords": keywords,
+    })
+    if plan and "architecture_decisions" in memory and isinstance(memory["architecture_decisions"], list):
+        memory["architecture_decisions"].append({
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "text": f"[{outcome}] {task[:100]}: {plan[:200]}",
+        })
+    save_memory(work_dir, memory)
     log_info("Task indexed in shared memory.")
 
     # Mirror to human-readable work log (.orchestrator/issues.md)
     log_issue(work_dir, task, outcome)
 
-    # Extract learnings from the task
+    # Mirror to human-readable ADR (.orchestrator/decisions.md)
     if plan:
-        add_learning(work_dir, "architecture_decisions",
-            f"[{outcome}] {task[:100]}: {plan[:200]}")
         # Mirror to human-readable ADR (.orchestrator/decisions.md)
         log_decision(
             working_dir=work_dir,

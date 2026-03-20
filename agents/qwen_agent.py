@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from agents.base import BaseAgent
 from utils.runner import run_cli
 
@@ -10,7 +12,9 @@ class QwenAgent(BaseAgent):
         return "Qwen"
 
     def query(self, prompt: str) -> str:
-        cmd = ["qwen", "-p", "-o", "text", "--model", self.model]
+        cmd = ["qwen", "-p", "-o", "text"]
+        if self.model:
+            cmd += ["--model", self.model]
         stdout, stderr = run_cli(
             cmd,
             agent_name=self.name,
@@ -18,6 +22,4 @@ class QwenAgent(BaseAgent):
             timeout=self.timeout,
             cwd=self.working_dir,
         )
-        if not stdout.strip() and stderr.strip():
-            raise RuntimeError(f"Qwen CLI failed: {stderr}")
-        return stdout.strip()
+        return self.check_cli_output(stdout, stderr, self.name)

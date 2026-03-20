@@ -22,11 +22,10 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from utils.logger import log_error, log_info, log_success
 from utils.memory import (
-    _append_to_note,
-    _next_adr_number,
-    _notes_path,
     init_project_notes,
     load_memory,
+    log_decision,
+    log_key_fact,
     save_memory,
 )
 
@@ -34,19 +33,7 @@ console = Console()
 
 # ── File-scanning constants ───────────────────────────────────────────────────
 
-_SKIP_DIRS: frozenset[str] = frozenset({
-    ".git", "node_modules", "__pycache__", ".venv", "venv", "env",
-    ".env", "dist", "build", ".orchestrator", ".tox", ".pytest_cache",
-    "coverage", ".nyc_output", "target", ".cargo", ".gradle",
-    ".idea", ".vscode", "htmlcov", ".eggs", "site-packages",
-})
-
-_SKIP_EXTENSIONS: frozenset[str] = frozenset({
-    ".pyc", ".pyo", ".class", ".o", ".so", ".dll", ".exe", ".wasm",
-    ".jpg", ".jpeg", ".png", ".gif", ".ico", ".svg", ".webp", ".bmp",
-    ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".whl", ".lock",
-    ".min.js", ".min.css", ".map",
-})
+from utils.constants import IGNORE_DIRS as _SKIP_DIRS, IGNORE_EXTS as _SKIP_EXTENSIONS
 
 # Files to read for project context (checked in order, root-relative)
 _KEY_FILES: list[str] = [
@@ -195,7 +182,7 @@ def _has_real_content(work_dir: str, filename: str) -> bool:
     The auto-generated header is 4 non-blank lines.  Any file with more than
     that has real content and should not be overwritten.
     """
-    path = _notes_path(work_dir, filename)
+    path = Path(work_dir) / ".orchestrator" / filename
     if not path.exists():
         return False
     try:
@@ -320,13 +307,7 @@ Be concise but thorough.  Max ~600 words.
 
 # ── Memory-protocol header injection ─────────────────────────────────────────
 
-_MEMORY_PROTOCOL_SECTION = (
-    "\n\n## Memory\n\n"
-    "All persistent memory lives in `.orchestrator/`:\n"
-    "- `bugs.md` · `decisions.md` · `key_facts.md` · `issues.md` · `memory.yaml`\n\n"
-    "Check these before making architectural changes or debugging known issues.\n"
-    "Run `/init` to have Qwen populate them from the codebase if they are empty.\n"
-)
+from utils.history import _MEMORY_PROTOCOL_SECTION  # noqa: E402 — shared constant
 
 
 def _upgrade_agent_md(work_dir: str, filename: str) -> bool:
@@ -345,7 +326,7 @@ def _upgrade_agent_md(work_dir: str, filename: str) -> bool:
     if ".orchestrator/" in text:
         return False  # already has it
 
-    path.write_text(text.rstrip() + _MEMORY_PROTOCOL_SECTION, encoding="utf-8")
+    path.write_text(text.rstrip() + "\n\n" + _MEMORY_PROTOCOL_SECTION, encoding="utf-8")
     return True
 
 
@@ -435,24 +416,24 @@ def run_init(work_dir: str, agent) -> None:
     if not already["key_facts.md"]:
         desc = analysis.get("description", "")
         if desc:
-            _write_key_fact(work_dir, "Project Overview", desc, today)
+            log_key_fact(work_dir, "Project Overview", desc, today)
             facts_written += 1
 
         tech = analysis.get("tech_stack", [])
         if tech:
-            _write_key_fact(work_dir, "Tech Stack", ", ".join(tech), today)
+            log_key_fact(work_dir, "Tech Stack", ", ".join(tech), today)
             facts_written += 1
 
         entry = analysis.get("entry_points", [])
         if entry:
-            _write_key_fact(work_dir, "Entry Points", " | ".join(entry), today)
+            log_key_fact(work_dir, "Entry Points", " | ".join(entry), today)
             facts_written += 1
 
         for item in analysis.get("key_facts", []):
             cat  = item.get("category", "General")
             fact = item.get("fact", "").strip()
             if fact:
-                _write_key_fact(work_dir, cat, fact, today)
+                log_key_fact(work_dir, cat, fact, today)
                 facts_written += 1
 
     # ── Step 6: Populate decisions.md ────────────────────────────────────────
@@ -464,7 +445,8 @@ def run_init(work_dir: str, agent) -> None:
             decision     = adr.get("decision", "").strip()
             consequences = adr.get("consequences", "").strip()
             if title and decision:
-                _write_adr(work_dir, title, context, decision, consequences, today)
+                log_decision(work_dir, title, context, decision,
+                             consequences=consequences, date=today)
                 adrs_written += 1
 
     # ── Step 7: Update YAML memory store ─────────────────────────────────────
@@ -560,28 +542,3 @@ def run_init(work_dir: str, agent) -> None:
     console.print()
 
 
-# ── Internal write helpers ────────────────────────────────────────────────────
-
-def _write_key_fact(work_dir: str, category: str, fact: str, date: str) -> None:
-    """Write one key-fact entry (mirrors memory.log_key_fact but uses a passed date)."""
-    entry = f"\n### {category}\n- [{date}] {fact.strip()}\n"
-    _append_to_note(work_dir, "key_facts.md", entry)
-
-
-def _write_adr(
-    work_dir: str,
-    title: str,
-    context: str,
-    decision: str,
-    consequences: str,
-    date: str,
-) -> None:
-    """Write one ADR entry with auto-incremented number."""
-    n = _next_adr_number(work_dir)
-    lines = [
-        f"\n### ADR-{n:03d}: {title} ({date})\n",
-        f"**Context:**\n{context}\n" if context else "",
-        f"**Decision:**\n{decision}",
-        f"\n**Consequences:**\n{consequences}" if consequences else "",
-    ]
-    _append_to_note(work_dir, "decisions.md", "\n".join(l for l in lines if l) + "\n")

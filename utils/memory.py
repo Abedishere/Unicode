@@ -234,6 +234,7 @@ def log_decision(
     decision: str,
     alternatives: str = "",
     consequences: str = "",
+    date: str | None = None,
 ) -> None:
     """Append an ADR to ``.orchestrator/decisions.md`` with auto-numbering.
 
@@ -253,7 +254,7 @@ def log_decision(
         **Consequences:**              (omitted if empty)
         ...
     """
-    date = datetime.now().strftime("%Y-%m-%d")
+    date = date or datetime.now().strftime("%Y-%m-%d")
     n = _next_adr_number(working_dir)
     lines = [
         f"\n### ADR-{n:03d}: {title} ({date})\n",
@@ -298,13 +299,13 @@ def log_issue(
     _append_to_note(working_dir, "issues.md", "\n".join(lines) + "\n")
 
 
-def log_key_fact(working_dir: str, category: str, fact: str) -> None:
+def log_key_fact(working_dir: str, category: str, fact: str, date: str | None = None) -> None:
     """Append a key fact bullet under *category* in ``.orchestrator/key_facts.md``.
 
     Always appends a new ``### <category>`` block.  Human review can
     consolidate duplicate sections over time.
     """
-    date = datetime.now().strftime("%Y-%m-%d")
+    date = date or datetime.now().strftime("%Y-%m-%d")
     entry = f"\n### {category}\n- [{date}] {fact.strip()}\n"
     _append_to_note(working_dir, "key_facts.md", entry)
 

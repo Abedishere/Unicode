@@ -17,22 +17,7 @@ from utils.logger import log_info
 
 # ── Ignore patterns ─────────────────────────────────────────────────────────
 
-_IGNORE_DIRS = {
-    ".git", "node_modules", "__pycache__", ".orchestrator", "build", "dist",
-    "target", ".gradle", ".next", "venv", ".venv", "env", ".idea", ".vscode",
-    ".mypy_cache", ".pytest_cache", ".tox", "egg-info",
-}
-
-_IGNORE_FILES = {
-    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
-}
-
-_IGNORE_EXTS = {
-    ".pyc", ".pyo", ".class", ".o", ".so", ".dll", ".exe",
-    ".min.js", ".min.css", ".map", ".woff", ".woff2", ".ttf",
-    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg",
-    ".zip", ".tar", ".gz", ".bz2",
-}
+from utils.constants import IGNORE_DIRS as _IGNORE_DIRS, IGNORE_EXTS as _IGNORE_EXTS, IGNORE_FILES as _IGNORE_FILES
 
 # ── Regex patterns for extraction ────────────────────────────────────────────
 

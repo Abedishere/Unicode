@@ -1,7 +1,7 @@
 discussion_rounds: 4
 max_review_iterations: 3
 claude_model: "opus"
-codex_model: "gpt-5.3-codex"
+codex_model: null  # null → reads from ~/.codex/config.toml automatically
 qwen_model: "qwen3-coder"
 dev_model: "sonnet"
 timeout_seconds: 600

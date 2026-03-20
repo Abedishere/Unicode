@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from agents.base import BaseAgent
 from utils.logger import format_transcript, log_agent, log_info, log_phase
 
@@ -64,13 +62,7 @@ def consolidate_plan(
     plan = codex.query(codex_prompt)
     log_agent("Codex", plan)
 
-    if plan.strip():
-        plan_dir = Path(working_dir) / ".orchestrator"
-        plan_dir.mkdir(parents=True, exist_ok=True)
-        plan_path = plan_dir / "plan.md"
-        plan_path.write_text(plan, encoding="utf-8")
-        log_info(f"Plan saved to {plan_path}")
-    else:
-        log_info("Warning: Codex returned empty plan — skipping disk write.")
+    if not plan.strip():
+        log_info("Warning: Codex returned empty plan.")
 
     return plan

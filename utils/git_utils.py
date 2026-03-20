@@ -22,37 +22,12 @@ _GIT_ENV = {
 # Codex query or diff collection for the same working directory.
 _configured_dirs: set[str] = set()
 
-# Build artifact and dependency directories excluded from the review diff.
-# Staging them is fine (they should be .gitignored by the project anyway),
-# but including them in the diff sent to AI reviewers is useless and can
-# make the diff so large that the review is broken entirely.
-_DIFF_EXCLUDE = [
-    # Gradle
-    ".gradle/wrapper/dists", ".gradle/caches",
-    # Node / JS
-    "node_modules",
-    # Python
-    ".venv", "venv", "env", "__pycache__",
-    # Java / Kotlin / Android
-    "build", "target", ".idea", "out",
-    # Dart / Flutter
-    ".dart_tool", ".flutter-plugins", ".flutter-plugins-dependencies",
-    # Swift / iOS
-    "Pods", ".build",
-    # Web
-    "dist", ".next", ".nuxt",
-    # Generic
-    "vendor",
-]
+from utils.constants import IGNORE_DIRS, IGNORE_EXTS
 
-# Binary / compiled file extensions excluded from diff (not useful to review)
-_DIFF_EXCLUDE_EXT = [
-    "*.class", "*.jar", "*.war", "*.ear",
-    "*.pyc", "*.pyo", "*.pyd",
-    "*.o", "*.so", "*.dll", "*.exe",
-    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp",
-    "*.zip", "*.tar", "*.gz", "*.aar",
-]
+# Git diff exclusion lists derived from the shared constants.
+# Directories use pathspec format; extensions use glob format.
+_DIFF_EXCLUDE = sorted(IGNORE_DIRS)
+_DIFF_EXCLUDE_EXT = sorted(f"*{ext}" for ext in IGNORE_EXTS)
 
 
 def _only_warnings(stderr: str) -> bool:
