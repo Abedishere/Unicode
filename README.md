@@ -64,6 +64,10 @@ This installs the `unicode` command globally and automatically installs all Pyth
 ### via npx (no install required)
 
 ```bash
+# Always runs the latest published version
+npx ai-orchestrator@latest <task>
+
+# Or omit the tag (uses latest by default)
 npx ai-orchestrator <task>
 ```
 
