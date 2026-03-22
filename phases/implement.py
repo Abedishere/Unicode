@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+
 from agents.claude_agent import ClaudeAgent
 from utils.logger import log_info, log_phase, log_success
 from utils.memory import get_context_for_task, load_memory, log_bug, log_key_fact, parse_json_response, save_memory
+
+console = Console()
 
 if TYPE_CHECKING:
     from agents.qwen_agent import QwenAgent
@@ -98,6 +106,39 @@ def _synthesize_file_memory(
     return [l for l in data.get("lessons", []) if isinstance(l, str) and l.strip()]
 
 
+def _build_file_prompt(
+    task: str,
+    file_spec,
+    skeleton: str,
+    shared_deps: str,
+    memory_context: str,
+) -> str:
+    action_hint = (
+        "Create this file from scratch."
+        if file_spec.action == "CREATE"
+        else "Modify this existing file."
+    )
+    return (
+        f"{memory_context}"
+        f"<task>{task[:500]}</task>\n\n"
+        f"{skeleton}"
+        f"{shared_deps}"
+        f"<file_spec>\n"
+        f"ACTION: {file_spec.action} {file_spec.path}\n"
+        f"{file_spec.spec}\n"
+        f"</file_spec>\n\n"
+        "<rules>\n"
+        f"- Implement ONLY this file: {file_spec.path}\n"
+        f"- {action_hint}\n"
+        "- Use the shared dependency names exactly as listed above.\n"
+        "- Follow the spec precisely. No extras.\n"
+        "- When creating or modifying requirements.txt or pyproject.toml, "
+        "always pin package versions with a minimum version constraint "
+        "(e.g. `click>=8.1.0`, not just `click`).\n"
+        "</rules>"
+    )
+
+
 def _implement_file_by_file(
     task: str,
     structured_plan: StructuredPlan,
@@ -106,80 +147,124 @@ def _implement_file_by_file(
     memory_context: str = "",
     qwen: QwenAgent | None = None,
     work_dir: str = "",
+    max_workers: int = 5,
 ) -> str:
-    """Implement the plan one file at a time.
+    """Implement the plan with up to *max_workers* parallel Claude agents.
 
-    Each file gets a focused prompt with only the repo skeleton, shared
-    dependencies, and that file's specific spec.  This produces more
-    reliable output for larger projects since each call has a smaller,
-    focused context.
+    Each file gets its own focused Claude process. A Rich Live table shows
+    per-file status. Qwen memory synthesis runs sequentially after all files
+    complete so it can see the full picture.
     """
     total = len(structured_plan.files)
-    results = []
-    all_lessons: list[str] = []
 
-    skeleton = ""
-    if repo_map:
-        skeleton = f"<codebase>\n{repo_map}\n</codebase>\n\n"
+    skeleton = f"<codebase>\n{repo_map}\n</codebase>\n\n" if repo_map else ""
+    shared_deps = (
+        "<shared_dependencies>\n"
+        f"{structured_plan.shared_dependencies}\n"
+        "</shared_dependencies>\n\n"
+        if structured_plan.shared_dependencies else ""
+    )
 
-    shared_deps = ""
-    if structured_plan.shared_dependencies:
-        shared_deps = (
-            "<shared_dependencies>\n"
-            f"{structured_plan.shared_dependencies}\n"
-            "</shared_dependencies>\n\n"
-        )
-
-    # Suppress Qwen's run_cli Live display during per-file memory synthesis —
-    # it would conflict with log_info/log_success output between Claude calls.
+    # Suppress individual Live spinners — the progress table handles display.
+    claude._quiet = True
     if qwen is not None:
         qwen._quiet = True
 
-    for i, file_spec in enumerate(structured_plan.files, 1):
-        log_info(f"Implementing file {i}/{total}: {file_spec.path}")
+    _colors = {
+        "Pending": "dim", "Running": "yellow",
+        "Done": "green", "Error": "red",
+    }
+    status: dict[str, str] = {s.path: "Pending" for s in structured_plan.files}
+    outputs: dict[str, str] = {}
+    _lock = threading.Lock()
+    update_event = threading.Event()
+    stop_event = threading.Event()
 
-        action_hint = (
-            "Create this file from scratch."
-            if file_spec.action == "CREATE"
-            else "Modify this existing file."
+    def _make_table() -> Table:
+        t = Table(show_header=True, header_style="bold", box=None, expand=True)
+        t.add_column("File", no_wrap=False)
+        t.add_column("Status", no_wrap=True, width=9)
+        done_n = sum(1 for s in status.values() if s == "Done")
+        err_n  = sum(1 for s in status.values() if s == "Error")
+        run_n  = sum(1 for s in status.values() if s == "Running")
+        t.add_row(
+            f"[dim]Progress: {done_n + err_n}/{total}  "
+            f"({run_n} running, {err_n} errors)[/]",
+            "",
         )
+        for path, state in status.items():
+            c = _colors.get(state, "white")
+            t.add_row(f"  {path}", f"[{c}]{state}[/]")
+        return t
 
-        prompt = (
-            f"{memory_context}"
-            f"<task>{task[:500]}</task>\n\n"
-            f"{skeleton}"
-            f"{shared_deps}"
-            f"<file_spec>\n"
-            f"ACTION: {file_spec.action} {file_spec.path}\n"
-            f"{file_spec.spec}\n"
-            f"</file_spec>\n\n"
-            "<rules>\n"
-            f"- Implement ONLY this file: {file_spec.path}\n"
-            f"- {action_hint}\n"
-            "- Use the shared dependency names exactly as listed above.\n"
-            "- Follow the spec precisely. No extras.\n"
-            "- When creating or modifying requirements.txt or pyproject.toml, "
-            "always pin package versions with a minimum version constraint "
-            "(e.g. `click>=8.1.0`, not just `click`).\n"
-            "</rules>"
-        )
+    def _refresh(live: Live) -> None:
+        while not stop_event.is_set():
+            update_event.wait(timeout=120)
+            update_event.clear()
+            with _lock:
+                t = _make_table()
+            live.update(t)
+            live.refresh()
 
-        claude_output = claude.implement(prompt)
-        results.append(f"[{file_spec.path}] done")
-        log_success(f"  {file_spec.path} — done")
+    def _worker(file_spec) -> str:
+        with _lock:
+            status[file_spec.path] = "Running"
+        update_event.set()
+        prompt = _build_file_prompt(task, file_spec, skeleton, shared_deps, memory_context)
+        try:
+            out = claude.implement(prompt)
+            with _lock:
+                status[file_spec.path] = "Done"
+                outputs[file_spec.path] = out
+        except Exception:
+            with _lock:
+                status[file_spec.path] = "Error"
+                outputs[file_spec.path] = ""
+        update_event.set()
+        return outputs.get(file_spec.path, "")
 
-        if qwen and work_dir:
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        futures = {
+            pool.submit(_worker, spec): spec
+            for spec in structured_plan.files
+        }
+        with Live(_make_table(), auto_refresh=False, console=console) as live:
+            refresh_thread = threading.Thread(target=_refresh, args=(live,), daemon=True)
+            refresh_thread.start()
+            try:
+                concurrent.futures.wait(futures)
+            finally:
+                stop_event.set()
+                update_event.set()
+                refresh_thread.join(timeout=1.0)
+            with _lock:
+                live.update(_make_table())
+            live.refresh()
+    finally:
+        pool.shutdown(wait=False)
+        claude._quiet = False
+        if qwen is not None:
+            qwen._quiet = False
+
+    # Log results
+    all_lessons: list[str] = []
+    results = []
+    for spec in structured_plan.files:
+        state = status[spec.path]
+        out = outputs.get(spec.path, "")
+        if state == "Done":
+            log_success(f"  {spec.path} — done")
+            results.append(f"[{spec.path}] done")
+        else:
+            log_info(f"  {spec.path} — {state.lower()}")
+            results.append(f"[{spec.path}] {state.lower()}")
+
+        if qwen and work_dir and state == "Done":
             lessons = _synthesize_file_memory(
-                qwen, task, file_spec.path, file_spec.spec, claude_output, work_dir,
+                qwen, task, spec.path, spec.spec, out, work_dir,
             )
             all_lessons.extend(lessons)
-            # Refresh memory_context so the next file's Claude subagent benefits
-            # from conventions/bugs discovered in this file
-            if i < total:
-                memory_context = get_context_for_task(work_dir, task)
-
-    if qwen is not None:
-        qwen._quiet = False
 
     if all_lessons and work_dir:
         memory = load_memory(work_dir)
@@ -203,6 +288,7 @@ def run_implementation(
     structured_plan: StructuredPlan | None = None,
     qwen: QwenAgent | None = None,
     work_dir: str = "",
+    max_workers: int = 5,
 ) -> str:
     """Have Claude Code implement the plan non-interactively.
 
@@ -240,7 +326,7 @@ def run_implementation(
         log_info(f"Using file-by-file generation ({len(structured_plan.files)} files)")
         return _implement_file_by_file(
             task, structured_plan, claude, repo_map, memory_context,
-            qwen=qwen, work_dir=work_dir,
+            qwen=qwen, work_dir=work_dir, max_workers=max_workers,
         )
 
     # Monolithic fallback

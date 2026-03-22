@@ -2054,7 +2054,8 @@ def _run_task(
                     repo_map=repo_map,
                     structured_plan=structured_plan,
                     qwen=qwen,
-                    work_dir=work_dir)
+                    work_dir=work_dir,
+                    max_workers=cfg.get("max_impl_workers", 5))
                 if impl is not None:
                     # Qwen writes orchestrator.md (project summary)
                     _run_phase("Writing orchestrator.md",

@@ -227,8 +227,6 @@ def run_cli(
 
     if quiet:
         process_done.wait()
-        elapsed = time.time() - start
-        console.print(f"  [dim]{agent_name} finished in {format_duration(elapsed)}[/]")
         return results["stdout"], results["stderr"]
 
     # ── Colour scheme ───────────────────────────────────────────────
