@@ -112,12 +112,65 @@ def _synthesize_file_memory(
     return [l for l in data.get("lessons", []) if isinstance(l, str) and l.strip()]
 
 
+def _extract_contracts(
+    qwen: QwenAgent,
+    task: str,
+    structured_plan: StructuredPlan,
+) -> str:
+    """Use Qwen to extract expected public interfaces from all CREATE files.
+
+    Runs once before parallel workers start. Returns a compact contracts string
+    listing function/class signatures for each file being created. Injected into
+    every worker prompt so agents know what sibling files will expose — preventing
+    callers from referencing functions that don't exist yet.
+    """
+    create_files = [f for f in structured_plan.files if f.action == "CREATE"]
+    if len(create_files) < 2:
+        return ""  # no sibling race if only one file is being created
+
+    specs_block = "\n\n".join(
+        f"FILE: {f.path}\n{f.spec[:600]}"
+        for f in create_files
+    )
+
+    prompt = (
+        f"<task>{task[:200]}</task>\n\n"
+        "These files will be created in parallel as part of this task. "
+        "For each file, extract its expected public interface based solely on its spec.\n\n"
+        f"<file_specs>\n{specs_block}\n</file_specs>\n\n"
+        "Output format (repeat for each file):\n"
+        "FILE: path/to/file.py\n"
+        "- def function_name(param: type) -> return_type\n"
+        "- class ClassName\n\n"
+        "Rules:\n"
+        "- Public API only (functions/classes other files will import)\n"
+        "- Use the exact names from the spec\n"
+        "- If a spec has no clear public API, skip that file\n"
+        "- No prose, no explanations, no implementation details\n"
+        "Return ONLY the FILE blocks."
+    )
+
+    try:
+        result = qwen.query(prompt)
+        if result.strip():
+            return (
+                "<sibling_contracts>\n"
+                "These files are being created in parallel — match their interfaces exactly:\n"
+                f"{result.strip()}\n"
+                "</sibling_contracts>\n\n"
+            )
+    except Exception:
+        pass
+    return ""
+
+
 def _build_file_prompt(
     task: str,
     file_spec,
     skeleton: str,
     shared_deps: str,
     memory_context: str,
+    contracts: str = "",
 ) -> str:
     action_hint = (
         "Create this file from scratch."
@@ -128,6 +181,7 @@ def _build_file_prompt(
         f"{memory_context}"
         f"<task>{task[:500]}</task>\n\n"
         f"{skeleton}"
+        f"{contracts}"
         f"{shared_deps}"
         f"<file_spec>\n"
         f"ACTION: {file_spec.action} {file_spec.path}\n"
@@ -137,6 +191,8 @@ def _build_file_prompt(
         f"- Implement ONLY this file: {file_spec.path}\n"
         f"- {action_hint}\n"
         "- Use the shared dependency names exactly as listed above.\n"
+        "- When importing from sibling files listed in <sibling_contracts>, "
+        "use the exact function/class names shown there.\n"
         "- Follow the spec precisely. No extras.\n"
         "- When creating or modifying requirements.txt or pyproject.toml, "
         "always pin package versions with a minimum version constraint "
@@ -174,6 +230,15 @@ def _implement_file_by_file(
         "</shared_dependencies>\n\n"
         if structured_plan.shared_dependencies else ""
     )
+
+    # Extract cross-file interface contracts so parallel workers know what
+    # sibling files will expose (prevents referencing non-existent functions).
+    contracts = ""
+    if qwen is not None and total > 1:
+        log_info("Extracting cross-file contracts via Qwen ...")
+        contracts = _extract_contracts(qwen, task, structured_plan)
+        if contracts:
+            log_info("Contracts extracted — injecting into worker prompts.")
 
     # Suppress individual Live spinners — the progress table handles display.
     claude._quiet = True
@@ -245,7 +310,7 @@ def _implement_file_by_file(
                 status[file_spec.path] = "Running"
             update_event.set()
 
-            prompt = _build_file_prompt(task, file_spec, skeleton, shared_deps, memory_context)
+            prompt = _build_file_prompt(task, file_spec, skeleton, shared_deps, memory_context, contracts)
             try:
                 out = claude.implement(prompt)
                 with _lock:
