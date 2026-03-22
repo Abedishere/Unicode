@@ -1986,7 +1986,8 @@ def _run_task(
             plan = _run_phase("Plan",
                 consolidate_plan, task, codex, work_dir, discussion,
                 memory_context=memory_context,
-                repo_map=repo_map) or ""
+                repo_map=repo_map,
+                claude=claude) or ""
             # Parse structured plan for file-by-file generation
             structured_plan = parse_plan(plan)
             if is_structured(structured_plan):

@@ -130,6 +130,11 @@ def _implement_file_by_file(
             "</shared_dependencies>\n\n"
         )
 
+    # Suppress Qwen's run_cli Live display during per-file memory synthesis —
+    # it would conflict with log_info/log_success output between Claude calls.
+    if qwen is not None:
+        qwen._quiet = True
+
     for i, file_spec in enumerate(structured_plan.files, 1):
         log_info(f"Implementing file {i}/{total}: {file_spec.path}")
 
@@ -172,6 +177,9 @@ def _implement_file_by_file(
             # from conventions/bugs discovered in this file
             if i < total:
                 memory_context = get_context_for_task(work_dir, task)
+
+    if qwen is not None:
+        qwen._quiet = False
 
     if all_lessons and work_dir:
         memory = load_memory(work_dir)

@@ -4,6 +4,30 @@ from agents.base import BaseAgent
 from utils.logger import format_transcript, log_agent, log_error, log_info, log_phase
 from utils.plan_parser import is_structured, parse_plan
 
+_CLAUDE_SYNTHESIS_PROMPT = """\
+<role>You are Claude, a senior technical lead. Codex has drafted an implementation plan. \
+Read it carefully and produce the final improved plan.</role>
+
+<task>{task}</task>
+
+<codex_plan>
+{plan}
+</codex_plan>
+
+<output_format>
+{plan_format}
+</output_format>
+
+<rules>
+- Output ONLY the improved plan in the exact structured format above.
+- Fix any gaps: missing files, wrong paths, incomplete specs.
+- Remove bloat from ## Shared Dependencies — keep dependency names short, \
+descriptions one line max.
+- Improve spec bullets under each ### file section: make them specific and actionable.
+- Do NOT add unnecessary files. Only include what the task requires.
+- Start your output directly with ## Shared Dependencies.
+</rules>"""
+
 _PLAN_FORMAT = (
     "## Shared Dependencies\n"
     "`name`: description (used by: file1.py, file2.py)\n\n"
@@ -24,6 +48,7 @@ def consolidate_plan(
     discussion: list[dict[str, str]] | None = None,
     memory_context: str = "",
     repo_map: str = "",
+    claude: BaseAgent | None = None,
 ) -> str:
     """Create an implementation plan. Codex writes it based on the agreed discussion.
 
@@ -123,5 +148,23 @@ def consolidate_plan(
             )
             if retry_plan.strip():
                 log_agent("Codex (retry, unstructured)", retry_plan)
+
+    # ── Claude synthesis: review and refine Codex's plan ─────────────────────
+    if claude is not None and plan.strip():
+        log_info("Claude is synthesizing and refining the plan ...")
+        synthesis_prompt = _CLAUDE_SYNTHESIS_PROMPT.format(
+            task=task, plan=plan, plan_format=_PLAN_FORMAT
+        )
+        try:
+            claude_plan = claude.query(synthesis_prompt)
+        except Exception:
+            claude_plan = ""
+        if claude_plan.strip() and is_structured(parse_plan(claude_plan)):
+            log_agent("Claude (plan synthesis)", claude_plan)
+            plan = claude_plan
+        elif claude_plan.strip():
+            # Claude responded but not structured — show it but keep Codex's plan
+            log_agent("Claude (plan review)", claude_plan)
+            log_info("Claude synthesis was not structured — keeping Codex plan.")
 
     return plan
