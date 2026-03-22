@@ -16,6 +16,12 @@ from agents.claude_agent import ClaudeAgent
 from utils.logger import log_info, log_phase, log_success
 from utils.memory import get_context_for_task, load_memory, log_bug, log_key_fact, parse_json_response, save_memory
 
+try:
+    from utils.repo_map import generate_repo_map as _generate_repo_map
+except ImportError:
+    def _generate_repo_map(working_dir: str, max_tokens: int = 2000) -> str:  # type: ignore[misc]
+        return ""
+
 console = Console()
 
 if TYPE_CHECKING:
@@ -151,13 +157,17 @@ def _implement_file_by_file(
 ) -> str:
     """Implement the plan with up to *max_workers* parallel Claude agents.
 
-    Each file gets its own focused Claude process. A Rich Live table shows
-    per-file status. Qwen memory synthesis runs sequentially after all files
-    complete so it can see the full picture.
+    Uses a work-queue pattern so each worker regenerates the repo_map just
+    before building its prompt.  Files completed by earlier workers are
+    already on disk, so later workers see their real function signatures —
+    no separate contracts pass needed.
+
+    A Rich Live table shows per-file status.  Qwen memory synthesis runs
+    sequentially after all files complete.
     """
     total = len(structured_plan.files)
+    repo_map_tokens = 2000  # same default as orchestrator
 
-    skeleton = f"<codebase>\n{repo_map}\n</codebase>\n\n" if repo_map else ""
     shared_deps = (
         "<shared_dependencies>\n"
         f"{structured_plan.shared_dependencies}\n"
@@ -179,6 +189,23 @@ def _implement_file_by_file(
     _lock = threading.Lock()
     update_event = threading.Event()
     stop_event = threading.Event()
+
+    # Work queue: workers pop the next file atomically, regenerating the
+    # repo_map at that moment so completed files are already on disk.
+    _queue = list(structured_plan.files)
+
+    def _dequeue_with_skeleton() -> tuple | None:
+        """Pop the next file and snapshot the current repo_map under the lock."""
+        with _lock:
+            if not _queue:
+                return None
+            spec = _queue.pop(0)
+            current_map = (
+                _generate_repo_map(work_dir, repo_map_tokens)
+                if work_dir else repo_map
+            )
+        skeleton = f"<codebase>\n{current_map}\n</codebase>\n\n" if current_map else ""
+        return spec, skeleton
 
     def _make_table() -> Table:
         t = Table(show_header=True, header_style="bold", box=None, expand=True)
@@ -206,34 +233,39 @@ def _implement_file_by_file(
             live.update(t)
             live.refresh()
 
-    def _worker(file_spec) -> str:
-        with _lock:
-            status[file_spec.path] = "Running"
-        update_event.set()
-        prompt = _build_file_prompt(task, file_spec, skeleton, shared_deps, memory_context)
-        try:
-            out = claude.implement(prompt)
+    def _worker() -> None:
+        """Each thread loops: dequeue → implement → repeat until queue empty."""
+        while True:
+            item = _dequeue_with_skeleton()
+            if item is None:
+                return
+            file_spec, skeleton = item
+
             with _lock:
-                status[file_spec.path] = "Done"
-                outputs[file_spec.path] = out
-        except Exception:
-            with _lock:
-                status[file_spec.path] = "Error"
-                outputs[file_spec.path] = ""
-        update_event.set()
-        return outputs.get(file_spec.path, "")
+                status[file_spec.path] = "Running"
+            update_event.set()
+
+            prompt = _build_file_prompt(task, file_spec, skeleton, shared_deps, memory_context)
+            try:
+                out = claude.implement(prompt)
+                with _lock:
+                    status[file_spec.path] = "Done"
+                    outputs[file_spec.path] = out
+            except Exception:
+                with _lock:
+                    status[file_spec.path] = "Error"
+                    outputs[file_spec.path] = ""
+            update_event.set()
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
     try:
-        futures = {
-            pool.submit(_worker, spec): spec
-            for spec in structured_plan.files
-        }
+        # Launch exactly max_workers threads; each drains the queue itself.
+        worker_futures = [pool.submit(_worker) for _ in range(min(max_workers, total))]
         with Live(_make_table(), auto_refresh=False, console=console) as live:
             refresh_thread = threading.Thread(target=_refresh, args=(live,), daemon=True)
             refresh_thread.start()
             try:
-                concurrent.futures.wait(futures)
+                concurrent.futures.wait(worker_futures)
             finally:
                 stop_event.set()
                 update_event.set()
