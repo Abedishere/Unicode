@@ -1,7 +1,8 @@
-"""Subprocess runner with live spinner, ESC-to-pause, and process tree management."""
+"""Subprocess runner with live streaming output, ESC-to-pause, and process tree management."""
 
 from __future__ import annotations
 
+import collections
 import os
 import subprocess
 import threading
@@ -10,7 +11,7 @@ import time
 import click
 import msvcrt
 import psutil
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.spinner import Spinner
 from rich.text import Text
@@ -101,7 +102,7 @@ def _resume_tree(proc: subprocess.Popen) -> None:
         pass
 
 
-# ── CLI runner (piped I/O, spinner) ─────────────────────────────────
+# ── CLI runner (piped I/O, live streaming output) ───────────────────
 
 
 def run_cli(
@@ -111,14 +112,23 @@ def run_cli(
     timeout: int = 600,
     cwd: str | None = None,
     env: dict | None = None,
+    no_timeout: bool = False,
 ) -> tuple[str, str]:
-    """Run a CLI subprocess with a live spinner and ESC-to-pause.
+    """Run a CLI subprocess with live streaming output and ESC-to-pause.
 
-    Shows: [spinner] Claude thinking... (1m 23s) — press ESC to pause
+    Shows the last 20 lines of agent output as they arrive, plus a header
+    with elapsed time.  When no output has arrived yet, falls back to a
+    spinner.
 
     On ESC the process tree is *suspended* (frozen, not killed) and the
     user is prompted to **resume** or **kill**.  Only "kill" raises
     ``CancelledByUser``; "resume" continues seamlessly.
+
+    Args:
+        no_timeout: When True, the timeout dialog is never shown.
+                    ESC-to-pause still works.  Use for long-running tasks
+                    like Claude implementation where there is no expected
+                    upper bound.
 
     Returns (stdout, stderr).
     Raises CancelledByUser  if the user chooses to kill.
@@ -126,14 +136,18 @@ def run_cli(
     Raises TimeoutError  if the user chooses "kill" on timeout.
     """
     cancelled = threading.Event()
-    stdout_result = ""
-    stderr_result = ""
-    communicate_done = threading.Event()
+    process_done = threading.Event()
     original_timeout = timeout
 
-    def _watch_esc():
+    # Rolling window of output lines for the live display
+    output_lines: collections.deque[str] = collections.deque(maxlen=20)
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    results: dict[str, str] = {"stdout": "", "stderr": ""}
+
+    def _watch_esc() -> None:
         """Monitor for ESC key press in a background thread."""
-        while not cancelled.is_set():
+        while not process_done.is_set():
             try:
                 if msvcrt.kbhit():
                     key = msvcrt.getch()
@@ -144,7 +158,6 @@ def run_cli(
                 pass
             time.sleep(0.1)
 
-    # Start ESC watcher
     esc_thread = threading.Thread(target=_watch_esc, daemon=True)
     esc_thread.start()
 
@@ -157,24 +170,58 @@ def run_cli(
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
+        errors="replace",
         shell=True,
         cwd=cwd,
         env=env,
     )
 
-    # Use communicate() in a thread to avoid deadlocks from full pipe buffers
-    def _communicate():
-        nonlocal stdout_result, stderr_result
+    # ── Background I/O threads ──────────────────────────────────────
+
+    def _write_stdin() -> None:
         try:
-            stdout_result, stderr_result = proc.communicate(
-                input=input_text
-            )
+            if input_text:
+                proc.stdin.write(input_text)
+                proc.stdin.flush()
         except Exception:
             pass
-        communicate_done.set()
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
 
-    comm_thread = threading.Thread(target=_communicate, daemon=True)
-    comm_thread.start()
+    def _read_stdout() -> None:
+        try:
+            for line in proc.stdout:
+                stripped = line.rstrip("\r\n")
+                stdout_chunks.append(line)
+                if stripped:
+                    output_lines.append(stripped)
+        except Exception:
+            pass
+
+    def _read_stderr() -> None:
+        try:
+            stderr_chunks.append(proc.stderr.read())
+        except Exception:
+            pass
+
+    def _wait_all() -> None:
+        stdout_t.join()
+        stderr_t.join()
+        proc.wait()
+        results["stdout"] = "".join(stdout_chunks)
+        results["stderr"] = "".join(stderr_chunks)
+        process_done.set()
+
+    threading.Thread(target=_write_stdin, daemon=True).start()
+    stdout_t = threading.Thread(target=_read_stdout, daemon=True)
+    stderr_t = threading.Thread(target=_read_stderr, daemon=True)
+    stdout_t.start()
+    stderr_t.start()
+    threading.Thread(target=_wait_all, daemon=True).start()
+
+    # ── Colour scheme ───────────────────────────────────────────────
 
     style = {
         "Claude": "cyan",
@@ -182,10 +229,13 @@ def run_cli(
         "Qwen": "magenta",
     }.get(agent_name.split(" ")[0], "white")
 
+    # ── Live display loop ───────────────────────────────────────────
+
     try:
-        with Live(console=console, refresh_per_second=4, transient=True) as live:
-            while not communicate_done.is_set():
-                # ── ESC pressed: suspend and prompt ──
+        with Live(console=console, refresh_per_second=8, transient=True) as live:
+            while not process_done.is_set():
+
+                # ── ESC pressed: suspend and prompt ──────────────
                 if cancelled.is_set():
                     _suspend_tree(proc)
                     live.stop()
@@ -199,25 +249,19 @@ def run_cli(
 
                     choice = click.prompt(
                         click.style("What now?", fg="yellow", bold=True),
-                        type=click.Choice(
-                            ["resume", "kill"],
-                            case_sensitive=False,
-                        ),
+                        type=click.Choice(["resume", "kill"], case_sensitive=False),
                         default="resume",
                     )
 
                     if choice == "resume":
                         console.print(f"[dim]Resuming {agent_name} ...[/]")
                         _resume_tree(proc)
-                        # Reset for another ESC press
                         cancelled.clear()
-                        esc_thread = threading.Thread(
-                            target=_watch_esc, daemon=True
-                        )
+                        esc_thread = threading.Thread(target=_watch_esc, daemon=True)
                         esc_thread.start()
                         live.start()
                         continue
-                    else:  # kill
+                    else:
                         _kill_tree(proc)
                         raise CancelledByUser(
                             f"{agent_name} operation killed by user (ESC)"
@@ -226,18 +270,8 @@ def run_cli(
                 elapsed = time.time() - start
                 time_str = format_duration(elapsed)
 
-                spinner_text = Text.assemble(
-                    (f" {agent_name}", f"bold {style}"),
-                    " working... ",
-                    (f"({time_str})", "dim"),
-                    " — press ",
-                    ("ESC", "bold yellow"),
-                    " to pause",
-                )
-                live.update(Spinner("dots", text=spinner_text))
-
-                # Check timeout — prompt user instead of crashing
-                if elapsed > timeout:
+                # ── Timeout dialog (skipped when no_timeout=True) ─
+                if not no_timeout and elapsed > timeout:
                     live.stop()
                     timeout_str = format_duration(timeout)
                     console.print()
@@ -248,40 +282,55 @@ def run_cli(
                     choice = click.prompt(
                         click.style("What now?", fg="yellow", bold=True),
                         type=click.Choice(
-                            ["continue", "skip", "kill"],
-                            case_sensitive=False,
+                            ["continue", "skip", "kill"], case_sensitive=False
                         ),
                         default="continue",
                     )
                     if choice == "continue":
                         timeout += original_timeout
                         console.print(
-                            f"[dim]Extended timeout — resuming "
-                            f"{agent_name} ...[/]"
+                            f"[dim]Extended timeout — resuming {agent_name} ...[/]"
                         )
                         live.start()
                         continue
                     elif choice == "skip":
                         _kill_tree(proc)
                         raise TimeoutSkipToReview(
-                            f"{agent_name} timed out — user chose to "
-                            f"skip to review"
+                            f"{agent_name} timed out — user chose to skip to review"
                         )
-                    else:  # kill
+                    else:
                         _kill_tree(proc)
                         raise TimeoutError(
                             f"{agent_name} timed out after {timeout_str}"
                         )
 
-                communicate_done.wait(timeout=0.25)
+                # ── Build live display ────────────────────────────
+                header_text = Text.assemble(
+                    (f" {agent_name}", f"bold {style}"),
+                    " working... ",
+                    (f"({time_str})", "dim"),
+                    " — press ",
+                    ("ESC", "bold yellow"),
+                    " to pause",
+                )
+                header = Spinner("dots", text=header_text)
+
+                lines = list(output_lines)
+                if lines:
+                    output_text = Text("\n".join(lines), style="dim", overflow="fold")
+                    live.update(Group(header, output_text))
+                else:
+                    live.update(header)
+
+                process_done.wait(timeout=0.125)
 
     finally:
-        cancelled.set()  # Stop the ESC watcher
+        process_done.set()  # Stop ESC watcher
 
     elapsed = time.time() - start
     console.print(f"  [dim]{agent_name} finished in {format_duration(elapsed)}[/]")
 
-    return stdout_result, stderr_result
+    return results["stdout"], results["stderr"]
 
 
 # ── Interactive runner (inherited stdio, no capture) ────────────────
@@ -318,9 +367,7 @@ def run_interactive(
 
     while True:
         try:
-            # Poll with a short wait so we can check timeout
             exit_code = proc.wait(timeout=1)
-            # Process finished
             elapsed = time.time() - start
             console.print(f"  [dim]{agent_name} finished in {format_duration(elapsed)}[/]")
             return exit_code
@@ -338,8 +385,7 @@ def run_interactive(
             choice = click.prompt(
                 click.style("What now?", fg="yellow", bold=True),
                 type=click.Choice(
-                    ["continue", "skip", "kill"],
-                    case_sensitive=False,
+                    ["continue", "skip", "kill"], case_sensitive=False
                 ),
                 default="continue",
             )
@@ -354,7 +400,7 @@ def run_interactive(
                 raise TimeoutSkipToReview(
                     f"{agent_name} timed out — user chose to skip to review"
                 )
-            else:  # kill
+            else:
                 _kill_tree(proc)
                 raise TimeoutError(
                     f"{agent_name} timed out after {timeout_str}"

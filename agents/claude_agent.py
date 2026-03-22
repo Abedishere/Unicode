@@ -59,6 +59,7 @@ class ClaudeAgent(BaseAgent):
             timeout=self.timeout,
             cwd=self.working_dir,
             env=_CLAUDE_ENV,
+            no_timeout=True,
         )
         return self.check_cli_output(stdout, stderr, agent_name)
 
