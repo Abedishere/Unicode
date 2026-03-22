@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from agents.base import BaseAgent
-from utils.logger import format_transcript, log_agent, log_info, log_phase
+from utils.logger import format_transcript, log_agent, log_error, log_info, log_phase
 from utils.plan_parser import is_structured, parse_plan
 
 _PLAN_FORMAT = (
@@ -117,9 +117,9 @@ def consolidate_plan(
             log_agent("Codex (retry)", retry_plan)
             plan = retry_plan
         else:
-            log_info(
-                "Warning: re-prompt did not produce a structured plan. "
-                "Falling through to monolithic implementation."
+            log_error(
+                "WARNING: Structured plan failed after retry — falling back to monolithic. "
+                "File-by-file implementation will be skipped."
             )
             if retry_plan.strip():
                 log_agent("Codex (retry, unstructured)", retry_plan)

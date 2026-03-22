@@ -29,6 +29,7 @@ class ClaudeAgent(BaseAgent):
 
     def query(self, prompt: str) -> str:
         """Query Claude in admin/read-only mode. No file access."""
+        self._maybe_audit(prompt)
         cmd = ["claude", "-p", "--output-format", "text", "--model", self.model]
         stdout, stderr = run_cli(
             cmd,

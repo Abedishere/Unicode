@@ -6,6 +6,7 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 console = Console()
@@ -82,3 +83,67 @@ def log_success(message: str) -> None:
 def log_error(message: str) -> None:
     console.print(f"[bold red]{message}[/]")
     _write_log(f"[ERROR]: {message}")
+
+
+def log_memory_context(context: str) -> None:
+    """Print injected memory context in a yellow panel before agents receive it."""
+    try:
+        console.print(Panel(
+            context,
+            title="[bold yellow]Memory Context[/]",
+            border_style="yellow",
+        ))
+        _write_log(f"[MEMORY_CONTEXT]: {context[:500]}")
+    except Exception:
+        pass
+
+
+def log_phase_outcome(phase: str, data: dict) -> None:
+    """Print a blue summary panel after each phase completes. Never raises."""
+    try:
+        if phase == "research":
+            brief = (data.get("brief") or "")[:200]
+            body = brief or "(no brief)"
+        elif phase == "discussion":
+            history = data.get("discussion") or []
+            entries = [e for e in history if len(e.get("message", "")) > 20][-3:]
+            bullets = [f"• [{e['agent']}]: {e['message'][:120]}" for e in entries]
+            body = "\n".join(bullets) if bullets else "(no discussion)"
+        elif phase == "plan":
+            files = data.get("files") or []
+            if files:
+                t = Table(show_header=True, header_style="bold", box=None)
+                t.add_column("Action")
+                t.add_column("File")
+                for f in files:
+                    t.add_row(f.action, f.path)
+                console.print(Panel(
+                    t,
+                    title="[bold blue]Phase Outcome: Plan[/]",
+                    border_style="blue",
+                ))
+                _write_log(f"[OUTCOME:plan] {len(files)} file(s)")
+                return
+            else:
+                body = "(monolithic — no file list)"
+        elif phase == "review":
+            verdict = data.get("verdict", "UNKNOWN")
+            count = data.get("issue_count", 0)
+            body = f"{verdict} | Issues: {count}"
+        elif phase == "memory":
+            counts = data.get("counts") or {}
+            body = "\n".join(f"• {k}: {v}" for k, v in counts.items())
+            body = body or "(no counts)"
+        else:
+            body = str(data)
+
+        console.print(Panel(
+            body,
+            title=f"[bold blue]Phase Outcome: {phase.title()}[/]",
+            border_style="blue",
+        ))
+        _write_log(f"[OUTCOME:{phase}] {body[:200]}")
+    except Exception:
+        pass
+
+

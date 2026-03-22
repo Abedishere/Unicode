@@ -18,6 +18,7 @@ class QwenAgent(BaseAgent):
         return cmd
 
     def query(self, prompt: str) -> str:
+        self._maybe_audit(prompt)
         stdout, stderr = run_cli(
             self._base_cmd(),
             agent_name=self.name,

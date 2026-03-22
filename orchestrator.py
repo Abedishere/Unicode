@@ -29,7 +29,7 @@ from phases.review import run_review
 from utils.approval import request_approval, reset_session_approvals, set_auto_all, is_auto_all
 from utils.git_utils import commit, push, init_repo, is_git_repo
 from utils.history import append_history, agent_update_md, init_agent_md, write_orchestrator_md
-from utils.logger import format_duration, init_transcript, log_error, log_info, log_phase, log_success
+from utils.logger import format_duration, init_transcript, log_error, log_info, log_memory_context, log_phase, log_phase_outcome, log_success
 from utils.memory import (
     extract_keywords_from_task,
     get_context_for_task, init_project_notes, load_memory,
@@ -1822,6 +1822,7 @@ def _run_task(
     phase: str = "all",
     tier: str = "standard",
     session: Session | None = None,
+    dry_run: bool = False,
 ) -> None:
     """Execute one full orchestration run for the given task.
 
@@ -1848,10 +1849,22 @@ def _run_task(
     log_info(f"Tier: {tier} | Dev model: {claude.dev_model}")
     start_time = time.time()
 
+    # Enable prompt audit logging for all agents
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for agent in [claude, codex, qwen]:
+        agent.enable_audit(work_dir, run_id)
+
+    def _set_phase(phase: str) -> None:
+        """Set current phase on session and all agents in one call."""
+        session.current_phase = phase
+        for _a in [claude, codex, qwen]:
+            _a.set_phase(phase)
+
     # Load shared memory context for this task (cached once, reused by all phases)
     memory_context = get_context_for_task(work_dir, task)
     if memory_context:
         log_info("Loaded shared memory context from previous tasks.")
+        log_memory_context(memory_context)
 
     # Generate repo skeleton map (compressed AST-like view of the codebase)
     repo_map = generate_repo_map(work_dir, cfg.get("repo_map_max_tokens", 2000))
@@ -1895,7 +1908,7 @@ def _run_task(
                 "Codex (×2) · Qwen (web) research in parallel → Haiku synthesizes",
                 "cyan",
             )
-        session.current_phase = "research"
+        _set_phase("research")
         save_session(work_dir, session)
         result, _ = request_approval(
             "research",
@@ -1914,6 +1927,7 @@ def _run_task(
                                   wall_seconds=wall)
             if enriched and enriched != task:
                 task = enriched
+            log_phase_outcome("research", {"brief": task})
         else:
             log_info("Skipping research phase.")
         session.mark_phase_done("research", {"enriched_task": task})
@@ -1924,7 +1938,7 @@ def _run_task(
     if run_discuss:
         if phase == "all":
             _print_phase_banner("Discussion", "admins", "Claude & Codex will agree on the approach", "cyan")
-        session.current_phase = "discussion"
+        _set_phase("discussion")
         save_session(work_dir, session)
         disc_rounds = cfg.get("discussion_rounds", 2)
         if not is_auto_all():
@@ -1952,6 +1966,7 @@ def _run_task(
                 discussion, agreed = disc_result
         else:
             log_info("Skipping discussion.")
+        log_phase_outcome("discussion", {"discussion": discussion})
         session.mark_phase_done("discussion", {"discussion": discussion, "agreed": agreed})
         save_session(work_dir, session)
 
@@ -1960,7 +1975,7 @@ def _run_task(
     if run_plan:
         if phase == "all":
             _print_phase_banner("Planning", "Codex", "Codex will write the agreed plan", "cyan")
-        session.current_phase = "plan"
+        _set_phase("plan")
         save_session(work_dir, session)
         result, extra = request_approval("plan",
             "Codex will write the implementation plan based on the discussion.")
@@ -1976,8 +1991,10 @@ def _run_task(
             structured_plan = parse_plan(plan)
             if is_structured(structured_plan):
                 log_info(f"Structured plan parsed: {len(structured_plan.files)} file specs")
+                log_phase_outcome("plan", {"files": structured_plan.files})
             else:
                 log_info("Plan is unstructured — will use monolithic implementation.")
+                log_phase_outcome("plan", {"files": []})
         else:
             log_info("Skipping plan phase.")
         session.mark_phase_done("plan", {"plan": plan})
@@ -1993,6 +2010,21 @@ def _run_task(
         _current_session = None
         return
 
+    # ── Dry-run: stop before implementation ──────────────────────────────────
+    if dry_run and plan:
+        if is_structured(structured_plan):
+            lines = [f"  {f.action}  {f.path}" for f in structured_plan.files]
+            body = "\n".join(lines) or "(no files parsed)"
+        else:
+            body = "(monolithic plan — no file list available)"
+        console.print(Panel(
+            body,
+            title="[bold yellow]DRY RUN: Would implement these files[/]",
+            border_style="yellow",
+        ))
+        log_info("Dry-run mode — stopping before implementation.")
+        return
+
     # ── Phase 3: Implementation (Claude as developer, with Qwen available) ──
     run_impl = (
         phase in ("all", "implement")
@@ -2005,7 +2037,7 @@ def _run_task(
             "magenta",
         )
     if run_impl:
-        session.current_phase = "implement"
+        _set_phase("implement")
         save_session(work_dir, session)
         result, extra = request_approval("implement",
             f"Claude (dev:{claude.dev_model}) will now implement the plan with full file access.")
@@ -2046,7 +2078,7 @@ def _run_task(
 
     # ── Phase 4: Code Review (Codex reviews with Claude validation) ──
     if not session.phase_done("review"):
-        session.current_phase = "review"
+        _set_phase("review")
         save_session(work_dir, session)
         if phase == "all":
             _print_phase_banner("Code Review", "reviewer",
@@ -2061,6 +2093,10 @@ def _run_task(
             approved, review_text = rev
         else:
             approved, review_text = bool(rev), ""
+        log_phase_outcome("review", {
+            "verdict": "APPROVED" if approved else "CHANGES_REQUESTED",
+            "issue_count": 0,
+        })
         session.mark_phase_done("review", approved)
         save_session(work_dir, session)
     else:
@@ -2068,7 +2104,7 @@ def _run_task(
         log_info("Restored review result from saved session.")
 
     # ── Phase 5: Finalization ──
-    session.current_phase = "finalize"
+    _set_phase("finalize")
     save_session(work_dir, session)
     log_phase("Phase 5: Finalization")
     outcome = "APPROVED" if approved else "NOT APPROVED"
@@ -2140,6 +2176,15 @@ def _run_task(
     log_info("Qwen is synthesizing memory entries ...")
     _synthesize_memory(qwen, codex, task, plan, review_text, outcome, work_dir)
 
+    # ── Verify memory was written ──
+    _mem_after = load_memory(work_dir)
+    _counts = {k: len(_mem_after.get(k, [])) for k in
+               ["architecture_decisions", "past_mistakes", "task_index"]}
+    if sum(_counts.values()) == 0:
+        log_error("WARNING: Memory synthesis wrote 0 entries — memory.yaml may be empty.")
+    else:
+        log_phase_outcome("memory", {"counts": _counts})
+
     # ── Mark session complete ──
     session.mark_phase_done("finalize", outcome)
     session.status = "completed"
@@ -2175,6 +2220,8 @@ def _run_task(
     help="Override developer model (e.g. sonnet, opus).")
 @click.option("--resume", "resume_id", default=None,
     help="Resume a saved session by ID.")
+@click.option("--dry-run", "dry_run", is_flag=True, default=False,
+    help="Run planning phases only; show files that would be implemented without writing.")
 def main(
     task: str | None,
     config_path: str,
@@ -2187,6 +2234,7 @@ def main(
     auto_mode: bool,
     dev_model: str | None,
     resume_id: str | None,
+    dry_run: bool,
 ):
     """Orchestrate Claude Code and Codex to collaboratively complete TASK."""
     # Install double Ctrl+C handler
@@ -2383,7 +2431,7 @@ def main(
             )
 
             _run_task(current_task, cfg, work_dir, claude, codex, qwen, phase,
-                      tier=selected_tier, session=current_session)
+                      tier=selected_tier, session=current_session, dry_run=dry_run)
 
             # Reset auto-all after each task (unless set via CLI)
             if not auto_mode:

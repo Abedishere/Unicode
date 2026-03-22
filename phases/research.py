@@ -12,9 +12,12 @@ Workflow:
 from __future__ import annotations
 
 import concurrent.futures
+import threading
 
 from rich.console import Console
+from rich.live import Live
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 from agents.base import BaseAgent
@@ -169,15 +172,73 @@ def run_research(
     qwen_prompt    = _QWEN_PROMPT.format(task=task)
 
     # ── 1. Parallel research with hard wall-clock deadline ────────────────────
+    status = {
+        "codex_a": {"state": "Pending", "snippet": ""},
+        "codex_b": {"state": "Pending", "snippet": ""},
+        "qwen":    {"state": "Pending", "snippet": ""},
+    }
+    _lock = threading.Lock()
+
+    def _make_research_table(st: dict) -> Table:
+        t = Table(show_header=True, header_style="bold", box=None, expand=True)
+        t.add_column("Agent", style="bold", no_wrap=True)
+        t.add_column("Status", no_wrap=True, width=10)
+        t.add_column("Snippet")
+        _colors = {
+            "Pending": "dim", "Running": "yellow",
+            "Done": "green", "Timeout": "red", "Error": "red",
+        }
+        for key, label in [
+            ("codex_a", "Codex (products & libraries)"),
+            ("codex_b", "Codex (technical patterns)"),
+            ("qwen",    "Qwen  (architecture + web)"),
+        ]:
+            s = st[key]
+            c = _colors.get(s["state"], "white")
+            t.add_row(label, f"[{c}]{s['state']}[/]", s["snippet"])
+        return t
+
+    def _worker(agent: BaseAgent, prompt: str, key: str, web_search: bool = False) -> str:
+        with _lock:
+            status[key]["state"] = "Running"
+        result = _query(agent, prompt, web_search=web_search)
+        with _lock:
+            status[key]["state"] = "Done" if result else "Error"
+            status[key]["snippet"] = (result or "")[:80]
+        return result
+
+    stop_event = threading.Event()
+
+    def _refresh(live) -> None:
+        while not stop_event.is_set():
+            with _lock:
+                t = _make_research_table(dict(status))
+            live.update(t)
+            stop_event.wait(0.5)
+
+    done: set = set()
+    pending: set = set()
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
     try:
-        f_a = pool.submit(_query, codex, codex_a_prompt)
-        f_b = pool.submit(_query, codex, codex_b_prompt)
-        f_q = pool.submit(_query, qwen,  qwen_prompt, web_search=True)
+        f_a = pool.submit(_worker, codex, codex_a_prompt, "codex_a")
+        f_b = pool.submit(_worker, codex, codex_b_prompt, "codex_b")
+        f_q = pool.submit(_worker, qwen,  qwen_prompt,    "qwen", True)
 
-        done, pending = concurrent.futures.wait(
-            [f_a, f_b, f_q], timeout=wall_seconds
-        )
+        with Live(_make_research_table(status), refresh_per_second=4, console=console) as live:
+            refresh_thread = threading.Thread(target=_refresh, args=(live,), daemon=True)
+            refresh_thread.start()
+            try:
+                done, pending = concurrent.futures.wait([f_a, f_b, f_q], timeout=wall_seconds)
+                for key, fut in [("codex_a", f_a), ("codex_b", f_b), ("qwen", f_q)]:
+                    if fut in pending:
+                        with _lock:
+                            status[key]["state"] = "Timeout"
+            finally:
+                stop_event.set()
+                refresh_thread.join(timeout=1.0)
+            with _lock:
+                live.update(_make_research_table(dict(status)))
+
         if pending:
             log_info(
                 f"{len(pending)} research agent(s) hit the {wall_seconds}s wall "
@@ -200,6 +261,7 @@ def run_research(
     finally:
         pool.shutdown(wait=False)
 
+    # All per-agent result logging happens after the Live block exits
     log_agent("Codex (products & libraries)", codex_a or "(no findings)")
     log_agent("Codex (technical patterns)",   codex_b or "(no findings)")
     log_agent("Qwen  (architecture + web)",   qwen_r  or "(no findings)")

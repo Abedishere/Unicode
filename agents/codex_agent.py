@@ -100,6 +100,7 @@ class CodexAgent(BaseAgent):
 
     def query(self, prompt: str) -> str:
         """Query Codex for planning / commit-message / general tasks."""
+        self._maybe_audit(prompt)
         return self._run_codex(prompt, sandbox=True)
 
     def review_query(self, prompt: str) -> str:
