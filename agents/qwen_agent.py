@@ -25,6 +25,7 @@ class QwenAgent(BaseAgent):
             input_text=prompt,
             timeout=self.timeout,
             cwd=self.working_dir,
+            quiet=self._quiet,
         )
         return self.check_cli_output(stdout, stderr, self.name)
 
@@ -45,5 +46,6 @@ class QwenAgent(BaseAgent):
             input_text=prompt,
             timeout=self.timeout,
             cwd=self.working_dir,
+            quiet=self._quiet,
         )
         return self.check_cli_output(stdout, stderr, self.name)

@@ -144,7 +144,7 @@ def run_research(
     codex: BaseAgent,
     qwen: BaseAgent,
     synthesizer: BaseAgent,
-    wall_seconds: int = 90,
+    wall_seconds: int = 180,
 ) -> str:
     """Run parallel research and return the task prompt enriched with findings.
 
@@ -221,6 +221,11 @@ def run_research(
             live.update(t)
             live.refresh()
 
+    # Suppress run_cli's own Live display while our research table is active.
+    # Workers share the same agent objects; both codex workers want quiet=True.
+    codex._quiet = True
+    qwen._quiet = True
+
     done: set = set()
     pending: set = set()
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
@@ -268,6 +273,8 @@ def run_research(
         qwen_r  = _get(f_q)
     finally:
         pool.shutdown(wait=False)
+        codex._quiet = False
+        qwen._quiet = False
 
     # All per-agent result logging happens after the Live block exits
     log_agent("Codex (products & libraries)", codex_a or "(no findings)")

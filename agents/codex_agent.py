@@ -92,6 +92,7 @@ class CodexAgent(BaseAgent):
                 timeout=self.timeout,
                 cwd=self.working_dir,
                 env=_GIT_ENV,
+                quiet=self._quiet,
             )
             return _read_output(output_path, stdout, stderr)
         finally:

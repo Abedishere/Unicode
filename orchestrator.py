@@ -1922,7 +1922,7 @@ def _run_task(
                 timeout=cfg.get("timeout_seconds", 120),
                 working_dir=work_dir,
             )
-            wall = cfg.get("research_wall_seconds", 90)
+            wall = cfg.get("research_wall_seconds", 180)
             enriched = _run_phase("Research", run_research, task, codex, qwen, synthesizer,
                                   wall_seconds=wall)
             if enriched and enriched != task:

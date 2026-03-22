@@ -113,6 +113,7 @@ def run_cli(
     cwd: str | None = None,
     env: dict | None = None,
     no_timeout: bool = False,
+    quiet: bool = False,
 ) -> tuple[str, str]:
     """Run a CLI subprocess with live streaming output and ESC-to-pause.
 
@@ -129,6 +130,10 @@ def run_cli(
                     ESC-to-pause still works.  Use for long-running tasks
                     like Claude implementation where there is no expected
                     upper bound.
+        quiet: When True, skip the Live spinner display and ESC watcher
+               entirely.  Use when the caller already has its own Live
+               context (e.g. the research phase table) to prevent nested
+               Live displays from corrupting the terminal.
 
     Returns (stdout, stderr).
     Raises CancelledByUser  if the user chooses to kill.
@@ -157,9 +162,6 @@ def run_cli(
             except Exception:
                 pass
             time.sleep(0.1)
-
-    esc_thread = threading.Thread(target=_watch_esc, daemon=True)
-    esc_thread.start()
 
     start = time.time()
 
@@ -221,6 +223,14 @@ def run_cli(
     stderr_t.start()
     threading.Thread(target=_wait_all, daemon=True).start()
 
+    # ── Quiet mode: no Live display, no ESC watcher ─────────────────
+
+    if quiet:
+        process_done.wait()
+        elapsed = time.time() - start
+        console.print(f"  [dim]{agent_name} finished in {format_duration(elapsed)}[/]")
+        return results["stdout"], results["stderr"]
+
     # ── Colour scheme ───────────────────────────────────────────────
 
     style = {
@@ -230,6 +240,9 @@ def run_cli(
     }.get(agent_name.split(" ")[0], "white")
 
     # ── Live display loop ───────────────────────────────────────────
+
+    esc_thread = threading.Thread(target=_watch_esc, daemon=True)
+    esc_thread.start()
 
     try:
         with Live(console=console, refresh_per_second=8, transient=True) as live:

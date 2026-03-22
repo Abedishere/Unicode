@@ -15,6 +15,7 @@ class BaseAgent(ABC):
         self._run_id: str | None = None
         self._prompt_counter: int = 0
         self._current_phase: str = "unknown"
+        self._quiet: bool = False  # suppress run_cli Live display (e.g. during research)
 
     def enable_audit(self, work_dir: str, run_id: str) -> None:
         """Enable prompt audit logging to .orchestrator/prompts/."""
