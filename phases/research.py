@@ -198,23 +198,28 @@ def run_research(
             t.add_row(label, f"[{c}]{s['state']}[/]", s["snippet"])
         return t
 
+    update_event = threading.Event()
+    stop_event = threading.Event()
+
     def _worker(agent: BaseAgent, prompt: str, key: str, web_search: bool = False) -> str:
         with _lock:
             status[key]["state"] = "Running"
+        update_event.set()
         result = _query(agent, prompt, web_search=web_search)
         with _lock:
             status[key]["state"] = "Done" if result else "Error"
             status[key]["snippet"] = (result or "")[:80]
+        update_event.set()
         return result
-
-    stop_event = threading.Event()
 
     def _refresh(live) -> None:
         while not stop_event.is_set():
+            update_event.wait(timeout=wall_seconds + 5)
+            update_event.clear()
             with _lock:
                 t = _make_research_table(dict(status))
             live.update(t)
-            stop_event.wait(0.5)
+            live.refresh()
 
     done: set = set()
     pending: set = set()
@@ -224,7 +229,7 @@ def run_research(
         f_b = pool.submit(_worker, codex, codex_b_prompt, "codex_b")
         f_q = pool.submit(_worker, qwen,  qwen_prompt,    "qwen", True)
 
-        with Live(_make_research_table(status), refresh_per_second=4, console=console) as live:
+        with Live(_make_research_table(status), auto_refresh=False, console=console) as live:
             refresh_thread = threading.Thread(target=_refresh, args=(live,), daemon=True)
             refresh_thread.start()
             try:
@@ -233,11 +238,14 @@ def run_research(
                     if fut in pending:
                         with _lock:
                             status[key]["state"] = "Timeout"
+                        update_event.set()
             finally:
                 stop_event.set()
+                update_event.set()
                 refresh_thread.join(timeout=1.0)
             with _lock:
                 live.update(_make_research_table(dict(status)))
+            live.refresh()
 
         if pending:
             log_info(
