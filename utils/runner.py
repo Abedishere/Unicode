@@ -240,102 +240,109 @@ def run_cli(
     }.get(agent_name.split(" ")[0], "white")
 
     # ── Live display loop ───────────────────────────────────────────
-
-    esc_thread = threading.Thread(target=_watch_esc, daemon=True)
-    esc_thread.start()
+    # Each ESC/timeout dialog breaks OUT of the current with-Live block so
+    # transient cleanup fires cleanly, then an outer loop starts a fresh
+    # Live context.  This prevents the stop()/start() ghost artifact.
 
     try:
-        with Live(console=console, refresh_per_second=8, transient=True) as live:
-            while not process_done.is_set():
+        while not process_done.is_set():
+            _break_reason: str | None = None  # "esc" | "timeout" | None
 
-                # ── ESC pressed: suspend and prompt ──────────────
-                if cancelled.is_set():
-                    _suspend_tree(proc)
-                    live.stop()
+            esc_thread = threading.Thread(target=_watch_esc, daemon=True)
+            esc_thread.start()
 
-                    console.print()
-                    console.print(
-                        f"[bold yellow]⏸  Paused:[/] {agent_name}  "
-                        f"[dim](subprocess frozen — not consuming tokens)[/]"
+            with Live(console=console, refresh_per_second=8, transient=True) as live:
+                while not process_done.is_set():
+
+                    # ── ESC pressed ───────────────────────────────
+                    if cancelled.is_set():
+                        _suspend_tree(proc)
+                        _break_reason = "esc"
+                        break  # exit Live cleanly → transient clears once
+
+                    elapsed = time.time() - start
+                    time_str = format_duration(elapsed)
+
+                    # ── Timeout (skipped when no_timeout=True) ────
+                    if not no_timeout and elapsed > timeout:
+                        _break_reason = "timeout"
+                        break  # exit Live cleanly → transient clears once
+
+                    # ── Build live display ────────────────────────
+                    header_text = Text.assemble(
+                        (f" {agent_name}", f"bold {style}"),
+                        " working... ",
+                        (f"({time_str})", "dim"),
+                        " — press ",
+                        ("ESC", "bold yellow"),
+                        " to pause",
                     )
-                    console.print()
+                    header = Spinner("dots", text=header_text)
 
-                    choice = click.prompt(
-                        click.style("What now?", fg="yellow", bold=True),
-                        type=click.Choice(["resume", "kill"], case_sensitive=False),
-                        default="resume",
-                    )
-
-                    if choice == "resume":
-                        console.print(f"[dim]Resuming {agent_name} ...[/]")
-                        _resume_tree(proc)
-                        cancelled.clear()
-                        esc_thread = threading.Thread(target=_watch_esc, daemon=True)
-                        esc_thread.start()
-                        live.start()
-                        continue
+                    lines = list(output_lines)
+                    if lines:
+                        output_text = Text("\n".join(lines), style="dim", overflow="fold")
+                        live.update(Group(header, output_text))
                     else:
-                        _kill_tree(proc)
-                        raise CancelledByUser(
-                            f"{agent_name} operation killed by user (ESC)"
-                        )
+                        live.update(header)
 
-                elapsed = time.time() - start
-                time_str = format_duration(elapsed)
+                    process_done.wait(timeout=0.125)
 
-                # ── Timeout dialog (skipped when no_timeout=True) ─
-                if not no_timeout and elapsed > timeout:
-                    live.stop()
-                    timeout_str = format_duration(timeout)
-                    console.print()
-                    console.print(
-                        f"[bold yellow]⏱  {agent_name} timed out "
-                        f"after {timeout_str}.[/]"
-                    )
-                    choice = click.prompt(
-                        click.style("What now?", fg="yellow", bold=True),
-                        type=click.Choice(
-                            ["continue", "skip", "kill"], case_sensitive=False
-                        ),
-                        default="continue",
-                    )
-                    if choice == "continue":
-                        timeout += original_timeout
-                        console.print(
-                            f"[dim]Extended timeout — resuming {agent_name} ...[/]"
-                        )
-                        live.start()
-                        continue
-                    elif choice == "skip":
-                        _kill_tree(proc)
-                        raise TimeoutSkipToReview(
-                            f"{agent_name} timed out — user chose to skip to review"
-                        )
-                    else:
-                        _kill_tree(proc)
-                        raise TimeoutError(
-                            f"{agent_name} timed out after {timeout_str}"
-                        )
+            # Live exited cleanly — handle dialog outside Live context
 
-                # ── Build live display ────────────────────────────
-                header_text = Text.assemble(
-                    (f" {agent_name}", f"bold {style}"),
-                    " working... ",
-                    (f"({time_str})", "dim"),
-                    " — press ",
-                    ("ESC", "bold yellow"),
-                    " to pause",
+            if _break_reason == "esc":
+                console.print()
+                console.print(
+                    f"[bold yellow]⏸  Paused:[/] {agent_name}  "
+                    f"[dim](subprocess frozen — not consuming tokens)[/]"
                 )
-                header = Spinner("dots", text=header_text)
-
-                lines = list(output_lines)
-                if lines:
-                    output_text = Text("\n".join(lines), style="dim", overflow="fold")
-                    live.update(Group(header, output_text))
+                console.print()
+                choice = click.prompt(
+                    click.style("What now?", fg="yellow", bold=True),
+                    type=click.Choice(["resume", "kill"], case_sensitive=False),
+                    default="resume",
+                )
+                if choice == "resume":
+                    console.print(f"[dim]Resuming {agent_name} ...[/]")
+                    _resume_tree(proc)
+                    cancelled.clear()
+                    # outer loop creates a fresh Live
                 else:
-                    live.update(header)
+                    _kill_tree(proc)
+                    raise CancelledByUser(
+                        f"{agent_name} operation killed by user (ESC)"
+                    )
 
-                process_done.wait(timeout=0.125)
+            elif _break_reason == "timeout":
+                timeout_str = format_duration(timeout)
+                console.print()
+                console.print(
+                    f"[bold yellow]⏱  {agent_name} timed out "
+                    f"after {timeout_str}.[/]"
+                )
+                choice = click.prompt(
+                    click.style("What now?", fg="yellow", bold=True),
+                    type=click.Choice(
+                        ["continue", "skip", "kill"], case_sensitive=False
+                    ),
+                    default="continue",
+                )
+                if choice == "continue":
+                    timeout += original_timeout
+                    console.print(
+                        f"[dim]Extended timeout — resuming {agent_name} ...[/]"
+                    )
+                    # outer loop creates a fresh Live
+                elif choice == "skip":
+                    _kill_tree(proc)
+                    raise TimeoutSkipToReview(
+                        f"{agent_name} timed out — user chose to skip to review"
+                    )
+                else:
+                    _kill_tree(proc)
+                    raise TimeoutError(
+                        f"{agent_name} timed out after {timeout_str}"
+                    )
 
     finally:
         process_done.set()  # Stop ESC watcher
