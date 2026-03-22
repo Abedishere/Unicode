@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import json
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agents.claude_agent import ClaudeAgent
 from utils.logger import log_info, log_phase, log_success
+from utils.memory import get_context_for_task, load_memory, log_bug, log_key_fact, parse_json_response, save_memory
 
 if TYPE_CHECKING:
+    from agents.qwen_agent import QwenAgent
     from utils.plan_parser import StructuredPlan
 
 
@@ -27,10 +32,70 @@ def _build_context_brief(discussion: list[dict[str, str]] | None) -> str:
         lines.append(f"[{agent}]: {msg[:300]}")
 
     return (
-        "CONTEXT BRIEF (from admin discussion — key decisions & rejected approaches):\n"
+        "<context>\n"
         + "\n".join(lines)
-        + "\n\n"
+        + "\n</context>\n\n"
     )
+
+
+def _synthesize_file_memory(
+    qwen: QwenAgent,
+    task: str,
+    file_path: str,
+    file_spec: str,
+    claude_output: str,
+    work_dir: str,
+) -> list[str]:
+    """Ask Qwen to extract memory entries from a single file's implementation.
+
+    Runs after each Claude subagent completes a file. Writes any discovered
+    conventions, patterns, or bugs to .orchestrator/ immediately so they are
+    available to subsequent subagents via memory_context.
+
+    Returns the list of lessons found (caller accumulates and writes them once).
+    """
+    prompt = (
+        "A Claude subagent just implemented one file. Extract memory entries.\n\n"
+        f"<task>{task[:200]}</task>\n\n"
+        f"<file_spec>\n"
+        f"FILE: {file_path}\n"
+        f"SPEC: {file_spec[:300]}\n"
+        f"</file_spec>\n\n"
+        f"<context>\n"
+        f"CLAUDE OUTPUT (what the agent reported doing):\n{claude_output[:800]}\n"
+        f"</context>\n\n"
+        "<output_format>\n"
+        "Return a JSON object (omit any key if nothing real to record):\n"
+        "{\n"
+        '  "key_facts": [{"category": "Code Conventions", "fact": "All handlers are async"}],\n'
+        '  "bugs": [{"issue": "...", "root_cause": "...", "solution": "...", "prevention": "..."}],\n'
+        '  "lessons": ["short concrete lesson"]\n'
+        "}\n"
+        "</output_format>\n\n"
+        "Only record things specific to THIS file and THIS task. No generic advice.\n"
+        "Return ONLY valid JSON, no markdown fences."
+    )
+    try:
+        raw = qwen.query(prompt)
+        data = parse_json_response(raw)
+    except Exception:
+        return []
+
+    for entry in data.get("key_facts", []):
+        if isinstance(entry, dict) and entry.get("fact"):
+            log_key_fact(work_dir, entry.get("category", "General"), entry["fact"])
+
+    for bug in data.get("bugs", []):
+        if isinstance(bug, dict) and bug.get("issue"):
+            log_bug(
+                working_dir=work_dir,
+                issue=bug["issue"],
+                root_cause=bug.get("root_cause", ""),
+                solution=bug.get("solution", ""),
+                prevention=bug.get("prevention", ""),
+            )
+
+    return [l for l in data.get("lessons", []) if isinstance(l, str) and l.strip()]
 
 
 def _implement_file_by_file(
@@ -39,6 +104,8 @@ def _implement_file_by_file(
     claude: ClaudeAgent,
     repo_map: str = "",
     memory_context: str = "",
+    qwen: QwenAgent | None = None,
+    work_dir: str = "",
 ) -> str:
     """Implement the plan one file at a time.
 
@@ -49,16 +116,18 @@ def _implement_file_by_file(
     """
     total = len(structured_plan.files)
     results = []
+    all_lessons: list[str] = []
 
     skeleton = ""
     if repo_map:
-        skeleton = f"CODEBASE SKELETON:\n{repo_map}\n\n"
+        skeleton = f"<codebase>\n{repo_map}\n</codebase>\n\n"
 
     shared_deps = ""
     if structured_plan.shared_dependencies:
         shared_deps = (
-            "SHARED DEPENDENCIES (used across files — reference these exactly):\n"
-            f"{structured_plan.shared_dependencies}\n\n"
+            "<shared_dependencies>\n"
+            f"{structured_plan.shared_dependencies}\n"
+            "</shared_dependencies>\n\n"
         )
 
     for i, file_spec in enumerate(structured_plan.files, 1):
@@ -72,24 +141,46 @@ def _implement_file_by_file(
 
         prompt = (
             f"{memory_context}"
-            f"TASK SUMMARY: {task[:500]}\n\n"
+            f"<task>{task[:500]}</task>\n\n"
             f"{skeleton}"
             f"{shared_deps}"
-            f"YOUR ASSIGNMENT — {file_spec.action} {file_spec.path}:\n"
-            f"{file_spec.spec}\n\n"
-            f"RULES:\n"
+            f"<file_spec>\n"
+            f"ACTION: {file_spec.action} {file_spec.path}\n"
+            f"{file_spec.spec}\n"
+            f"</file_spec>\n\n"
+            "<rules>\n"
             f"- Implement ONLY this file: {file_spec.path}\n"
             f"- {action_hint}\n"
             "- Use the shared dependency names exactly as listed above.\n"
-            "- Follow the spec precisely. No extras.\n\n"
-            "IMPORTANT: When creating or modifying requirements.txt or pyproject.toml, "
+            "- Follow the spec precisely. No extras.\n"
+            "- When creating or modifying requirements.txt or pyproject.toml, "
             "always pin package versions with a minimum version constraint "
-            "(e.g. `click>=8.1.0`, not just `click`)."
+            "(e.g. `click>=8.1.0`, not just `click`).\n"
+            "</rules>"
         )
 
-        result = claude.implement(prompt)
+        claude_output = claude.implement(prompt)
         results.append(f"[{file_spec.path}] done")
         log_success(f"  {file_spec.path} — done")
+
+        if qwen and work_dir:
+            lessons = _synthesize_file_memory(
+                qwen, task, file_spec.path, file_spec.spec, claude_output, work_dir,
+            )
+            all_lessons.extend(lessons)
+            # Refresh memory_context so the next file's Claude subagent benefits
+            # from conventions/bugs discovered in this file
+            if i < total:
+                memory_context = get_context_for_task(work_dir, task)
+
+    if all_lessons and work_dir:
+        memory = load_memory(work_dir)
+        for lesson in all_lessons:
+            memory["past_mistakes"].append({
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "text": lesson,
+            })
+        save_memory(work_dir, memory)
 
     return f"File-by-file implementation complete ({total} files):\n" + "\n".join(results)
 
@@ -102,6 +193,8 @@ def run_implementation(
     memory_context: str = "",
     repo_map: str = "",
     structured_plan: StructuredPlan | None = None,
+    qwen: QwenAgent | None = None,
+    work_dir: str = "",
 ) -> str:
     """Have Claude Code implement the plan non-interactively.
 
@@ -139,6 +232,7 @@ def run_implementation(
         log_info(f"Using file-by-file generation ({len(structured_plan.files)} files)")
         return _implement_file_by_file(
             task, structured_plan, claude, repo_map, memory_context,
+            qwen=qwen, work_dir=work_dir,
         )
 
     # Monolithic fallback
@@ -147,20 +241,22 @@ def run_implementation(
 
     skeleton = ""
     if repo_map:
-        skeleton = f"CODEBASE SKELETON:\n{repo_map}\n\n"
+        skeleton = f"<codebase>\n{repo_map}\n</codebase>\n\n"
 
     log_info(f"Running Claude Code (dev:{claude.dev_model}) ...")
     implement_prompt = (
         f"{memory_context}"
         f"{skeleton}"
         f"{context_brief}"
-        f"TASK:\n{task}\n\n"
-        f"IMPLEMENTATION PLAN:\n{plan}\n\n"
-        "Implement the plan exactly. Follow every step.\n\n"
-        "IMPORTANT: When creating or modifying requirements.txt or pyproject.toml, "
+        f"<task>\n{task}\n</task>\n\n"
+        f"<plan>\n{plan}\n</plan>\n\n"
+        "<rules>\n"
+        "- Implement the plan exactly. Follow every step.\n"
+        "- When creating or modifying requirements.txt or pyproject.toml, "
         "always pin package versions with a minimum version constraint "
         "(e.g. `click>=8.1.0`, not just `click`). "
-        "Look up the current stable version of each package and use it as the lower bound."
+        "Look up the current stable version of each package and use it as the lower bound.\n"
+        "</rules>"
     )
     result = claude.implement(implement_prompt)
     log_success("Claude Code finished implementation.")

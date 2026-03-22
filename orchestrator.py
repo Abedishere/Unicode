@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import signal
@@ -30,9 +31,9 @@ from utils.git_utils import commit, push, init_repo, is_git_repo
 from utils.history import append_history, agent_update_md, init_agent_md, write_orchestrator_md
 from utils.logger import format_duration, init_transcript, log_error, log_info, log_phase, log_success
 from utils.memory import (
-    add_learning, extract_keywords_from_task,
+    extract_keywords_from_task,
     get_context_for_task, init_project_notes, load_memory,
-    log_bug, log_decision, log_issue, log_key_fact, save_memory,
+    log_bug, log_decision, log_issue, log_key_fact, parse_json_response, save_memory,
 )
 from utils.init_project import run_init
 from utils.runner import CancelledByUser, TimeoutSkipToReview
@@ -1597,39 +1598,218 @@ def _load_saved_plan(work_dir: str) -> str:
     return ""
 
 
-def _extract_review_learnings(
+_COMPACT_THRESHOLD = 6_000   # chars — compact if file exceeds this
+_COMPACT_TARGET = 3_000      # chars — aim for this after compaction
+_MEMORY_LIST_MAX = 20    # max YAML list entries per category before pruning
+
+_COMPACT_INSTRUCTIONS = {
+    "bugs.md": (
+        "This is a bug log. Keep the 5 most important and recent entries. "
+        "For each, preserve: date, issue, root cause, solution, prevention. "
+        "Merge entries that describe the same underlying problem. "
+        "Drop entries that are too vague to be actionable."
+    ),
+    "decisions.md": (
+        "This is an architectural decision log (ADRs). Keep the 5 most impactful decisions. "
+        "Prefer decisions that constrain future work (technology choices, patterns, conventions). "
+        "Drop decisions about one-off tasks or minor implementation details. "
+        "Preserve the ADR-NNN numbering of kept entries."
+    ),
+    "key_facts.md": (
+        "This is a project facts file. Merge duplicate categories. "
+        "Within each category keep only the most recent and accurate fact. "
+        "Drop outdated facts superseded by newer ones. "
+        "Keep: tech stack, entry points, conventions, important URLs."
+    ),
+}
+
+
+def _compact_memory_files(qwen: QwenAgent, codex: CodexAgent, work_dir: str) -> None:
+    """Distill oversized .orchestrator/ markdown files.
+
+    Tries Qwen first. If Qwen returns something larger than the original
+    (or fails), falls back to Codex. If both fail, the file is left as-is.
+    issues.md is excluded — it is a chronological log, not a lookup store.
+    """
+    notes_dir = Path(work_dir) / ".orchestrator"
+    for filename, instructions in _COMPACT_INSTRUCTIONS.items():
+        path = notes_dir / filename
+        if not path.exists():
+            continue
+        try:
+            if path.stat().st_size <= _COMPACT_THRESHOLD:
+                continue
+            content = path.read_text(encoding="utf-8")
+            if len(content) <= _COMPACT_THRESHOLD:
+                continue
+        except OSError:
+            continue
+
+        prompt = (
+            f"<role>You are compacting a project memory file that has grown too large.</role>\n\n"
+            f"<context>\n"
+            f"FILE: {filename}\n"
+            f"CURRENT CONTENT ({len(content)} chars):\n{content}\n"
+            f"</context>\n\n"
+            f"<rules>\n"
+            f"{instructions}\n"
+            f"Rewrite the file keeping only the most important entries. "
+            f"Target under {_COMPACT_TARGET} characters. "
+            f"Keep the original markdown format and the top-level heading. "
+            f"Add a line '> Compacted {datetime.now().strftime('%Y-%m-%d')} — older entries distilled.' "
+            f"after the heading.\n"
+            f"</rules>\n\n"
+            f"Return ONLY the new file content, nothing else."
+        )
+
+        compacted = None
+        # Priority-ordered fallback: Qwen first, Codex if Qwen returns a larger result
+        for agent_name, query_fn in [("Qwen", qwen.query), ("Codex", codex.query)]:
+            try:
+                result = query_fn(prompt).strip()
+                if result and len(result) < len(content):
+                    compacted = result
+                    log_info(f"Compacted {filename} via {agent_name}: {len(content)} → {len(result)} chars")
+                    break
+                else:
+                    log_info(f"{agent_name} compaction of {filename} did not reduce size — trying fallback")
+            except Exception:
+                log_info(f"{agent_name} compaction of {filename} failed — trying fallback")
+
+        if compacted:
+            try:
+                path.write_text(compacted + "\n", encoding="utf-8")
+            except OSError:
+                pass  # Never break the pipeline over memory housekeeping
+
+
+def _synthesize_memory(
     qwen: QwenAgent,
-    review_text: str,
+    codex: CodexAgent,
     task: str,
+    plan: str,
+    review_text: str,
+    outcome: str,
     work_dir: str,
 ) -> None:
-    """Have Qwen extract lessons learned from a code review and save to memory."""
+    """Ask Qwen to extract real memory entries from the completed run and write them.
+
+    Replaces the old mechanical raw-dump approach with actual synthesis.
+    Writes to: memory.yaml, bugs.md, decisions.md, key_facts.md, issues.md.
+    """
     prompt = (
-        f"TASK: {task}\n\n"
-        f"CODE REVIEW FEEDBACK:\n{review_text[:2000]}\n\n"
-        "Extract any recurring patterns or mistakes from this review. "
-        "Return a JSON array of strings, each a short lesson (max 50 words). "
-        "If no useful lessons, return []. Example:\n"
-        '[\"Always validate user input before database queries\", '
-        '\"Use constants instead of magic numbers\"]\n'
-        "Return ONLY the JSON array, nothing else."
+        "You just completed a software task. Extract structured memory entries from the context below.\n\n"
+        f"<task>{task[:400]}</task>\n\n"
+        f"<context>\n"
+        f"PLAN SUMMARY: {plan[:600]}\n\n"
+        f"OUTCOME: {outcome}\n"
+        f"</context>\n\n"
+    )
+    if review_text:
+        prompt += f"<context>\nREVIEW FEEDBACK:\n{review_text[:600]}\n</context>\n\n"
+    prompt += (
+        "<output_format>\n"
+        "Return a JSON object with these optional keys (omit any key if nothing real to record):\n"
+        "{\n"
+        '  "key_facts": [\n'
+        '    {"category": "Tech Stack", "fact": "Uses FastAPI with async SQLAlchemy"}\n'
+        "  ],\n"
+        '  "decisions": [\n'
+        "    {\n"
+        '      "title": "Use async handlers for DB queries",\n'
+        '      "context": "App needs concurrent request handling",\n'
+        '      "decision": "All DB queries use async/await with SQLAlchemy async session",\n'
+        '      "alternatives": "Sync with thread pool",\n'
+        '      "consequences": "Better concurrency, careful session lifecycle needed"\n'
+        "    }\n"
+        "  ],\n"
+        '  "bugs": [\n'
+        "    {\n"
+        '      "issue": "Race condition in session cleanup",\n'
+        '      "root_cause": "Session not closed in finally block",\n'
+        '      "solution": "Use async context manager pattern",\n'
+        '      "prevention": "Always use context managers for DB sessions"\n'
+        "    }\n"
+        "  ],\n"
+        '  "lessons": ["Specific lesson 1", "Specific lesson 2"],\n'
+        '  "issue_notes": "One sentence summary of what was done and the result."\n'
+        "}\n"
+        "</output_format>\n\n"
+        "<rules>\n"
+        "- Only record REAL decisions made during THIS task, not generic advice.\n"
+        "- Only record bugs actually found or fixed during this task.\n"
+        "- key_facts should be specific to this project (ports, patterns, conventions found).\n"
+        "- lessons should be concrete coding lessons (max 3, max 50 words each).\n"
+        "- If nothing meaningful to record for a key, omit it entirely.\n"
+        "</rules>\n"
+        "Return ONLY valid JSON, no markdown fences, nothing else."
     )
     try:
-        result = qwen.query(prompt)
-        lessons = json.loads(result)
-        if isinstance(lessons, list):
-            for lesson in lessons[:3]:
-                if isinstance(lesson, str) and lesson.strip():
-                    add_learning(work_dir, "past_mistakes", lesson.strip())
-                    # Mirror to human-readable bug log (.orchestrator/bugs.md)
-                    log_bug(
-                        working_dir=work_dir,
-                        issue=lesson.strip(),
-                        root_cause="Extracted from code review",
-                        solution="See review feedback above",
-                    )
+        raw = qwen.query(prompt)
+        data = parse_json_response(raw)
     except Exception:
-        pass  # Non-critical — don't break the pipeline
+        data = {}
+
+    memory = load_memory(work_dir)
+
+    # ── key_facts.md ─────────────────────────────────────────────────────────
+    for entry in data.get("key_facts", []):
+        if isinstance(entry, dict) and entry.get("fact"):
+            log_key_fact(work_dir, entry.get("category", "General"), entry["fact"])
+
+    # ── decisions.md + YAML architecture_decisions ───────────────────────────
+    for dec in data.get("decisions", []):
+        if isinstance(dec, dict) and dec.get("title") and dec.get("decision"):
+            log_decision(
+                working_dir=work_dir,
+                title=dec["title"],
+                context=dec.get("context", f"Task: {task[:200]}"),
+                decision=dec["decision"],
+                alternatives=dec.get("alternatives", ""),
+                consequences=dec.get("consequences", f"Outcome: {outcome}"),
+            )
+            if isinstance(memory.get("architecture_decisions"), list):
+                memory["architecture_decisions"].append({
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "text": f"{dec['title']}: {dec['decision'][:150]}",
+                })
+
+    # ── bugs.md + YAML past_mistakes ─────────────────────────────────────────
+    for bug in data.get("bugs", []):
+        if isinstance(bug, dict) and bug.get("issue"):
+            log_bug(
+                working_dir=work_dir,
+                issue=bug["issue"],
+                root_cause=bug.get("root_cause", ""),
+                solution=bug.get("solution", ""),
+                prevention=bug.get("prevention", ""),
+            )
+    for lesson in data.get("lessons", []):
+        if isinstance(lesson, str) and lesson.strip():
+            memory["past_mistakes"].append({
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "text": lesson.strip(),
+            })
+
+    # ── issues.md ────────────────────────────────────────────────────────────
+    issue_notes = data.get("issue_notes", "")
+    log_issue(work_dir, task, outcome, notes=issue_notes)
+
+    # ── YAML task_index ───────────────────────────────────────────────────────
+    keywords = extract_keywords_from_task(task)
+    memory["task_index"].append({
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "task": task[:200],
+        "outcome": outcome,
+        "keywords": keywords,
+    })
+
+    # Prune and save YAML
+    save_memory(work_dir, memory)
+    log_info("Memory synthesized and saved to .orchestrator/")
+
+    # Compact oversized markdown files so they never grow unboundedly
+    _compact_memory_files(qwen, codex, work_dir)
 
 
 def _run_task(
@@ -1684,6 +1864,7 @@ def _run_task(
     plan = ""
     approved = False
     skip_to_review = False
+    review_text = ""
 
     # ── Restore completed phases from session ──
     if session.phase_done("discussion"):
@@ -1838,7 +2019,9 @@ def _run_task(
                     discussion=discussion,
                     memory_context=memory_context,
                     repo_map=repo_map,
-                    structured_plan=structured_plan)
+                    structured_plan=structured_plan,
+                    qwen=qwen,
+                    work_dir=work_dir)
                 if impl is not None:
                     # Qwen writes orchestrator.md (project summary)
                     _run_phase("Writing orchestrator.md",
@@ -1878,9 +2061,6 @@ def _run_task(
             approved, review_text = rev
         else:
             approved, review_text = bool(rev), ""
-        # Extract learnings from review feedback → writes to .orchestrator/bugs.md
-        if review_text:
-            _extract_review_learnings(qwen, review_text, task, work_dir)
         session.mark_phase_done("review", approved)
         save_session(work_dir, session)
     else:
@@ -1897,18 +2077,24 @@ def _run_task(
         log_success("Implementation approved!")
 
         # Codex (GPT) synthesizes and updates both agent MD files
-        _run_phase("Codex updating CLAUDE.md",
-            agent_update_md, work_dir, task, plan, discussion, codex, "CLAUDE.md")
-        _run_phase("Codex updating AGENTS.md",
-            agent_update_md, work_dir, task, plan, discussion, codex, "AGENTS.md")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            f_claude = pool.submit(_run_phase, "Codex updating CLAUDE.md",
+                agent_update_md, work_dir, task, plan, discussion, codex, "CLAUDE.md")
+            f_agents = pool.submit(_run_phase, "Codex updating AGENTS.md",
+                agent_update_md, work_dir, task, plan, discussion, codex, "AGENTS.md")
+            concurrent.futures.wait([f_claude, f_agents])
 
         # Codex writes the commit message
         commit_prompt = (
-            "Write a short git commit message for these changes. "
-            "One line, max 72 characters. No quotes. No prefix. "
-            "Just describe what was done.\n\n"
-            f"TASK: {task}\n\n"
-            f"PLAN:\n{plan[:1000]}\n"
+            "<task>\n"
+            f"Write a git commit message for these changes based on this task:\n{task}\n"
+            "</task>\n\n"
+            f"<plan>{plan[:1000]}</plan>\n\n"
+            "<rules>\n"
+            "- One line, max 72 characters\n"
+            "- No quotes, no prefix\n"
+            "- Just describe what was done\n"
+            "</rules>"
         )
         log_info("Codex is writing commit message ...")
         commit_msg = _run_phase("Commit message", codex.query, commit_prompt)
@@ -1935,8 +2121,11 @@ def _run_task(
     # Record history (Qwen summarizes, not Claude)
     duration = time.time() - start_time
     summary_prompt = (
-        f"TASK: {task}\n\nPLAN:\n{plan}\n\n"
-        "List files created/modified as a bullet list. One line each. No commentary."
+        f"<task>{task}</task>\n\n"
+        f"<plan>{plan}</plan>\n\n"
+        "<rules>\n"
+        "List files created/modified as a bullet list. One line each. No commentary.\n"
+        "</rules>"
     )
     log_info("Qwen is summarizing actions ...")
     actions_summary = _run_phase("Summary", qwen.query, summary_prompt)
@@ -1947,36 +2136,9 @@ def _run_task(
     append_history(work_dir, task, outcome, duration, actions_summary, transcript_name)
     log_info("Appended run to .orchestrator/history.md")
 
-    # ── Save to shared memory (single load/save cycle) ──
-    keywords = extract_keywords_from_task(task)
-    memory = load_memory(work_dir)
-    memory["task_index"].append({
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "task": task[:200],
-        "outcome": outcome,
-        "keywords": keywords,
-    })
-    if plan and "architecture_decisions" in memory and isinstance(memory["architecture_decisions"], list):
-        memory["architecture_decisions"].append({
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "text": f"[{outcome}] {task[:100]}: {plan[:200]}",
-        })
-    save_memory(work_dir, memory)
-    log_info("Task indexed in shared memory.")
-
-    # Mirror to human-readable work log (.orchestrator/issues.md)
-    log_issue(work_dir, task, outcome)
-
-    # Mirror to human-readable ADR (.orchestrator/decisions.md)
-    if plan:
-        # Mirror to human-readable ADR (.orchestrator/decisions.md)
-        log_decision(
-            working_dir=work_dir,
-            title=task[:60].replace("\n", " ").strip(),
-            context=f"Task: {task[:300]}",
-            decision=plan[:400],
-            consequences=f"Outcome: {outcome}",
-        )
+    # ── Synthesize and save memory (Qwen extracts real entries) ──
+    log_info("Qwen is synthesizing memory entries ...")
+    _synthesize_memory(qwen, codex, task, plan, review_text, outcome, work_dir)
 
     # ── Mark session complete ──
     session.mark_phase_done("finalize", outcome)

@@ -26,7 +26,6 @@ _CHANGES_PAT = re.compile(r"^\s*CHANGES[_ ]REQUESTED\b", re.IGNORECASE | re.MULT
 
 # Claude verdict patterns
 _CONFIRMED_PAT = re.compile(r"^\s*CONFIRMED\b", re.IGNORECASE | re.MULTILINE)
-_CLAUDE_APPROVED_PAT = re.compile(r"^\s*APPROVED\b", re.IGNORECASE | re.MULTILINE)
 
 # Fallback: heuristic "looks good" signals when Codex skips the verdict line
 _LOOKS_GOOD = re.compile(
@@ -119,6 +118,57 @@ def _extract_file_diff(full_diff: str, filenames: list[str]) -> str:
     return "\n\n".join(matched) if matched else ""
 
 
+def _handle_full_diff_request(
+    review: str,
+    full_diff: str,
+    agent_query_fn,
+    agent_label: str,
+    *,
+    text_only_preamble: bool = False,
+) -> str:
+    """If *review* contains NEED_FULL_DIFF requests, fetch the diffs and re-query.
+
+    Returns the updated review string, or the original if no request was found
+    or the follow-up fails.
+    """
+    full_diff_matches = _NEED_FULL_DIFF.findall(review)
+    if not full_diff_matches:
+        return review
+
+    requested_files = []
+    for match in full_diff_matches:
+        requested_files.extend(f.strip() for f in match.split(","))
+    log_info(f"{agent_label} requested full diff for: {', '.join(requested_files)}")
+
+    extracted = _extract_file_diff(full_diff, requested_files)
+    if not extracted:
+        return review
+
+    preamble = (
+        "=== IMPORTANT: TEXT-ONLY TASK — DO NOT RUN ANY SHELL COMMANDS ===\n"
+        "You previously reviewed a diff summary and requested full diffs.\n"
+        "=== END IMPORTANT ===\n\n"
+    ) if text_only_preamble else ""
+
+    followup = (
+        f"{preamble}"
+        "<context>\n"
+        f"Here are the full diffs you requested:\n\n"
+        f"```diff\n{extracted[:6000]}\n```\n\n"
+        f"Your original review so far:\n{review}\n"
+        "</context>\n\n"
+        "Now finalize your review with the full context. Same rules apply.\n"
+        "Your response MUST start with APPROVED or CHANGES_REQUESTED."
+    )
+    try:
+        updated = agent_query_fn(followup)
+        log_agent(agent_label, updated)
+        return updated
+    except RuntimeError:
+        log_info(f"{agent_label} follow-up failed — using initial review.")
+        return review
+
+
 # ── Review Part 1: Codex primary review ──────────────────────────────────────
 
 def _codex_primary_review(
@@ -143,19 +193,21 @@ def _codex_primary_review(
     diff_summary = diff_summary or _summarize_diff(diff)
     prompt = (
         "=== IMPORTANT: TEXT-ONLY TASK — DO NOT RUN ANY SHELL COMMANDS ===\n"
-        "You are a senior technical lead doing a code review.\n"
         "ALL information you need is in this prompt.\n"
         "DO NOT use any tools. DO NOT run git, cat, ls, or any other command.\n"
         "Respond with plain text only.\n"
         "=== END IMPORTANT ===\n\n"
-        "REVIEW RULES:\n"
+        "<role>You are a senior technical lead doing a code review.</role>\n\n"
+        "<rules>\n"
         "- Flag ONLY: actual bugs, logic errors, deviations from the plan.\n"
         "- Do NOT flag: missing tests, documentation, comments, or style.\n"
         "- If the implementation correctly follows the plan, reply APPROVED.\n"
-        f"- This is review cycle {iteration} of {max_iterations}. Be decisive.\n\n"
-        f"TASK:\n{task}\n\n"
-        f"PLAN:\n{plan[:2000]}\n\n"
-        f"DIFF SUMMARY:\n{diff_summary}\n\n"
+        f"- This is review cycle {iteration} of {max_iterations}. Be decisive.\n"
+        "</rules>\n\n"
+        f"<task>{task}</task>\n\n"
+        f"<plan>{plan[:2000]}</plan>\n\n"
+        f"<diff_summary>\n{diff_summary}\n</diff_summary>\n\n"
+        "<output_format>\n"
         "If you need to see the full diff for specific files to make a judgment,\n"
         "respond with NEED_FULL_DIFF: filename1, filename2\n"
         "Those files' full diffs will be provided in a follow-up.\n\n"
@@ -163,7 +215,8 @@ def _codex_primary_review(
         "APPROVED\n"
         "CHANGES_REQUESTED\n\n"
         "If CHANGES_REQUESTED, list each confirmed issue as a numbered bullet.\n"
-        "Reference specific lines/functions. No style or test requests."
+        "Reference specific lines/functions. No style or test requests.\n"
+        "</output_format>"
     )
 
     console.print("[bold green]▶  Codex is reviewing the diff ...[/]")
@@ -187,29 +240,10 @@ def _codex_primary_review(
         return "", True
 
     # Handle NEED_FULL_DIFF requests
-    full_diff_matches = _NEED_FULL_DIFF.findall(review)
-    if full_diff_matches:
-        requested_files = []
-        for match in full_diff_matches:
-            requested_files.extend(f.strip() for f in match.split(","))
-        log_info(f"Codex requested full diff for: {', '.join(requested_files)}")
-
-        extracted = _extract_file_diff(diff, requested_files)
-        if extracted:
-            followup = (
-                "=== IMPORTANT: TEXT-ONLY TASK — DO NOT RUN ANY SHELL COMMANDS ===\n"
-                "You previously reviewed a diff summary and requested full diffs.\n"
-                "Here are the full diffs you requested:\n\n"
-                f"```diff\n{extracted[:6000]}\n```\n\n"
-                f"Your original review so far:\n{review}\n\n"
-                "Now finalize your review with the full context. Same rules apply.\n"
-                "Your response MUST start with APPROVED or CHANGES_REQUESTED."
-            )
-            try:
-                review = codex.review_query(followup)
-                log_agent("Codex (Review Part 1 — follow-up)", review)
-            except RuntimeError:
-                log_info("Follow-up failed — using initial review.")
+    review = _handle_full_diff_request(
+        review, diff, codex.review_query, "Codex (Review Part 1 — follow-up)",
+        text_only_preamble=True,
+    )
 
     # Determine verdict
     if _APPROVED_PAT.search(review) and not _CHANGES_PAT.search(review):
@@ -241,26 +275,29 @@ def _claude_secondary_review(
     """
     diff_summary = diff_summary or _summarize_diff(diff)
     prompt = (
-        "You are a senior technical lead doing a secondary code review.\n"
+        "<role>You are a senior technical lead doing a secondary code review.\n"
         "Codex (another lead) reviewed the diff and flagged issues.\n"
-        "Your job: validate each finding against the actual diff.\n\n"
-        "VALIDATION RULES:\n"
+        "Your job: validate each finding against the actual diff.</role>\n\n"
+        "<rules>\n"
         "- VALID: actual bugs, logic errors, plan deviations visible in the diff.\n"
         "- INVALID: requests for tests, docs, comments, style, or anything not\n"
         "  visible in the diff below.\n"
         "- Reject hallucinated issues (issues Codex claims exist but the diff\n"
-        "  shows are already handled or don't exist at all).\n\n"
-        f"TASK:\n{task}\n\n"
-        f"PLAN:\n{plan[:2000]}\n\n"
-        f"DIFF SUMMARY:\n{diff_summary}\n\n"
-        f"CODEX FINDINGS:\n{codex_review}\n\n"
+        "  shows are already handled or don't exist at all).\n"
+        "</rules>\n\n"
+        f"<task>{task}</task>\n\n"
+        f"<plan>{plan[:2000]}</plan>\n\n"
+        f"<diff_summary>\n{diff_summary}\n</diff_summary>\n\n"
+        f"<review_findings>\n{codex_review}\n</review_findings>\n\n"
+        "<output_format>\n"
         "If you need the full diff for specific files to validate a finding,\n"
         "respond with NEED_FULL_DIFF: filename1, filename2\n\n"
         "Otherwise, your response MUST start with exactly one of:\n"
         "CONFIRMED — at least one issue is valid\n"
         "APPROVED  — all issues are invalid, implementation is correct\n\n"
         "If CONFIRMED, list ONLY the confirmed issues as numbered bullets.\n"
-        "One sentence each. Actionable. No new issues beyond what Codex flagged."
+        "One sentence each. Actionable. No new issues beyond what Codex flagged.\n"
+        "</output_format>"
     )
 
     log_info("Review Part 2 — Claude is validating Codex's findings ...")
@@ -272,31 +309,13 @@ def _claude_secondary_review(
         return codex_review, True  # fall back to trusting Codex's findings
 
     # Handle NEED_FULL_DIFF requests
-    full_diff_matches = _NEED_FULL_DIFF.findall(result)
-    if full_diff_matches:
-        requested_files = []
-        for match in full_diff_matches:
-            requested_files.extend(f.strip() for f in match.split(","))
-        log_info(f"Claude requested full diff for: {', '.join(requested_files)}")
+    result = _handle_full_diff_request(
+        result, diff, claude.query, "Claude (Review Part 2 — follow-up)",
+        text_only_preamble=False,
+    )
 
-        extracted = _extract_file_diff(diff, requested_files)
-        if extracted:
-            followup = (
-                "You previously reviewed a diff summary and requested full diffs.\n"
-                "Here are the full diffs you requested:\n\n"
-                f"```diff\n{extracted[:6000]}\n```\n\n"
-                f"CODEX FINDINGS:\n{codex_review}\n\n"
-                f"Your original assessment:\n{result}\n\n"
-                "Now finalize your validation with the full context.\n"
-                "Your response MUST start with CONFIRMED or APPROVED."
-            )
-            try:
-                result = claude.query(followup)
-                log_agent("Claude (Review Part 2 — follow-up)", result)
-            except RuntimeError:
-                log_info("Follow-up failed — using initial validation.")
-
-    has_issues = bool(_CONFIRMED_PAT.search(result)) and not bool(_CLAUDE_APPROVED_PAT.search(result.split("\n")[0]))
+    first_line = next((l for l in result.splitlines() if l.strip()), "")
+    has_issues = bool(_CONFIRMED_PAT.search(first_line)) and not bool(_APPROVED_PAT.search(first_line))
     return result, has_issues
 
 
@@ -420,16 +439,19 @@ def run_review(
         # ── Developer fix ─────────────────────────────────────────────────
         log_info("Confirmed issues found — sending to developer for fixes ...")
         fix_prompt = (
-            "You are the developer. Two senior technical leads reviewed your "
-            "implementation.\n\n"
+            "<role>You are the developer. Two senior technical leads reviewed your "
+            "implementation.</role>\n\n"
+            "<context>\n"
             "Codex flagged issues and Claude confirmed each one is a real bug "
-            "or logic error — not style, tests, or documentation.\n\n"
-            "CONFIRMED ISSUES (fix every one of these):\n"
-            f"{aggregated}\n\n"
-            f"TASK:\n{task}\n\n"
-            f"PLAN:\n{plan}\n\n"
-            "Fix ONLY the confirmed issues listed above.\n"
-            "Do not touch anything else. No commentary, just implement the fixes."
+            "or logic error — not style, tests, or documentation.\n"
+            "</context>\n\n"
+            f"<review_findings>\n{aggregated}\n</review_findings>\n\n"
+            f"<task>{task}</task>\n\n"
+            f"<plan>{plan}</plan>\n\n"
+            "<rules>\n"
+            "- Fix ONLY the confirmed issues listed above.\n"
+            "- Do not touch anything else. No commentary, just implement the fixes.\n"
+            "</rules>"
         )
         fix_output = claude.implement(fix_prompt)
         log_agent("Claude (developer fix)", fix_output)

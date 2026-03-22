@@ -27,35 +27,42 @@ console = Console()
 # ── Per-agent research prompts ────────────────────────────────────────────────
 
 _CODEX_A_PROMPT = """\
-You are a senior product researcher. Study the task and share what you know.
+<role>You are a senior product researcher. Study the task and share what you know.</role>
 
+<task>{task}</task>
+
+<rules>
 Look for:
 - Existing apps, SaaS tools, or open-source projects that address this problem
 - Libraries or APIs that are commonly used for this kind of feature
 - What the leading solutions do well and where their gaps are
 
-TASK: {task}
-
 Write informal notes — bullets are fine. No preamble. Just the facts.
+</rules>
 """
 
 _CODEX_B_PROMPT = """\
-You are a senior technical researcher. Study the task and share technical findings.
+<role>You are a senior technical researcher. Study the task and share technical findings.</role>
 
+<task>{task}</task>
+
+<rules>
 Look for:
 - Common implementation approaches and their trade-offs
 - Packages, SDKs, or protocols that are well-suited to this task
 - Edge cases, gotchas, or known bugs teams run into
 - Relevant specs, RFCs, or community conventions
 
-TASK: {task}
-
 Write informal technical notes — bullets are fine. No preamble. Just the facts.
+</rules>
 """
 
 _QWEN_PROMPT = """\
-You are a senior architect and code-quality researcher. You have a web search tool.
+<role>You are a senior architect and code-quality researcher. You have a web search tool.</role>
 
+<task>{task}</task>
+
+<rules>
 STRICT RULES — follow exactly:
 1. Call the search tool ONCE with a single focused query.
 2. Do NOT call fetch_content or visit any URLs.
@@ -63,17 +70,17 @@ STRICT RULES — follow exactly:
 4. Work only with the snippets returned by the search.
 
 Your ONE search query should find: architectural patterns, common mistakes, \
-and security/performance considerations for the task below.
-
-TASK: {task}
+and security/performance considerations for the task above.
 
 After the single search, write your findings as informal bullet notes. \
 No preamble, no URLs, no conclusion. Just the facts from the snippets.
+</rules>
 """
 
 _SYNTHESIS_PROMPT = """\
-You are a technical researcher aggregating notes from three independent engineers.
+<role>You are a technical researcher aggregating notes from three independent engineers.</role>
 
+<role>
 YOUR ONLY JOB is to distill their findings into a single, compact summary that \
 captures every key piece of information across all three sets of notes. \
 Preserve all important details. Do not drop anything meaningful. \
@@ -83,18 +90,11 @@ tell anyone what to do — just present what was found.
 
 The output will be injected as background context for a planning session. \
 It should read like a factual briefing, not a set of instructions.
+</role>
 
-Keep it under 400 words. Use bullets. Use only the headings that have content:
+<task>{task}</task>
 
-## Existing Solutions & Libraries
-## Technical Approaches & Trade-offs
-## Architectural Patterns
-## Known Pitfalls & Challenges
-## Conflicting Findings  ← only if engineers disagreed on something
-
-━━━ TASK ━━━
-{task}
-
+<context>
 ━━━ CODEX (products & libraries) ━━━
 {codex_a}
 
@@ -103,6 +103,17 @@ Keep it under 400 words. Use bullets. Use only the headings that have content:
 
 ━━━ QWEN (architecture, web-searched) ━━━
 {qwen}
+</context>
+
+<output_format>
+Keep it under 400 words. Use bullets. Use only the headings that have content:
+
+## Existing Solutions & Libraries
+## Technical Approaches & Trade-offs
+## Architectural Patterns
+## Known Pitfalls & Challenges
+## Conflicting Findings  ← only if engineers disagreed on something
+</output_format>
 
 Write the aggregated briefing now. Start directly with the first heading. \
 No preamble, no conclusion, no advice.

@@ -17,6 +17,7 @@ Both stores are written together.  Reads pull from both for richer context.
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,20 @@ from pathlib import Path
 import yaml
 
 from utils.logger import log_info
+
+
+def parse_json_response(raw: str) -> dict:
+    """Parse a JSON object from an LLM response, stripping markdown fences.
+
+    Returns an empty dict if the response contains no valid JSON object.
+    """
+    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
+    raw = re.sub(r"\n?```$", "", raw.strip())
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    try:
+        return json.loads(match.group()) if match else {}
+    except (json.JSONDecodeError, AttributeError):
+        return {}
 
 
 # ── YAML store ───────────────────────────────────────────────────────────────

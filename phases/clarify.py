@@ -15,16 +15,19 @@ from utils.logger import log_info, log_phase
 console = Console()
 
 INTERPRETER_SYSTEM = (
+    "<role>\n"
     "You are the Interpreter for an AI orchestrator. Your job is to have a "
     "short, focused conversation with the user to fully understand what they "
     "want built. Ask clarifying questions one or two at a time. Be concise "
     "and friendly. When you have enough information, say READY and summarize "
-    "the task as a clear brief.\n\n"
-    "Rules:\n"
+    "the task as a clear brief.\n"
+    "</role>\n\n"
+    "<rules>\n"
     "- Don't be annoying — if the task is already clear, just say READY\n"
     "- At most 3-4 exchanges, then move on\n"
     "- If the user says 'go', 'done', 'just do it', etc. → say READY immediately\n"
     "- Your READY summary should be a clean task brief the dev team can work from\n"
+    "</rules>\n"
 )
 
 
@@ -56,7 +59,7 @@ def run_interpreter(task: str, interpreter: BaseAgent) -> str:
     # First interpreter turn — analyze the task
     first_prompt = (
         f"{INTERPRETER_SYSTEM}\n"
-        f"The user's initial request:\n\"{task}\"\n\n"
+        f"<task>{task}</task>\n\n"
         "Analyze this. If it's clear enough to work on, reply with READY followed "
         "by your task brief. Otherwise, ask your first clarifying question(s)."
     )
@@ -104,8 +107,8 @@ def run_interpreter(task: str, interpreter: BaseAgent) -> str:
         )
         follow_prompt = (
             f"{INTERPRETER_SYSTEM}\n"
-            f"Original request: \"{task}\"\n\n"
-            f"Conversation so far:\n{conv_text}\n\n"
+            f"<task>{task}</task>\n\n"
+            f"<discussion>\n{conv_text}\n</discussion>\n\n"
             "Continue the conversation. If you now have enough info, "
             "reply with READY followed by your complete task brief."
         )
@@ -137,8 +140,9 @@ def run_interpreter(task: str, interpreter: BaseAgent) -> str:
         for h in history
     )
     compile_prompt = (
-        f"Original request: \"{task}\"\n\n"
-        f"Clarification conversation:\n{conv_text}\n\n"
+        f"{INTERPRETER_SYSTEM}\n"
+        f"<task>{task}</task>\n\n"
+        f"<discussion>\n{conv_text}\n</discussion>\n\n"
         "Now compile a clear, complete task brief that incorporates everything "
         "discussed. Return ONLY the brief, no preamble."
     )

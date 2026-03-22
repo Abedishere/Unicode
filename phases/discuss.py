@@ -167,15 +167,16 @@ def _build_prompt(
     repo_map: str = "",
 ) -> str:
     lines = [
-        f"You are {current_agent}, a senior technical lead (admin).",
+        f"<role>You are {current_agent}, a senior technical lead (admin).",
         f"You are collaborating with {other_agent} (another admin) on this task.",
         "A separate developer will implement whatever you two agree on.",
-        "You do NOT write code, create files, or delegate tasks. You may read the repo. You only discuss.",
-        f"\nTASK: {task}\n",
+        "You do NOT write code, create files, or delegate tasks. You may read the repo. You only discuss.</role>",
+        f"\n<task>{task}</task>\n",
     ]
     if repo_map:
-        lines.append("CODEBASE SKELETON:")
+        lines.append("<codebase>")
         lines.append(repo_map)
+        lines.append("</codebase>")
         lines.append("")
 
     lines.extend([
@@ -187,18 +188,21 @@ def _build_prompt(
     if history:
         summary, recent = _summarize_old_history(history)
         if summary:
+            lines.append("<discussion>")
             lines.append("EARLIER DISCUSSION (summary):")
             lines.append(summary)
             lines.append("")
             lines.append("RECENT DISCUSSION:")
             lines.append(format_transcript(recent))
+            lines.append("</discussion>")
         else:
-            lines.append("CONVERSATION SO FAR:")
+            lines.append("<discussion>")
             lines.append(format_transcript(history))
+            lines.append("</discussion>")
         lines.append("")
 
     lines.append(
-        "RULES:\n"
+        "<rules>\n"
         "- You are an ADMIN. You do NOT write code, create files, or delegate to anyone.\n"
         "- Discuss the approach: files to touch, architecture, key decisions.\n"
         "- Be concise. Bullet points, not essays.\n"
@@ -206,5 +210,6 @@ def _build_prompt(
         "- If you need input from the user, prefix with @User and ask directly.\n"
         "- When you are happy with the agreed approach, end your message with: AGREED\n"
         "- No philosophizing. No restating the task. Just actionable output.\n"
+        "</rules>"
     )
     return "\n".join(lines)

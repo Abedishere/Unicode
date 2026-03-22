@@ -2,6 +2,19 @@ from __future__ import annotations
 
 from agents.base import BaseAgent
 from utils.logger import format_transcript, log_agent, log_info, log_phase
+from utils.plan_parser import is_structured, parse_plan
+
+_PLAN_FORMAT = (
+    "## Shared Dependencies\n"
+    "`name`: description (used by: file1.py, file2.py)\n\n"
+    "## Files\n\n"
+    "### path/to/file.py (CREATE)\n"
+    "- Spec for this new file\n"
+    "- List every function, class, endpoint to create\n\n"
+    "### path/to/file.py (MODIFY)\n"
+    "- Spec for this existing file\n"
+    "- List every function, class, endpoint to change\n"
+)
 
 
 def consolidate_plan(
@@ -24,13 +37,14 @@ def consolidate_plan(
 
     context = ""
     if discussion:
-        context = f"\nAGREED DISCUSSION:\n{format_transcript(discussion)}\n\n"
+        context = f"\n<discussion>\n{format_transcript(discussion)}\n</discussion>\n\n"
 
     skeleton = ""
     if repo_map:
         skeleton = (
-            "CODEBASE SKELETON (existing project structure):\n"
-            f"{repo_map}\n\n"
+            "<codebase>\n"
+            f"{repo_map}\n"
+            "</codebase>\n\n"
             "Use this skeleton to understand what already exists. "
             "Reference existing files accurately.\n\n"
         )
@@ -38,25 +52,29 @@ def consolidate_plan(
     codex_prompt = (
         f"{memory_context}"
         f"{skeleton}"
-        "You are Codex, a senior technical lead (admin). "
+        "YOU MUST OUTPUT A STRUCTURED PLAN. "
+        "The file-by-file implementation system REQUIRES the exact format shown below. "
+        "A plain prose plan will BREAK THE PIPELINE — every file must have its own "
+        "### header with (CREATE) or (MODIFY). There are no exceptions.\n\n"
+        "<output_format>\n"
+        "────────────────────────\n"
+        f"{_PLAN_FORMAT}"
+        "────────────────────────\n"
+        "</output_format>\n\n"
+        "<role>You are Codex, a senior technical lead (admin). "
         "A developer will implement your plan.\n"
-        "You do NOT write code or create files. You may read the repo to inform your plan.\n\n"
-        f"TASK: {task}\n{context}"
-        "Write the implementation plan in this EXACT structure:\n\n"
-        "## Shared Dependencies\n"
-        "List every function, class, constant, or type that is used across multiple files.\n"
-        "Format: `name`: description (used by: file1.py, file2.py)\n\n"
-        "## Files\n\n"
-        "### path/to/file.py (CREATE|MODIFY)\n"
-        "- Detailed spec of what this file should contain/change\n"
-        "- List specific functions, classes, endpoints to create/modify\n"
-        "- Reference shared dependencies by name\n\n"
-        "RULES:\n"
+        "You do NOT write code or create files. You may read the repo to inform your plan.</role>\n\n"
+        f"<task>{task}</task>\n"
+        f"{context}"
+        "<rules>\n"
+        "- MANDATORY: Use the exact structured format above — no deviations\n"
         "- Every file that needs to be created or modified MUST have its own ### section\n"
         "- The action must be CREATE (new file) or MODIFY (existing file)\n"
+        "- List shared dependencies in ## Shared Dependencies before ## Files\n"
         "- Reference shared dependencies by the exact names listed above\n"
         "- Be specific: name every function, class, endpoint, model\n"
-        "- No preamble. No options. No 'we could do X or Y'. Just the plan."
+        "- No preamble. No options. No 'we could do X or Y'. Just the plan.\n"
+        "</rules>"
     )
     log_info("Codex is writing the plan ...")
     plan = codex.query(codex_prompt)
@@ -64,5 +82,46 @@ def consolidate_plan(
 
     if not plan.strip():
         log_info("Warning: Codex returned empty plan.")
+
+    # ── Structured-format enforcement: one retry ──────────────────────────
+    if not is_structured(parse_plan(plan)):
+        log_info(
+            "Warning: plan is not structured (no ### file (CREATE|MODIFY) headers). "
+            "Sending re-prompt to reformat …"
+        )
+        retry_prompt = (
+            "<rules>\n"
+            "The plan you wrote is not in the required structured format. "
+            "The file-by-file implementation system cannot process it. "
+            "Reformat the entire plan using the exact structure in <output_format>. "
+            "Every file must appear as ### path/to/file.py (CREATE) or ### path/to/file.py (MODIFY). "
+            "No plain prose. No preamble.\n"
+            "</rules>\n\n"
+            "<output_format>\n"
+            "────────────────\n"
+            f"{_PLAN_FORMAT}"
+            "────────────────\n"
+            "</output_format>\n\n"
+            "<context>\n"
+            "Here is the plan you wrote that needs reformatting:\n\n"
+            f"{plan}\n"
+            "</context>"
+        )
+        try:
+            retry_plan = codex.query(retry_prompt)
+        except Exception:
+            retry_plan = ""
+
+        if retry_plan.strip() and is_structured(parse_plan(retry_plan)):
+            log_info("Re-prompt succeeded — using structured plan.")
+            log_agent("Codex (retry)", retry_plan)
+            plan = retry_plan
+        else:
+            log_info(
+                "Warning: re-prompt did not produce a structured plan. "
+                "Falling through to monolithic implementation."
+            )
+            if retry_plan.strip():
+                log_agent("Codex (retry, unstructured)", retry_plan)
 
     return plan
