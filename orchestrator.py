@@ -26,6 +26,7 @@ from phases.implement import run_implementation
 from phases.plan import consolidate_plan
 from phases.research import run_research
 from phases.review import run_review
+from phases.skills_scout import SkillsManifest, run_skills_scout
 from utils.approval import request_approval, reset_session_approvals, set_auto_all, is_auto_all
 from utils.git_utils import commit, push, init_repo, is_git_repo
 from utils.history import append_history, agent_update_md, init_agent_md, write_orchestrator_md
@@ -1874,6 +1875,7 @@ def _run_task(
     # Track state across phases
     discussion: list[dict[str, str]] = []
     structured_plan = None
+    skills_manifest: SkillsManifest = SkillsManifest()
     plan = ""
     approved = False
     skip_to_review = False
@@ -1922,9 +1924,27 @@ def _run_task(
                 timeout=cfg.get("timeout_seconds", 120),
                 working_dir=work_dir,
             )
-            wall = cfg.get("research_wall_seconds", 180)
-            enriched = _run_phase("Research", run_research, task, codex, qwen, synthesizer,
-                                  wall_seconds=wall)
+            # Dedicated Qwen instance for skills scouting (runs in parallel with research)
+            qwen_scout = QwenAgent(
+                model=cfg["qwen_model"],
+                timeout=cfg.get("timeout_seconds", 120),
+                working_dir=work_dir,
+            )
+            qwen_scout.enable_audit(work_dir, run_id)
+
+            # Run research and skills scout in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _scout_pool:
+                _wall = cfg.get("research_wall_seconds", 90)
+                _research_future = _scout_pool.submit(
+                    _run_phase, "Research", run_research, task, codex, qwen, synthesizer,
+                    wall_seconds=_wall,
+                )
+                _scout_future = _scout_pool.submit(
+                    _run_phase, "Skills Scout", run_skills_scout, task, qwen_scout
+                )
+                enriched = _research_future.result()
+                skills_manifest = _scout_future.result() or SkillsManifest()
+
             if enriched and enriched != task:
                 task = enriched
             log_phase_outcome("research", {"brief": task})
@@ -1961,7 +1981,8 @@ def _run_task(
             disc_result = _run_phase("Discussion",
                 run_discussion, task, claude, codex, disc_rounds,
                 allow_user_questions=cfg.get("allow_user_questions", True),
-                repo_map=repo_map)
+                repo_map=repo_map,
+                skills_context=skills_manifest.planner)
             if disc_result is not None:
                 discussion, agreed = disc_result
         else:
@@ -1987,7 +2008,8 @@ def _run_task(
                 consolidate_plan, task, codex, work_dir, discussion,
                 memory_context=memory_context,
                 repo_map=repo_map,
-                claude=claude) or ""
+                claude=claude,
+                skills_context=skills_manifest.planner) or ""
             # Parse structured plan for file-by-file generation
             structured_plan = parse_plan(plan)
             if is_structured(structured_plan):
@@ -2046,6 +2068,7 @@ def _run_task(
             if extra:
                 plan = f"{plan}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
                 log_info("Updated plan with your instructions.")
+            impl = None
             try:
                 impl = _run_phase("Implementation",
                     run_implementation, task, plan, claude,
@@ -2055,14 +2078,20 @@ def _run_task(
                     structured_plan=structured_plan,
                     qwen=qwen,
                     work_dir=work_dir,
-                    max_workers=cfg.get("max_impl_workers", 5))
-                if impl is not None:
-                    # Qwen writes orchestrator.md (project summary)
-                    _run_phase("Writing orchestrator.md",
-                        write_orchestrator_md, work_dir, task, plan, discussion, qwen)
+                    max_workers=cfg.get("max_impl_workers", 5),
+                    skills_context=skills_manifest.developer)
             except TimeoutSkipToReview:
                 log_info("Skipping to review phase (user request after timeout).")
                 skip_to_review = True
+
+            # Qwen writes orchestrator.md — non-fatal, isolated from implementation
+            # so a Qwen failure here never blocks Phase 4 (Review).
+            if impl is not None:
+                try:
+                    _run_phase("Writing orchestrator.md",
+                        write_orchestrator_md, work_dir, task, plan, discussion, qwen)
+                except Exception as exc:
+                    log_info(f"Warning: orchestrator.md skipped — {exc}")
         else:
             log_info("Skipping implementation phase.")
         session.mark_phase_done("implement", True)
@@ -2088,7 +2117,8 @@ def _run_task(
         log_info("First code review is mandatory.")
         rev = _run_phase("Code Review",
             run_review, task, plan, claude, codex, work_dir,
-            cfg["max_review_iterations"])
+            cfg["max_review_iterations"],
+            skills_context=skills_manifest.reviewer)
         if rev is None:
             approved, review_text = True, ""
         elif isinstance(rev, tuple):
