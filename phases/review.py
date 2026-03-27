@@ -179,6 +179,7 @@ def _codex_primary_review(
     iteration: int,
     max_iterations: int,
     diff_summary: str = "",
+    skills_context: str = "",
 ) -> tuple[str, bool]:
     """Have Codex review the diff.
 
@@ -191,6 +192,7 @@ def _codex_primary_review(
     # Placing this instruction first — before any task content — maximises
     # the chance Codex treats this as a pure text task.
     diff_summary = diff_summary or _summarize_diff(diff)
+    skills_block = f"<skills>\n{skills_context}\n</skills>\n\n" if skills_context else ""
     prompt = (
         "=== IMPORTANT: TEXT-ONLY TASK — DO NOT RUN ANY SHELL COMMANDS ===\n"
         "ALL information you need is in this prompt.\n"
@@ -198,6 +200,7 @@ def _codex_primary_review(
         "Respond with plain text only.\n"
         "=== END IMPORTANT ===\n\n"
         "<role>You are a senior technical lead doing a code review.</role>\n\n"
+        f"{skills_block}"
         "<rules>\n"
         "- Flag ONLY: actual bugs, logic errors, deviations from the plan.\n"
         "- Do NOT flag: missing tests, documentation, comments, or style.\n"
@@ -328,6 +331,7 @@ def run_review(
     codex: CodexAgent,
     working_dir: str,
     max_iterations: int,
+    skills_context: str = "",
 ) -> tuple[bool, str]:
     """Two-phase code review loop.
 
@@ -396,6 +400,7 @@ def run_review(
         codex_review, approved = _codex_primary_review(
             codex, diff, task, plan, iteration, max_iterations,
             diff_summary=diff_summary,
+            skills_context=skills_context,
         )
 
         if codex_review:

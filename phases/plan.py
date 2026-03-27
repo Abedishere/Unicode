@@ -49,6 +49,7 @@ def consolidate_plan(
     memory_context: str = "",
     repo_map: str = "",
     claude: BaseAgent | None = None,
+    skills_context: str = "",
 ) -> str:
     """Create an implementation plan. Codex writes it based on the agreed discussion.
 
@@ -74,9 +75,17 @@ def consolidate_plan(
             "Reference existing files accurately.\n\n"
         )
 
+    skills_block = ""
+    if skills_context:
+        skills_block = (
+            f"<skills>\n{skills_context}\n</skills>\n\n"
+            "Let the skills above guide your architectural decisions and file structure.\n\n"
+        )
+
     codex_prompt = (
         f"{memory_context}"
         f"{skeleton}"
+        f"{skills_block}"
         "YOU MUST OUTPUT A STRUCTURED PLAN. "
         "The file-by-file implementation system REQUIRES the exact format shown below. "
         "A plain prose plan will BREAK THE PIPELINE — every file must have its own "
