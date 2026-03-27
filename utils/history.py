@@ -214,7 +214,11 @@ def write_orchestrator_md(
     )
 
     log_info("Qwen is writing orchestrator.md ...")
-    content = qwen.query(prompt)
+    try:
+        content = qwen.query(prompt)
+    except Exception as exc:
+        log_info(f"Warning: orchestrator.md skipped — Qwen unavailable: {exc}")
+        return
 
     orch_md = work / "orchestrator.md"
     orch_md.write_text(content, encoding="utf-8")
