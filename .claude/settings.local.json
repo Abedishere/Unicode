@@ -19,7 +19,22 @@
       "Bash(cd /c/Users/user/ai-orchestrator && npx skills add https://github.com/vercel-labs/skills --skill find-skills -y 2>&1)",
       "Bash(npx skills:*)",
       "Bash(echo no codex config:*)",
-      "Bash(git checkout:*)"
+      "Bash(git checkout:*)",
+      "Bash(codex:*)",
+      "Bash(ls:*)",
+      "Bash(npm pack:*)",
+      "Bash(node:*)",
+      "Bash(qwen:*)",
+      "Bash(pip install:*)",
+      "WebFetch(domain:pypi.org)",
+      "Bash(where duckduckgo-mcp-server:*)",
+      "Bash(where qwen:*)",
+      "Bash(uv tool:*)",
+      "Bash(duckduckgo-mcp-server:*)",
+      "Bash(for f in ad48dd7333c3dcd81 a9961a1f162fd07f9 ada2a5abee513bc96)",
+      "Bash(do echo \"=== $f ===\")",
+      "Read(//c/Users/PinkPanther/AppData/Local/Temp/claude/C--Users-PinkPanther-ai-orchestrator/tasks/**)",
+      "Bash(done)"
     ]
   }
 }
