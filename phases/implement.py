@@ -4,6 +4,7 @@ import concurrent.futures
 import json
 import re
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -171,17 +172,20 @@ def _build_file_prompt(
     shared_deps: str,
     memory_context: str,
     contracts: str = "",
+    skills_context: str = "",
 ) -> str:
     action_hint = (
         "Create this file from scratch."
         if file_spec.action == "CREATE"
         else "Modify this existing file."
     )
+    skills_block = f"<skills>\n{skills_context}\n</skills>\n\n" if skills_context else ""
     return (
         f"{memory_context}"
         f"<task>{task[:500]}</task>\n\n"
         f"{skeleton}"
         f"{contracts}"
+        f"{skills_block}"
         f"{shared_deps}"
         f"<file_spec>\n"
         f"ACTION: {file_spec.action} {file_spec.path}\n"
@@ -201,6 +205,91 @@ def _build_file_prompt(
     )
 
 
+def _snapshot_dir(work_dir: str) -> set[str]:
+    """Return all relative file paths under work_dir, excluding .orchestrator."""
+    root = Path(work_dir)
+    try:
+        return {
+            p.relative_to(root).as_posix()
+            for p in root.rglob("*")
+            if p.is_file() and ".orchestrator" not in p.parts
+        }
+    except Exception:
+        return set()
+
+
+def _wait_for_file(path: Path, retries: int = 5, delay: float = 0.4) -> bool:
+    """Poll for file existence to handle OS-level write-flush delays on Windows."""
+    for _ in range(retries):
+        if path.exists() and path.stat().st_size > 0:
+            return True
+        time.sleep(delay)  # only reached when file not yet visible
+    return False
+
+
+def _check_file_written(
+    spec_path: str,
+    expected: Path,
+    new_files: set[str],
+    output: str,
+    work_dir: str,
+) -> bool:
+    """Check whether a file landed on disk via any of three recovery layers.
+
+    Layer 1: Claude used the Write tool — poll with OS-flush tolerance (Windows).
+    Layer 2: Claude wrote a different path due to session conflict/rate limit.
+    Layer 3: Claude emitted content as text instead of using the Write tool.
+    """
+    # Layer 1: exact path with OS-flush polling
+    file_found = _wait_for_file(expected)
+
+    # Layer 2: Claude wrote a differently-named file — accept it
+    if not file_found and new_files:
+        file_found = True
+        log_info(f"  {spec_path} — written as: {sorted(new_files)}")
+
+    # Layer 3: Claude output the content as text — write it ourselves
+    if not file_found:
+        file_found = _extract_and_write_file(spec_path, output, work_dir)
+        if file_found:
+            log_info(f"  {spec_path} — recovered from Claude output text")
+
+    return file_found
+
+
+def _extract_and_write_file(file_path: str, output: str, work_dir: str) -> bool:
+    """Write a file from Claude's text output when the tool write didn't fire.
+
+    Claude sometimes outputs file content as a markdown code block instead of
+    using the Write tool (e.g. under session conflicts or rate limits).  This
+    function extracts the largest code block and writes it to the expected path.
+    """
+    if not output or not output.strip():
+        return False
+
+    target = Path(work_dir) / file_path if work_dir else Path(file_path)
+
+    # Extract all fenced code blocks and pick the largest one
+    blocks = re.findall(r"```(?:[a-zA-Z0-9_.+-]*)?\n([\s\S]*?)```", output)
+    if blocks:
+        content = max(blocks, key=len).strip()
+        if len(content) > 10:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            return target.exists() and target.stat().st_size > 0
+
+    # Last resort: use the raw output if it looks like code (not prose)
+    stripped = output.strip()
+    first_word = stripped.split()[0] if stripped.split() else ""
+    looks_like_prose = first_word in {"I", "The", "Here", "This", "Note", "Sure", "Let", "To"}
+    if stripped and not looks_like_prose and len(stripped.splitlines()) >= 3:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(stripped, encoding="utf-8")
+        return target.exists() and target.stat().st_size > 0
+
+    return False
+
+
 def _implement_file_by_file(
     task: str,
     structured_plan: StructuredPlan,
@@ -210,6 +299,7 @@ def _implement_file_by_file(
     qwen: QwenAgent | None = None,
     work_dir: str = "",
     max_workers: int = 5,
+    skills_context: str = "",
 ) -> str:
     """Implement the plan with up to *max_workers* parallel Claude agents.
 
@@ -310,11 +400,26 @@ def _implement_file_by_file(
                 status[file_spec.path] = "Running"
             update_event.set()
 
-            prompt = _build_file_prompt(task, file_spec, skeleton, shared_deps, memory_context, contracts)
+            prompt = _build_file_prompt(task, file_spec, skeleton, shared_deps, memory_context, contracts, skills_context)
             try:
+                # Snapshot directory before so we can detect files written under
+                # a different name/path than the plan specifies.
+                before = _snapshot_dir(work_dir) if work_dir else set()
+
                 out = claude.implement(prompt)
+
+                after = _snapshot_dir(work_dir) if work_dir else set()
+                new_files = after - before
+
+                expected = Path(work_dir) / file_spec.path if work_dir else Path(file_spec.path)
+                file_found = _check_file_written(file_spec.path, expected, new_files, out, work_dir)
+
                 with _lock:
-                    status[file_spec.path] = "Done"
+                    if file_found:
+                        status[file_spec.path] = "Done"
+                    else:
+                        status[file_spec.path] = "Missing"
+                        log_info(f"  Warning: {file_spec.path} not found on disk after implementation")
                     outputs[file_spec.path] = out
             except Exception:
                 with _lock:
@@ -343,6 +448,34 @@ def _implement_file_by_file(
         claude._quiet = False
         if qwen is not None:
             qwen._quiet = False
+
+    # Sequential retry for files that didn't land on disk despite a clean exit.
+    # Runs single-threaded to avoid the same session-conflict race that caused
+    # the missing files in the first place.
+    missing = [s for s in structured_plan.files if status[s.path] in ("Missing", "Error")]
+    if missing:
+        log_info(f"  Retrying {len(missing)} missing/failed file(s) sequentially ...")
+        for spec in missing:
+            current_map = _generate_repo_map(work_dir, repo_map_tokens) if work_dir else ""
+            skeleton = f"<codebase>\n{current_map}\n</codebase>\n\n" if current_map else ""
+            prompt = _build_file_prompt(task, spec, skeleton, shared_deps, memory_context, contracts, skills_context)
+            try:
+                before = _snapshot_dir(work_dir) if work_dir else set()
+                out = claude.implement(prompt)
+                after = _snapshot_dir(work_dir) if work_dir else set()
+                new_files = after - before
+
+                expected = Path(work_dir) / spec.path if work_dir else Path(spec.path)
+                file_found = _check_file_written(spec.path, expected, new_files, out, work_dir)
+
+                if file_found:
+                    status[spec.path] = "Done"
+                    outputs[spec.path] = out
+                    log_success(f"  {spec.path} — recovered")
+                else:
+                    log_info(f"  {spec.path} — still missing after retry")
+            except Exception as exc:
+                log_info(f"  {spec.path} — retry failed: {exc}")
 
     # Log results
     all_lessons: list[str] = []
@@ -386,6 +519,7 @@ def run_implementation(
     qwen: QwenAgent | None = None,
     work_dir: str = "",
     max_workers: int = 5,
+    skills_context: str = "",
 ) -> str:
     """Have Claude Code implement the plan non-interactively.
 
@@ -424,6 +558,7 @@ def run_implementation(
         return _implement_file_by_file(
             task, structured_plan, claude, repo_map, memory_context,
             qwen=qwen, work_dir=work_dir, max_workers=max_workers,
+            skills_context=skills_context,
         )
 
     # Monolithic fallback
@@ -435,10 +570,12 @@ def run_implementation(
         skeleton = f"<codebase>\n{repo_map}\n</codebase>\n\n"
 
     log_info(f"Running Claude Code (dev:{claude.dev_model}) ...")
+    skills_block = f"<skills>\n{skills_context}\n</skills>\n\n" if skills_context else ""
     implement_prompt = (
         f"{memory_context}"
         f"{skeleton}"
         f"{context_brief}"
+        f"{skills_block}"
         f"<task>\n{task}\n</task>\n\n"
         f"<plan>\n{plan}\n</plan>\n\n"
         "<rules>\n"
