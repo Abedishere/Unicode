@@ -28,6 +28,7 @@ _USER_QUESTION = re.compile(
 
 # Sentinel pattern: agents are instructed to end their message with "AGREED"
 _AGREEMENT = re.compile(r"\bAGREED\b|\bI agree\b")
+_DECLINED  = re.compile(r"\bDECLINED\b")
 
 
 def _has_user_question(text: str) -> bool:
@@ -38,6 +39,11 @@ def _has_user_question(text: str) -> bool:
 def _has_agreement(text: str) -> bool:
     """Check if an agent's reply signals consensus."""
     return bool(_AGREEMENT.search(text))
+
+
+def _has_declined(text: str) -> bool:
+    """Check if an agent explicitly rejected the proposal."""
+    return bool(_DECLINED.search(text))
 
 
 def _ask_user(agent_name: str, message: str) -> str | None:
@@ -97,6 +103,7 @@ def run_discussion(
     user_context: str | None = None,
     allow_user_questions: bool = True,
     repo_map: str = "",
+    skills_context: str = "",
 ) -> tuple[list[dict[str, str]], bool]:
     """Run a multi-round discussion between Claude and Codex.
 
@@ -121,7 +128,7 @@ def run_discussion(
         can_ask = allow_user_questions and round_num > 1
 
         # --- Codex's turn (goes first) ---
-        codex_prompt = _build_prompt(task, history, codex.name, claude.name, max_rounds, repo_map)
+        codex_prompt = _build_prompt(task, history, codex.name, claude.name, max_rounds, repo_map, skills_context)
         log_info(f"Waiting for {codex.name} ...")
         codex_reply = codex.query(codex_prompt)
         history.append({"agent": codex.name, "message": codex_reply})
@@ -134,7 +141,7 @@ def run_discussion(
                 log_agent("User", answer)
 
         # --- Claude's turn (goes second) ---
-        claude_prompt = _build_prompt(task, history, claude.name, codex.name, max_rounds, repo_map)
+        claude_prompt = _build_prompt(task, history, claude.name, codex.name, max_rounds, repo_map, skills_context)
         log_info(f"Waiting for {claude.name} ...")
         claude_reply = claude.query(claude_prompt)
         history.append({"agent": claude.name, "message": claude_reply})
@@ -146,11 +153,23 @@ def run_discussion(
                 history.append({"agent": "User", "message": answer})
                 log_agent("User", answer)
 
-        # Check if both agents agree — exit early if so
-        if _has_agreement(codex_reply) and _has_agreement(claude_reply):
-            agreed = True
-            log_info(f"Both agents agree after round {round_num} — stopping early.")
-            break
+        # --- Codex confirmation turn (sees Claude's full response) ---
+        # Only run if Claude signalled satisfaction; Codex must critically review.
+        if _has_agreement(claude_reply):
+            confirm_prompt = _build_confirm_prompt(task, history, codex.name, claude.name)
+            log_info(f"Waiting for {codex.name} (critical review of Claude's additions) ...")
+            confirm_reply = codex.query(confirm_prompt)
+            history.append({"agent": codex.name, "message": confirm_reply})
+            log_agent(f"{codex.name} (confirm)", confirm_reply)
+
+            # Both checks needed: _has_agreement guards against a bare "AGREED" appearing
+            # in a longer critical response, while not _has_declined catches cases where
+            # Codex writes "I'd AGREED but..." and then closes with DECLINED.
+            if _has_agreement(confirm_reply) and not _has_declined(confirm_reply):
+                agreed = True
+                log_info(f"Both agents agree after round {round_num} — stopping early.")
+                break
+            # Codex raised concerns — continue to next round with objections in history
 
     if not agreed:
         log_info("Discussion complete — proceeding with best available approach.")
@@ -165,6 +184,7 @@ def _build_prompt(
     other_agent: str,
     max_rounds: int,
     repo_map: str = "",
+    skills_context: str = "",
 ) -> str:
     lines = [
         f"<role>You are {current_agent}, a senior technical lead (admin).",
@@ -201,6 +221,13 @@ def _build_prompt(
             lines.append("</discussion>")
         lines.append("")
 
+    if skills_context:
+        lines.append(f"<skills>\n{skills_context}\n</skills>\n")
+        lines.append(
+            "Use the skills above as guidelines when proposing the approach. "
+            "Reference them where relevant.\n"
+        )
+
     lines.append(
         "<rules>\n"
         "- You are an ADMIN. You do NOT write code, create files, or delegate to anyone.\n"
@@ -213,3 +240,48 @@ def _build_prompt(
         "</rules>"
     )
     return "\n".join(lines)
+
+
+def _build_confirm_prompt(
+    task: str,
+    history: list[dict[str, str]],
+    codex_name: str,
+    claude_name: str,
+) -> str:
+    """Prompt for Codex's critical confirmation after Claude has reviewed."""
+    summary, recent = _summarize_old_history(history)
+    transcript_block = ""
+    if summary:
+        transcript_block = (
+            "<discussion>\n"
+            "EARLIER DISCUSSION (summary):\n"
+            f"{summary}\n\n"
+            "RECENT DISCUSSION:\n"
+            f"{format_transcript(recent)}\n"
+            "</discussion>\n"
+        )
+    else:
+        transcript_block = (
+            "<discussion>\n"
+            f"{format_transcript(history)}\n"
+            "</discussion>\n"
+        )
+
+    return (
+        f"<role>You are {codex_name}, a senior technical lead (admin). "
+        f"{claude_name} has just reviewed your proposal and added to it. "
+        "Your job now is to critically scrutinize the combined plan before sign-off.</role>\n\n"
+        f"<task>{task}</task>\n\n"
+        f"{transcript_block}\n"
+        "<rules>\n"
+        f"- Read {claude_name}'s additions carefully. Assume they may be wrong or incomplete.\n"
+        "- Actively hunt for: missing files, wrong paths, scope creep, bad architecture, "
+        "vague specs, contradictions, anything that will cause the implementation to fail.\n"
+        "- Your DEFAULT stance is DECLINED. Only say AGREED if you genuinely cannot find "
+        "a single gap or problem worth raising.\n"
+        "- If you have ANY concern — even minor — state it clearly and end with: DECLINED\n"
+        "- If the plan is airtight and you have zero objections, end with: AGREED\n"
+        "- Do NOT be polite. Do NOT rubber-stamp. Be the harshest reviewer on the team.\n"
+        "- No preamble. Bullet points only.\n"
+        "</rules>"
+    )
