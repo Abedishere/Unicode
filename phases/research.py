@@ -14,7 +14,6 @@ from __future__ import annotations
 import concurrent.futures
 import threading
 
-from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
@@ -22,9 +21,7 @@ from rich.text import Text
 
 from agents.base import BaseAgent
 from agents.qwen_agent import QwenAgent
-from utils.logger import log_agent, log_info, log_phase
-
-console = Console()
+from utils.logger import console, log_agent, log_info, log_phase
 
 
 # ── Per-agent research prompts ────────────────────────────────────────────────
@@ -144,7 +141,7 @@ def run_research(
     codex: BaseAgent,
     qwen: BaseAgent,
     synthesizer: BaseAgent,
-    wall_seconds: int = 180,
+    wall_seconds: int = 90,
 ) -> str:
     """Run parallel research and return the task prompt enriched with findings.
 
@@ -154,16 +151,15 @@ def run_research(
       - synthesizer ×1 sequential (distills all findings — Haiku recommended)
 
     wall_seconds: hard deadline for the parallel phase. Agents that finish
-    within the window contribute; any that are still running are skipped so
-    the pipeline doesn't stall. Defaults to 90s.
+    within the window contribute; stragglers are cancelled so the pipeline
+    doesn't stall (e.g. if Qwen web search hangs). Defaults to 90s.
 
     Returns the enriched task string (original task + research context).
     Returns the original task unchanged if all agents fail or find nothing.
     """
     log_phase("Phase 0.5: Research")
     console.print(
-        f"[dim]Codex (×2) and Qwen are researching in parallel "
-        f"(max {wall_seconds}s) …[/]"
+        f"[dim]Codex (×2) and Qwen are researching in parallel (max {wall_seconds}s) …[/]"
     )
     console.print()
 
@@ -214,7 +210,7 @@ def run_research(
 
     def _refresh(live) -> None:
         while not stop_event.is_set():
-            update_event.wait(timeout=wall_seconds + 5)
+            update_event.wait(timeout=5)
             update_event.clear()
             with _lock:
                 t = _make_research_table(dict(status))
