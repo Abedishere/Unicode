@@ -13,9 +13,22 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
+import os
+
 from agents.claude_agent import ClaudeAgent
-from utils.logger import log_info, log_phase, log_success
-from utils.memory import get_context_for_task, load_memory, log_bug, log_key_fact, parse_json_response, save_memory
+from utils.fallback import build_agents_dict, get_fallback_agent
+from utils.logger import log_info, log_phase, log_success, skills_block
+from utils.memory import (
+    get_context_for_task, init_project_notes, load_memory,
+    log_bug, log_decision, log_issue, log_key_fact,
+    parse_json_response, save_memory,
+)
+from utils.runner import UsageLimitReached
+
+# When set to N > 0, the implementation worker raises UsageLimitReached after
+# N files complete successfully.  Used to test the fallback chain without
+# hitting a real API limit.  Set via env var: ORCHESTRATOR_SIMULATE_LIMIT_AFTER=2
+_SIMULATE_LIMIT_AFTER: int = int(os.environ.get("ORCHESTRATOR_SIMULATE_LIMIT_AFTER", "0"))
 
 try:
     from utils.repo_map import generate_repo_map as _generate_repo_map
@@ -160,10 +173,282 @@ def _extract_contracts(
                 f"{result.strip()}\n"
                 "</sibling_contracts>\n\n"
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        log_info(f"  Contract extraction failed (non-fatal): {exc}")
     return ""
 
+
+# ── Parallel Qwen memory synthesis ───────────────────────────────────────────
+
+_MEMORY_AGENT_CONFIGS: list[dict] = [
+    {
+        "name": "bugs",
+        "filename": "bugs.md",
+        "role": "Bug Tracker",
+        "focus": "Extract bugs, unexpected behaviors, or errors discovered during implementation.",
+        "output_format": (
+            "Return a JSON array (or [] if none found):\n"
+            '[{"issue": "title", "root_cause": "why it happened", '
+            '"solution": "how it was fixed", "prevention": "how to avoid in future"}]'
+        ),
+    },
+    {
+        "name": "decisions",
+        "filename": "decisions.md",
+        "role": "Architecture Recorder",
+        "focus": (
+            "Extract meaningful architectural or design decisions made "
+            "(skip trivial or obvious choices)."
+        ),
+        "output_format": (
+            "Return a JSON array (or [] if none):\n"
+            '[{"title": "short title", "context": "why this decision was needed", '
+            '"decision": "what was decided", '
+            '"alternatives": "other options considered (optional)", '
+            '"consequences": "tradeoffs or implications (optional)"}]'
+        ),
+    },
+    {
+        "name": "key_facts",
+        "filename": "key_facts.md",
+        "role": "Key Facts Recorder",
+        "focus": (
+            "Extract important facts: APIs used, config values, naming conventions, "
+            "module patterns, environment details."
+        ),
+        "output_format": (
+            "Return a JSON array (or [] if none):\n"
+            '[{"category": "Code Conventions|API|Config|Architecture|Environment", '
+            '"fact": "the concrete fact"}]'
+        ),
+    },
+    {
+        "name": "issues",
+        "filename": "issues.md",
+        "role": "Work Log Recorder",
+        "focus": "Summarize what was implemented and any notable outcomes or follow-up items.",
+        "output_format": (
+            "Return a JSON object (or {} if nothing notable):\n"
+            '{"task_summary": "one-line summary of what was done", '
+            '"outcome": "completed|partial|blocked", '
+            '"notes": "optional details or follow-up items"}'
+        ),
+    },
+    {
+        "name": "memory",
+        "filename": "memory.yaml",
+        "role": "Memory Index Updater",
+        "focus": (
+            "Extract patterns, conventions, and learnings for the searchable YAML memory index."
+        ),
+        "output_format": (
+            "Return a JSON object with only categories that have NEW entries (or {} if none):\n"
+            '{"patterns_learned": ["concrete pattern discovered"], '
+            '"codebase_conventions": ["convention observed in this codebase"], '
+            '"past_mistakes": ["mistake made + lesson learned"], '
+            '"architecture_decisions": ["key decision made"]}'
+        ),
+    },
+]
+
+
+def _read_memory_skeleton(work_dir: str) -> str:
+    """Snapshot all 5 memory files as a single context string.
+
+    Each agent receives this so it can avoid duplicating existing entries.
+    Large files are truncated to keep prompts manageable.
+    """
+    orch_dir = Path(work_dir) / ".orchestrator"
+    files = ["bugs.md", "decisions.md", "key_facts.md", "issues.md", "memory.yaml"]
+    parts = []
+    for filename in files:
+        path = orch_dir / filename
+        if path.exists():
+            try:
+                content = path.read_text(encoding="utf-8").strip()
+                if content:
+                    max_chars = 1000 if filename.endswith(".yaml") else 600
+                    if len(content) > max_chars:
+                        content = content[:max_chars] + "\n... [truncated]"
+                    parts.append(f"--- {filename} ---\n{content}")
+            except OSError:
+                pass
+    return "\n\n".join(parts) if parts else "(no existing memory)"
+
+
+def _run_memory_agent(
+    qwen,
+    cfg: dict,
+    task: str,
+    impls_block: str,
+    skeleton: str,
+    work_dir: str,
+) -> None:
+    """Run one specialized memory agent and write its output to the target file."""
+    prompt = (
+        f"You are the {cfg['role']} for the AI Orchestrator's memory system.\n"
+        f"Job: analyze these file implementations and update {cfg['filename']} only.\n\n"
+        f"<task>{task[:300]}</task>\n\n"
+        "<memory_skeleton>\n"
+        "Current state of ALL memory files (do NOT duplicate existing entries):\n"
+        f"{skeleton}\n"
+        "</memory_skeleton>\n\n"
+        "<completed_implementations>\n"
+        f"{impls_block}\n"
+        "</completed_implementations>\n\n"
+        f"Focus: {cfg['focus']}\n\n"
+        f"{cfg['output_format']}\n\n"
+        "Rules:\n"
+        "- Only record genuinely NEW information not already in the skeleton above\n"
+        "- Be specific and concrete — no generic advice or platitudes\n"
+        "- Return ONLY valid JSON, no markdown fences\n"
+        f"- Return empty [] or {{}} if nothing new to add to {cfg['filename']}"
+    )
+
+    raw = qwen.query(prompt)
+    data = parse_json_response(raw)
+
+    if cfg["name"] == "bugs":
+        for bug in (data if isinstance(data, list) else []):
+            if isinstance(bug, dict) and bug.get("issue"):
+                log_bug(
+                    work_dir, bug["issue"],
+                    bug.get("root_cause", ""), bug.get("solution", ""),
+                    bug.get("prevention", ""),
+                )
+
+    elif cfg["name"] == "decisions":
+        for dec in (data if isinstance(data, list) else []):
+            if isinstance(dec, dict) and dec.get("title") and dec.get("decision"):
+                log_decision(
+                    work_dir, dec["title"],
+                    dec.get("context", ""), dec["decision"],
+                    dec.get("alternatives", ""), dec.get("consequences", ""),
+                )
+
+    elif cfg["name"] == "key_facts":
+        for fact in (data if isinstance(data, list) else []):
+            if isinstance(fact, dict) and fact.get("fact"):
+                log_key_fact(work_dir, fact.get("category", "General"), fact["fact"])
+
+    elif cfg["name"] == "issues":
+        if isinstance(data, dict) and data.get("task_summary"):
+            log_issue(
+                work_dir, data["task_summary"],
+                data.get("outcome", "completed"),
+                notes=data.get("notes", ""),
+            )
+
+    elif cfg["name"] == "memory":
+        if isinstance(data, dict):
+            mem = load_memory(work_dir)
+            for category in ("patterns_learned", "codebase_conventions",
+                             "past_mistakes", "architecture_decisions"):
+                for entry in data.get(category, []):
+                    if isinstance(entry, str) and entry.strip():
+                        mem[category].append({
+                            "date": datetime.now().strftime("%Y-%m-%d"),
+                            "text": entry.strip(),
+                        })
+            save_memory(work_dir, mem)
+
+
+def _synthesize_memory_parallel(
+    qwen,
+    task: str,
+    completed_files: list[tuple[str, str, str]],
+    work_dir: str,
+) -> None:
+    """Update all 5 memory files using 5 parallel Qwen agents.
+
+    Each agent specializes in one file:
+        bugs.md / decisions.md / key_facts.md / issues.md / memory.yaml
+
+    All agents receive the same snapshot of the current memory state (skeleton)
+    so they can avoid duplicating existing entries.  Since each agent writes to
+    a different file there are no race conditions.
+
+    *completed_files* is a list of (file_path, file_spec, claude_output) tuples.
+    """
+    init_project_notes(work_dir)  # ensure all files exist before parallel writes
+
+    # Build the implementations block shared by all agents
+    impls_block = "\n\n".join(
+        f"FILE: {path}\nSPEC: {spec[:300]}\nOUTPUT: {out[:600]}"
+        for path, spec, out in completed_files
+    )
+
+    # Snapshot memory once — all agents get the same baseline context
+    skeleton = _read_memory_skeleton(work_dir)
+
+    qwen._quiet = True
+    agent_status: dict[str, str] = {cfg["name"]: "Pending" for cfg in _MEMORY_AGENT_CONFIGS}
+    _lock = threading.Lock()
+    _colors = {"Pending": "dim", "Running": "yellow", "Done": "green", "Error": "red"}
+
+    def _make_mem_table() -> Table:
+        t = Table(show_header=True, header_style="bold", box=None, expand=True)
+        t.add_column("Memory File", no_wrap=False)
+        t.add_column("Status", no_wrap=True, width=9)
+        done_n = sum(1 for s in agent_status.values() if s == "Done")
+        t.add_row(f"[dim]Memory synthesis: {done_n}/5 agents done[/]", "")
+        for cfg in _MEMORY_AGENT_CONFIGS:
+            state = agent_status[cfg["name"]]
+            c = _colors.get(state, "white")
+            t.add_row(f"  {cfg['filename']}", f"[{c}]{state}[/]")
+        return t
+
+    stop_event = threading.Event()
+    update_event = threading.Event()
+
+    def _refresh(live: Live) -> None:
+        while not stop_event.is_set():
+            update_event.wait(timeout=30)
+            update_event.clear()
+            with _lock:
+                t = _make_mem_table()
+            live.update(t)
+            live.refresh()
+
+    def _agent_worker(cfg: dict) -> None:
+        with _lock:
+            agent_status[cfg["name"]] = "Running"
+        update_event.set()
+        try:
+            _run_memory_agent(qwen, cfg, task, impls_block, skeleton, work_dir)
+            with _lock:
+                agent_status[cfg["name"]] = "Done"
+        except Exception as exc:
+            log_info(f"  Memory agent [{cfg['filename']}] failed: {exc}")
+            with _lock:
+                agent_status[cfg["name"]] = "Error"
+        update_event.set()
+
+    console.print("[bold cyan]▶  Running 5 parallel Qwen memory agents ...[/]")
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+    try:
+        futures = [pool.submit(_agent_worker, cfg) for cfg in _MEMORY_AGENT_CONFIGS]
+        with Live(_make_mem_table(), auto_refresh=False, console=console) as live:
+            refresh_thread = threading.Thread(target=_refresh, args=(live,), daemon=True)
+            refresh_thread.start()
+            try:
+                concurrent.futures.wait(futures)
+            finally:
+                stop_event.set()
+                update_event.set()
+                refresh_thread.join(timeout=1.0)
+            with _lock:
+                live.update(_make_mem_table())
+            live.refresh()
+    finally:
+        pool.shutdown(wait=False)
+        qwen._quiet = False
+
+    done_n = sum(1 for s in agent_status.values() if s == "Done")
+    log_success(f"Memory synthesis complete — {done_n}/5 agents succeeded.")
+
+
+# ── File-by-file implementation ───────────────────────────────────────────────
 
 def _build_file_prompt(
     task: str,
@@ -179,13 +464,12 @@ def _build_file_prompt(
         if file_spec.action == "CREATE"
         else "Modify this existing file."
     )
-    skills_block = f"<skills>\n{skills_context}\n</skills>\n\n" if skills_context else ""
     return (
         f"{memory_context}"
         f"<task>{task[:500]}</task>\n\n"
         f"{skeleton}"
         f"{contracts}"
-        f"{skills_block}"
+        f"{skills_block(skills_context)}"
         f"{shared_deps}"
         f"<file_spec>\n"
         f"ACTION: {file_spec.action} {file_spec.path}\n"
@@ -236,25 +520,26 @@ def _check_file_written(
 ) -> bool:
     """Check whether a file landed on disk via any of three recovery layers.
 
-    Layer 1: Claude used the Write tool — poll with OS-flush tolerance (Windows).
-    Layer 2: Claude wrote a different path due to session conflict/rate limit.
-    Layer 3: Claude emitted content as text instead of using the Write tool.
+    Layer 2 (no-wait path) is checked first: if Claude wrote any new file at
+    all, we accept immediately without polling.  Layer 1 (polling) only runs
+    when the expected path specifically is missing, saving up to 2s per file.
+    Layer 3 (text extraction) is the last resort.
     """
-    # Layer 1: exact path with OS-flush polling
-    file_found = _wait_for_file(expected)
-
-    # Layer 2: Claude wrote a differently-named file — accept it
-    if not file_found and new_files:
-        file_found = True
+    # Layer 2: Claude wrote a differently-named file — accept immediately, no polling
+    if new_files:
         log_info(f"  {spec_path} — written as: {sorted(new_files)}")
+        return True
+
+    # Layer 1: exact path with OS-flush polling (Windows write-flush delay)
+    if _wait_for_file(expected):
+        return True
 
     # Layer 3: Claude output the content as text — write it ourselves
-    if not file_found:
-        file_found = _extract_and_write_file(spec_path, output, work_dir)
-        if file_found:
-            log_info(f"  {spec_path} — recovered from Claude output text")
+    if _extract_and_write_file(spec_path, output, work_dir):
+        log_info(f"  {spec_path} — recovered from Claude output text")
+        return True
 
-    return file_found
+    return False
 
 
 def _extract_and_write_file(file_path: str, output: str, work_dir: str) -> bool:
@@ -300,6 +585,9 @@ def _implement_file_by_file(
     work_dir: str = "",
     max_workers: int = 5,
     skills_context: str = "",
+    fallback_agent=None,
+    _status: dict | None = None,
+    _outputs: dict | None = None,
 ) -> str:
     """Implement the plan with up to *max_workers* parallel Claude agents.
 
@@ -310,6 +598,10 @@ def _implement_file_by_file(
 
     A Rich Live table shows per-file status.  Qwen memory synthesis runs
     sequentially after all files complete.
+
+    *fallback_agent* is used when the primary agent (*claude*) hits its usage
+    limit.  *_status* and *_outputs* allow recursive calls to share the same
+    tracking dicts so the parent can see the final state of all files.
     """
     total = len(structured_plan.files)
     repo_map_tokens = 2000  # same default as orchestrator
@@ -337,10 +629,12 @@ def _implement_file_by_file(
 
     _colors = {
         "Pending": "dim", "Running": "yellow",
-        "Done": "green", "Error": "red",
+        "Done": "green", "Missing": "yellow",
+        "Error": "red", "Limit": "bold red",
     }
-    status: dict[str, str] = {s.path: "Pending" for s in structured_plan.files}
-    outputs: dict[str, str] = {}
+    # Reuse shared dicts when this is a recursive fallback call; otherwise create new ones.
+    status: dict[str, str] = _status if _status is not None else {s.path: "Pending" for s in structured_plan.files}
+    outputs: dict[str, str] = _outputs if _outputs is not None else {}
     _lock = threading.Lock()
     update_event = threading.Event()
     stop_event = threading.Event()
@@ -381,12 +675,15 @@ def _implement_file_by_file(
 
     def _refresh(live: Live) -> None:
         while not stop_event.is_set():
-            update_event.wait(timeout=120)
+            update_event.wait(timeout=30)
             update_event.clear()
             with _lock:
                 t = _make_table()
             live.update(t)
             live.refresh()
+
+    # Tracks which agent names hit their usage limit during parallel execution.
+    agent_limit_hit: set[str] = set()
 
     def _worker() -> None:
         """Each thread loops: dequeue → implement → repeat until queue empty."""
@@ -402,6 +699,14 @@ def _implement_file_by_file(
 
             prompt = _build_file_prompt(task, file_spec, skeleton, shared_deps, memory_context, contracts, skills_context)
             try:
+                # Simulation: raise UsageLimitReached after N successful files.
+                # Controlled via ORCHESTRATOR_SIMULATE_LIMIT_AFTER env var.
+                if _SIMULATE_LIMIT_AFTER > 0:
+                    with _lock:
+                        done_so_far = sum(1 for s in status.values() if s == "Done")
+                    if done_so_far >= _SIMULATE_LIMIT_AFTER:
+                        raise UsageLimitReached(claude.name, "Simulated limit for testing")
+
                 # Snapshot directory before so we can detect files written under
                 # a different name/path than the plan specifies.
                 before = _snapshot_dir(work_dir) if work_dir else set()
@@ -421,6 +726,13 @@ def _implement_file_by_file(
                         status[file_spec.path] = "Missing"
                         log_info(f"  Warning: {file_spec.path} not found on disk after implementation")
                     outputs[file_spec.path] = out
+            except UsageLimitReached as e:
+                with _lock:
+                    status[file_spec.path] = "Limit"
+                    outputs[file_spec.path] = ""
+                    agent_limit_hit.add(e.agent_name.lower())
+                update_event.set()
+                return  # Stop this worker — limited agent will fail every subsequent file too
             except Exception:
                 with _lock:
                     status[file_spec.path] = "Error"
@@ -449,9 +761,42 @@ def _implement_file_by_file(
         if qwen is not None:
             qwen._quiet = False
 
+    # If the primary agent hit its usage limit, hand unfinished files to the
+    # fallback agent before sequential retry.
+    needs_fallback = [
+        s for s in structured_plan.files
+        if status[s.path] in ("Pending", "Running", "Limit")
+    ]
+    if needs_fallback and fallback_agent is not None:
+        console.print(
+            f"[bold yellow]⚠ {claude.name} limit reached — "
+            f"switching to {fallback_agent.name} for {len(needs_fallback)} file(s)[/]"
+        )
+        log_info(f"Fallback: {fallback_agent.name} handling {len(needs_fallback)} file(s)")
+        from utils.plan_parser import StructuredPlan as _StructuredPlan
+        fallback_plan = _StructuredPlan(
+            shared_dependencies=structured_plan.shared_dependencies,
+            files=needs_fallback,
+        )
+        _implement_file_by_file(
+            task, fallback_plan, fallback_agent,
+            repo_map=repo_map, memory_context=memory_context,
+            qwen=qwen, work_dir=work_dir, max_workers=max_workers,
+            skills_context=skills_context,
+            fallback_agent=None,   # no double-chaining in recursive call
+            _status=status,        # share the same dicts so caller sees results
+            _outputs=outputs,
+        )
+
     # Sequential retry for files that didn't land on disk despite a clean exit.
     # Runs single-threaded to avoid the same session-conflict race that caused
     # the missing files in the first place.
+    # If the primary agent is limited, use the fallback for retry too.
+    retry_agent = (
+        fallback_agent
+        if fallback_agent is not None and (agent_limit_hit & {claude.name.lower()})
+        else claude
+    )
     missing = [s for s in structured_plan.files if status[s.path] in ("Missing", "Error")]
     if missing:
         log_info(f"  Retrying {len(missing)} missing/failed file(s) sequentially ...")
@@ -461,7 +806,9 @@ def _implement_file_by_file(
             prompt = _build_file_prompt(task, spec, skeleton, shared_deps, memory_context, contracts, skills_context)
             try:
                 before = _snapshot_dir(work_dir) if work_dir else set()
-                out = claude.implement(prompt)
+                out = (retry_agent.implement(prompt)
+                       if hasattr(retry_agent, "implement")
+                       else retry_agent.query(prompt))
                 after = _snapshot_dir(work_dir) if work_dir else set()
                 new_files = after - before
 
@@ -478,32 +825,23 @@ def _implement_file_by_file(
                 log_info(f"  {spec.path} — retry failed: {exc}")
 
     # Log results
-    all_lessons: list[str] = []
     results = []
+    completed_for_memory: list[tuple[str, str, str]] = []
     for spec in structured_plan.files:
         state = status[spec.path]
         out = outputs.get(spec.path, "")
         if state == "Done":
             log_success(f"  {spec.path} — done")
             results.append(f"[{spec.path}] done")
+            completed_for_memory.append((spec.path, spec.spec, out))
         else:
             log_info(f"  {spec.path} — {state.lower()}")
             results.append(f"[{spec.path}] {state.lower()}")
 
-        if qwen and work_dir and state == "Done":
-            lessons = _synthesize_file_memory(
-                qwen, task, spec.path, spec.spec, out, work_dir,
-            )
-            all_lessons.extend(lessons)
-
-    if all_lessons and work_dir:
-        memory = load_memory(work_dir)
-        for lesson in all_lessons:
-            memory["past_mistakes"].append({
-                "date": datetime.now().strftime("%Y-%m-%d"),
-                "text": lesson,
-            })
-        save_memory(work_dir, memory)
+    # Parallel Qwen memory synthesis — 5 agents, one per memory file.
+    # Replaces the old sequential _synthesize_file_memory loop.
+    if qwen and work_dir and completed_for_memory:
+        _synthesize_memory_parallel(qwen, task, completed_for_memory, work_dir)
 
     return f"File-by-file implementation complete ({total} files):\n" + "\n".join(results)
 
@@ -520,6 +858,7 @@ def run_implementation(
     work_dir: str = "",
     max_workers: int = 5,
     skills_context: str = "",
+    fallback_agent=None,
 ) -> str:
     """Have Claude Code implement the plan non-interactively.
 
@@ -559,6 +898,7 @@ def run_implementation(
             task, structured_plan, claude, repo_map, memory_context,
             qwen=qwen, work_dir=work_dir, max_workers=max_workers,
             skills_context=skills_context,
+            fallback_agent=fallback_agent,
         )
 
     # Monolithic fallback
@@ -570,12 +910,11 @@ def run_implementation(
         skeleton = f"<codebase>\n{repo_map}\n</codebase>\n\n"
 
     log_info(f"Running Claude Code (dev:{claude.dev_model}) ...")
-    skills_block = f"<skills>\n{skills_context}\n</skills>\n\n" if skills_context else ""
     implement_prompt = (
         f"{memory_context}"
         f"{skeleton}"
         f"{context_brief}"
-        f"{skills_block}"
+        f"{skills_block(skills_context)}"
         f"<task>\n{task}\n</task>\n\n"
         f"<plan>\n{plan}\n</plan>\n\n"
         "<rules>\n"
@@ -586,6 +925,16 @@ def run_implementation(
         "Look up the current stable version of each package and use it as the lower bound.\n"
         "</rules>"
     )
-    result = claude.implement(implement_prompt)
+    try:
+        result = claude.implement(implement_prompt)
+    except UsageLimitReached as e:
+        if fallback_agent is not None:
+            console.print(f"[bold yellow]⚠ {e.agent_name} limit — switching to {fallback_agent.name}[/]")
+            log_info(f"Monolithic fallback: {fallback_agent.name} will implement.")
+            result = (fallback_agent.implement(implement_prompt)
+                      if hasattr(fallback_agent, "implement")
+                      else fallback_agent.query(implement_prompt))
+        else:
+            raise
     log_success("Claude Code finished implementation.")
     return result

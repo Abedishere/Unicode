@@ -120,7 +120,7 @@ def run_skills_scout(task: str, qwen: BaseAgent) -> SkillsManifest:
 
     # ── Step 2: Search, install, and read for each role ───────────────────────
     manifest = SkillsManifest()
-    roles = list(_SKILLS_PER_ROLE.keys())  # researcher, planner, developer, reviewer
+    roles = _SKILLS_PER_ROLE.keys()  # researcher, planner, developer, reviewer
 
     # Track every package already assigned to an earlier role so the same skill
     # is never recommended to two different roles.

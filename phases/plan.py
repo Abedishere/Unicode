@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from agents.base import BaseAgent
-from utils.logger import format_transcript, log_agent, log_error, log_info, log_phase
+from utils.logger import format_transcript, log_agent, log_error, log_info, log_phase, skills_block
 from utils.plan_parser import is_structured, parse_plan
 
 _CLAUDE_SYNTHESIS_PROMPT = """\
@@ -75,17 +75,14 @@ def consolidate_plan(
             "Reference existing files accurately.\n\n"
         )
 
-    skills_block = ""
-    if skills_context:
-        skills_block = (
-            f"<skills>\n{skills_context}\n</skills>\n\n"
-            "Let the skills above guide your architectural decisions and file structure.\n\n"
-        )
+    skills = skills_block(skills_context)
+    if skills:
+        skills = skills + "Let the skills above guide your architectural decisions and file structure.\n\n"
 
     codex_prompt = (
         f"{memory_context}"
         f"{skeleton}"
-        f"{skills_block}"
+        f"{skills}"
         "YOU MUST OUTPUT A STRUCTURED PLAN. "
         "The file-by-file implementation system REQUIRES the exact format shown below. "
         "A plain prose plan will BREAK THE PIPELINE — every file must have its own "

@@ -78,9 +78,7 @@ No preamble, no URLs, no conclusion. Just the facts from the snippets.
 """
 
 _SYNTHESIS_PROMPT = """\
-<role>You are a technical researcher aggregating notes from three independent engineers.</role>
-
-<role>
+<role>You are a technical researcher aggregating notes from three independent engineers. \
 YOUR ONLY JOB is to distill their findings into a single, compact summary that \
 captures every key piece of information across all three sets of notes. \
 Preserve all important details. Do not drop anything meaningful. \
@@ -141,7 +139,7 @@ def run_research(
     codex: BaseAgent,
     qwen: BaseAgent,
     synthesizer: BaseAgent,
-    wall_seconds: int = 90,
+    wall_seconds: int | None = None,
 ) -> str:
     """Run parallel research and return the task prompt enriched with findings.
 
@@ -152,15 +150,13 @@ def run_research(
 
     wall_seconds: hard deadline for the parallel phase. Agents that finish
     within the window contribute; stragglers are cancelled so the pipeline
-    doesn't stall (e.g. if Qwen web search hangs). Defaults to 90s.
+    doesn't stall (e.g. if Qwen web search hangs). None means no timeout.
 
     Returns the enriched task string (original task + research context).
     Returns the original task unchanged if all agents fail or find nothing.
     """
     log_phase("Phase 0.5: Research")
-    console.print(
-        f"[dim]Codex (×2) and Qwen are researching in parallel (max {wall_seconds}s) …[/]"
-    )
+    console.print("[dim]Codex (×2) and Qwen are researching in parallel …[/]")
     console.print()
 
     codex_a_prompt = _CODEX_A_PROMPT.format(task=task)
@@ -250,8 +246,8 @@ def run_research(
 
         if pending:
             log_info(
-                f"{len(pending)} research agent(s) hit the {wall_seconds}s wall "
-                "— using partial results."
+                f"{len(pending)} research agent(s) hit the "
+                f"{wall_seconds}s wall — using partial results."
             )
             for fut in pending:
                 fut.cancel()

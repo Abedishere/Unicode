@@ -25,6 +25,11 @@ def format_transcript(discussion: list[dict[str, str]]) -> str:
     return "\n".join(f"[{e['agent']}]: {e['message']}" for e in discussion)
 
 
+def skills_block(ctx: str) -> str:
+    """Wrap skills context in a <skills> XML block for prompt injection."""
+    return f"<skills>\n{ctx}\n</skills>\n\n" if ctx else ""
+
+
 def format_duration(seconds: float) -> str:
     """Format a duration in seconds as '2m 05s' or '45s'."""
     mins, secs = divmod(int(seconds), 60)

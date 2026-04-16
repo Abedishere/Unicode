@@ -14,7 +14,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from agents.base import BaseAgent
-from utils.logger import format_transcript, log_agent, log_info, log_phase
+from utils.logger import format_transcript, log_agent, log_info, log_phase, skills_block
 
 console = Console()
 
@@ -95,6 +95,25 @@ def _summarize_old_history(
     return "\n".join(lines), recent
 
 
+def _format_discussion_block(history: list[dict[str, str]]) -> str:
+    """Format history as a <discussion> XML block, summarising old entries."""
+    summary, recent = _summarize_old_history(history)
+    if summary:
+        return (
+            "<discussion>\n"
+            "EARLIER DISCUSSION (summary):\n"
+            f"{summary}\n\n"
+            "RECENT DISCUSSION:\n"
+            f"{format_transcript(recent)}\n"
+            "</discussion>\n"
+        )
+    return (
+        "<discussion>\n"
+        f"{format_transcript(history)}\n"
+        "</discussion>\n"
+    )
+
+
 def run_discussion(
     task: str,
     claude: BaseAgent,
@@ -154,7 +173,6 @@ def run_discussion(
                 log_agent("User", answer)
 
         # --- Codex confirmation turn (sees Claude's full response) ---
-        # Only run if Claude signalled satisfaction; Codex must critically review.
         if _has_agreement(claude_reply):
             confirm_prompt = _build_confirm_prompt(task, history, codex.name, claude.name)
             log_info(f"Waiting for {codex.name} (critical review of Claude's additions) ...")
@@ -206,26 +224,14 @@ def _build_prompt(
     ])
 
     if history:
-        summary, recent = _summarize_old_history(history)
-        if summary:
-            lines.append("<discussion>")
-            lines.append("EARLIER DISCUSSION (summary):")
-            lines.append(summary)
-            lines.append("")
-            lines.append("RECENT DISCUSSION:")
-            lines.append(format_transcript(recent))
-            lines.append("</discussion>")
-        else:
-            lines.append("<discussion>")
-            lines.append(format_transcript(history))
-            lines.append("</discussion>")
+        lines.append(_format_discussion_block(history))
         lines.append("")
 
     if skills_context:
-        lines.append(f"<skills>\n{skills_context}\n</skills>\n")
         lines.append(
-            "Use the skills above as guidelines when proposing the approach. "
-            "Reference them where relevant.\n"
+            skills_block(skills_context)
+            + "Use the skills above as guidelines when proposing the approach. "
+            "Reference them where relevant."
         )
 
     lines.append(
@@ -249,24 +255,7 @@ def _build_confirm_prompt(
     claude_name: str,
 ) -> str:
     """Prompt for Codex's critical confirmation after Claude has reviewed."""
-    summary, recent = _summarize_old_history(history)
-    transcript_block = ""
-    if summary:
-        transcript_block = (
-            "<discussion>\n"
-            "EARLIER DISCUSSION (summary):\n"
-            f"{summary}\n\n"
-            "RECENT DISCUSSION:\n"
-            f"{format_transcript(recent)}\n"
-            "</discussion>\n"
-        )
-    else:
-        transcript_block = (
-            "<discussion>\n"
-            f"{format_transcript(history)}\n"
-            "</discussion>\n"
-        )
-
+    transcript_block = _format_discussion_block(history)
     return (
         f"<role>You are {codex_name}, a senior technical lead (admin). "
         f"{claude_name} has just reviewed your proposal and added to it. "

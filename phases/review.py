@@ -16,7 +16,8 @@ from rich.console import Console
 from agents.claude_agent import ClaudeAgent
 from agents.codex_agent import CodexAgent
 from utils.git_utils import get_diff
-from utils.logger import log_agent, log_error, log_info, log_phase, log_success
+from utils.logger import log_agent, log_error, log_info, log_phase, log_success, skills_block
+from utils.runner import UsageLimitReached
 
 console = Console()
 
@@ -169,6 +170,15 @@ def _handle_full_diff_request(
         return review
 
 
+def _determine_verdict(review: str) -> bool:
+    """Return True (approved) / False (changes requested) from a primary review string."""
+    if _APPROVED_PAT.search(review) and not _CHANGES_PAT.search(review):
+        return True
+    if _LOOKS_GOOD.search(review) and not _CHANGES_PAT.search(review):
+        return True
+    return not bool(_CHANGES_PAT.search(review))
+
+
 # ── Review Part 1: Codex primary review ──────────────────────────────────────
 
 def _codex_primary_review(
@@ -192,7 +202,6 @@ def _codex_primary_review(
     # Placing this instruction first — before any task content — maximises
     # the chance Codex treats this as a pure text task.
     diff_summary = diff_summary or _summarize_diff(diff)
-    skills_block = f"<skills>\n{skills_context}\n</skills>\n\n" if skills_context else ""
     prompt = (
         "=== IMPORTANT: TEXT-ONLY TASK — DO NOT RUN ANY SHELL COMMANDS ===\n"
         "ALL information you need is in this prompt.\n"
@@ -200,7 +209,7 @@ def _codex_primary_review(
         "Respond with plain text only.\n"
         "=== END IMPORTANT ===\n\n"
         "<role>You are a senior technical lead doing a code review.</role>\n\n"
-        f"{skills_block}"
+        f"{skills_block(skills_context)}"
         "<rules>\n"
         "- Flag ONLY: actual bugs, logic errors, deviations from the plan.\n"
         "- Do NOT flag: missing tests, documentation, comments, or style.\n"
@@ -227,6 +236,8 @@ def _codex_primary_review(
         review = codex.review_query(prompt)
         console.print("[bold green]✓  Codex review received.[/]")
         log_agent("Codex (Review Part 1)", review)
+    except UsageLimitReached:
+        raise  # propagate to run_review to trigger Qwen fallback
     except RuntimeError as exc:
         log_error(f"Codex review failed: {exc}")
         choice = click.prompt(
@@ -248,17 +259,61 @@ def _codex_primary_review(
         text_only_preamble=True,
     )
 
-    # Determine verdict
-    if _APPROVED_PAT.search(review) and not _CHANGES_PAT.search(review):
-        return review, True
-    if _LOOKS_GOOD.search(review) and not _CHANGES_PAT.search(review):
-        return review, True
-    if not _CHANGES_PAT.search(review):
-        # No explicit changes requested → treat as approved
+    approved = _determine_verdict(review)
+    if approved and not _CHANGES_PAT.search(review) and not _APPROVED_PAT.search(review) and not _LOOKS_GOOD.search(review):
         log_info("Codex did not request changes — treating as approved.")
-        return review, True
+    return review, approved
 
-    return review, False
+
+# ── Qwen fallback primary review ─────────────────────────────────────────────
+
+def _qwen_primary_review(
+    qwen,
+    diff: str,
+    task: str,
+    plan: str,
+    iteration: int,
+    max_iterations: int,
+    diff_summary: str = "",
+    skills_context: str = "",
+) -> tuple[str, bool]:
+    """Fallback primary reviewer when Codex hits its usage limit.
+
+    Uses the same review prompt structure as Codex but without the
+    NO-TOOLS preamble (Qwen doesn't execute shell commands in query mode).
+    Returns (review_text, is_approved).
+    """
+    diff_summary = diff_summary or _summarize_diff(diff)
+    prompt = (
+        "<role>You are a senior technical lead doing a code review.</role>\n\n"
+        f"{skills_block(skills_context)}"
+        "<rules>\n"
+        "- Flag ONLY: actual bugs, logic errors, deviations from the plan.\n"
+        "- Do NOT flag: missing tests, documentation, comments, or style.\n"
+        "- If the implementation correctly follows the plan, reply APPROVED.\n"
+        f"- This is review cycle {iteration} of {max_iterations}. Be decisive.\n"
+        "</rules>\n\n"
+        f"<task>{task}</task>\n\n"
+        f"<plan>{plan[:2000]}</plan>\n\n"
+        f"<diff_summary>\n{diff_summary}\n</diff_summary>\n\n"
+        "<output_format>\n"
+        "Your response MUST start with exactly one of these two lines:\n"
+        "APPROVED\n"
+        "CHANGES_REQUESTED\n\n"
+        "If CHANGES_REQUESTED, list each confirmed issue as a numbered bullet.\n"
+        "Reference specific lines/functions. No style or test requests.\n"
+        "</output_format>"
+    )
+
+    console.print("[bold green]▶  Qwen is reviewing the diff (Codex fallback) ...[/]")
+    review = qwen.review_query(prompt)
+    console.print("[bold green]✓  Qwen review received.[/]")
+    log_agent("Qwen (Review Part 1 fallback)", review)
+
+    approved = _determine_verdict(review)
+    if approved and not _CHANGES_PAT.search(review) and not _APPROVED_PAT.search(review) and not _LOOKS_GOOD.search(review):
+        log_info("Qwen did not request changes — treating as approved.")
+    return review, approved
 
 
 # ── Review Part 2: Claude secondary review ───────────────────────────────────
@@ -307,9 +362,11 @@ def _claude_secondary_review(
     try:
         result = claude.query(prompt)
         log_agent("Claude (Review Part 2)", result)
-    except RuntimeError as exc:
-        log_error(f"Claude secondary review failed: {exc} — using Codex review as-is.")
-        return codex_review, True  # fall back to trusting Codex's findings
+    except (RuntimeError, UsageLimitReached) as exc:
+        log_error(f"Claude secondary review unavailable: {exc} — using Codex review as-is.")
+        if isinstance(exc, UsageLimitReached):
+            log_info("Accepting Codex/Qwen primary review as final (Claude limit hit).")
+        return codex_review, True  # fall back to trusting the primary reviewer's findings
 
     # Handle NEED_FULL_DIFF requests
     result = _handle_full_diff_request(
@@ -332,6 +389,7 @@ def run_review(
     working_dir: str,
     max_iterations: int,
     skills_context: str = "",
+    qwen=None,
 ) -> tuple[bool, str]:
     """Two-phase code review loop.
 
@@ -346,6 +404,8 @@ def run_review(
     review feedback (used by the orchestrator to extract learnings).
     """
     log_phase("Phase 4: Code Review")
+    if max_iterations > 3:
+        log_info(f"max_review_iterations capped at 3 (configured: {max_iterations}).")
     max_iterations = min(max_iterations, 3)
     review_feedback: list[str] = []
 
@@ -392,16 +452,27 @@ def run_review(
         # ── Pre-compute diff summary (shared by both review parts) ──────
         diff_summary = _summarize_diff(diff)
 
-        # ── Review Part 1: Codex primary review ──────────────────────────
+        # ── Review Part 1: Codex primary review (Qwen fallback if Codex is limited) ──
         log_phase(
             f"Review Part 1 — Codex primary review "
             f"(cycle {iteration}/{max_iterations})"
         )
-        codex_review, approved = _codex_primary_review(
-            codex, diff, task, plan, iteration, max_iterations,
-            diff_summary=diff_summary,
-            skills_context=skills_context,
-        )
+        try:
+            codex_review, approved = _codex_primary_review(
+                codex, diff, task, plan, iteration, max_iterations,
+                diff_summary=diff_summary,
+                skills_context=skills_context,
+            )
+        except UsageLimitReached as e:
+            if qwen is None:
+                raise
+            console.print(f"[bold yellow]⚠ {e.agent_name} limit — Qwen will review instead[/]")
+            log_info(f"Codex usage limit hit — switching to Qwen as primary reviewer (cycle {iteration})")
+            codex_review, approved = _qwen_primary_review(
+                qwen, diff, task, plan, iteration, max_iterations,
+                diff_summary=diff_summary,
+                skills_context=skills_context,
+            )
 
         if codex_review:
             review_feedback.append(f"Codex Review (cycle {iteration}):\n{codex_review}")
@@ -458,8 +529,12 @@ def run_review(
             "- Do not touch anything else. No commentary, just implement the fixes.\n"
             "</rules>"
         )
-        fix_output = claude.implement(fix_prompt)
-        log_agent("Claude (developer fix)", fix_output)
+        try:
+            fix_output = claude.implement(fix_prompt)
+            log_agent("Claude (developer fix)", fix_output)
+        except UsageLimitReached:
+            log_info("Claude limit hit during fix — skipping fix, exiting review loop.")
+            break
 
         # Max cycles reached — approve after this fix rather than re-reviewing
         if iteration == max_iterations:
