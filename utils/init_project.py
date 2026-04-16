@@ -20,7 +20,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from utils.logger import log_error, log_info, log_success
+from utils.logger import log_error
 from utils.memory import (
     init_project_notes,
     load_memory,

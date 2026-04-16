@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import re
 import threading
 import time
@@ -16,10 +15,9 @@ from rich.table import Table
 import os
 
 from agents.claude_agent import ClaudeAgent
-from utils.fallback import build_agents_dict, get_fallback_agent
 from utils.logger import log_info, log_phase, log_success, skills_block
 from utils.memory import (
-    get_context_for_task, init_project_notes, load_memory,
+    init_project_notes, load_memory,
     log_bug, log_decision, log_issue, log_key_fact,
     parse_json_response, save_memory,
 )
