@@ -1,5 +1,5 @@
 {
-  "name": "ai-orchestrator",
+  "name": "unicode",
   "version": "0.1.0",
   "description": "Orchestrate Claude Code and Codex CLI into an automated agentic workflow",
   "bin": {

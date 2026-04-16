@@ -56,7 +56,7 @@ Make sure `claude`, `codex`, and `qwen` all work from your terminal before proce
 ### via npm (recommended)
 
 ```bash
-npm install -g ai-orchestrator
+npm install -g unicode
 ```
 
 This installs the `unicode` command globally and automatically installs all Python dependencies.
@@ -65,13 +65,13 @@ This installs the `unicode` command globally and automatically installs all Pyth
 
 ```bash
 # Always runs the latest published version
-npx ai-orchestrator@latest <task>
+npx unicode@latest <task>
 
 # Or omit the tag (uses latest by default)
-npx ai-orchestrator <task>
+npx unicode <task>
 ```
 
-> This project is updated frequently. We recommend running `npx ai-orchestrator@latest` whenever you feel like picking up new improvements — no reinstall needed.
+> This project is updated frequently. We recommend running `npx unicode@latest` whenever you feel like picking up new improvements — no reinstall needed.
 
 ### from source
 
