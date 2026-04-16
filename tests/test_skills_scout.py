@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from phases.skills_scout import (
     SkillsManifest,

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from phases.clarify import _collect_input, relay_agent_questions, run_interpreter
 

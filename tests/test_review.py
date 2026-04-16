@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from phases.review import (
     _determine_verdict,

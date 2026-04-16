@@ -3,12 +3,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from utils.repo_map import (
     _analyse_js,
     _analyse_python,
-    _build_output,
     _collect_files,
     _format_detail,
     _should_skip,

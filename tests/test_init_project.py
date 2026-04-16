@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from utils.init_project import (
     _build_file_tree,
