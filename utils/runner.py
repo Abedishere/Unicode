@@ -9,8 +9,12 @@ import threading
 import time
 
 import click
-import msvcrt
 import psutil
+
+try:
+    import msvcrt  # Windows only — ESC key watcher
+except ImportError:
+    msvcrt = None  # type: ignore[assignment]  # non-Windows: ESC watching disabled
 from rich.console import Console, Group
 from rich.live import Live
 from rich.spinner import Spinner
@@ -27,6 +31,32 @@ class CancelledByUser(Exception):
 
 class TimeoutSkipToReview(Exception):
     """Raised when the user chooses to skip to review after a timeout."""
+
+
+class UsageLimitReached(Exception):
+    """Raised when an agent reports it has hit a usage or rate limit."""
+
+    def __init__(self, agent_name: str, detail: str = ""):
+        self.agent_name = agent_name
+        self.detail = detail
+        super().__init__(f"{agent_name} usage limit reached: {detail}")
+
+
+def _is_usage_limit(stdout: str, stderr: str) -> bool:
+    """Return True if stdout/stderr indicate the agent hit a usage or rate limit."""
+    combined = (stdout + " " + stderr).lower()
+    patterns = [
+        "claude.ai/api/limits",
+        "rate_limit_error",
+        "overloaded_error",
+        "usage limit reached",
+        "529 too many requests",
+        "too many requests",
+        "request rate limit",
+        "quota exceeded",
+        "maximum context length",
+    ]
+    return any(p in combined for p in patterns)
 
 
 # ── Process tree helpers ────────────────────────────────────────────
@@ -151,7 +181,9 @@ def run_cli(
     results: dict[str, str] = {"stdout": "", "stderr": ""}
 
     def _watch_esc() -> None:
-        """Monitor for ESC key press in a background thread."""
+        """Monitor for ESC key press in a background thread (Windows only)."""
+        if msvcrt is None:
+            return  # ESC watching not available on non-Windows
         while not process_done.is_set():
             try:
                 if msvcrt.kbhit():

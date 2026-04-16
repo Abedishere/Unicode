@@ -119,7 +119,7 @@ def request_approval(action: str, description: str) -> tuple[str, str | None]:
             text = "\n".join(lines).strip()
             if text:
                 extra_instructions = text
-                console.print(f"\n[bold green]Got it.[/] Now choose how to proceed:")
+                console.print("\n[bold green]Got it.[/] Now choose how to proceed:")
             else:
                 console.print("\n[dim]No instructions entered.[/] Asking again:")
             # Loop back to the approval prompt

@@ -3,13 +3,29 @@
 from __future__ import annotations
 
 import concurrent.futures
-import json
+import io
 import os
 import signal
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+# ── Windows UTF-8 fix ────────────────────────────────────────────────────────
+# The box-drawing / block characters in the banner (and other Unicode in agent
+# output) fail on the legacy cp1252 Windows console.  Reconfigure stdout/stderr
+# to UTF-8 with replacement at startup so the orchestrator always works from
+# any terminal — including Claude Code's Bash tool.
+if sys.platform == "win32" and "pytest" not in sys.modules:
+    try:
+        sys.stdout = io.TextIOWrapper(
+            sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+        )
+        sys.stderr = io.TextIOWrapper(
+            sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
+        )
+    except AttributeError:
+        pass  # already wrapped
 
 import click
 import yaml
@@ -37,7 +53,8 @@ from utils.memory import (
     log_bug, log_decision, log_issue, log_key_fact, parse_json_response, save_memory,
 )
 from utils.init_project import run_init
-from utils.runner import CancelledByUser, TimeoutSkipToReview
+from utils.fallback import build_agents_dict, get_fallback_agent
+from utils.runner import CancelledByUser, TimeoutSkipToReview, UsageLimitReached
 from utils.session import Session, save_session, load_session, list_sessions
 
 try:
@@ -143,11 +160,11 @@ def _print_banner(cfg: dict, work_dir: str) -> None:
     # Info panel (right side)
     info_lines = Text()
     info_lines.append(">_ ", style="bold magenta")
-    info_lines.append(f"Unicode Orchestrator", style="bold white")
+    info_lines.append("Unicode Orchestrator", style="bold white")
     info_lines.append(f" (v{VERSION})\n\n", style="dim")
-    info_lines.append(f"  Claude ", style=f"bold {_C}")
+    info_lines.append("  Claude ", style=f"bold {_C}")
     info_lines.append(f"{cfg['claude_model']}", style="dim")
-    info_lines.append(f"  |  ", style="dim")
+    info_lines.append("  |  ", style="dim")
     codex_display = cfg["codex_model"]
     if not codex_display:
         codex_cfg = read_codex_config()
@@ -155,12 +172,12 @@ def _print_banner(cfg: dict, work_dir: str) -> None:
         effort = codex_cfg.get("reasoning_effort")
         if effort:
             codex_display += f" ({effort})"
-    info_lines.append(f"Codex ", style=f"bold {_X}")
+    info_lines.append("Codex ", style=f"bold {_X}")
     info_lines.append(f"{codex_display}", style="dim")
-    info_lines.append(f"\n  Qwen ", style=f"bold {_Q}")
+    info_lines.append("\n  Qwen ", style=f"bold {_Q}")
     info_lines.append(f"{cfg['qwen_model']}", style="dim")
-    info_lines.append(f"  |  ", style="dim")
-    info_lines.append(f"Dev ", style=f"bold {_C}")
+    info_lines.append("  |  ", style="dim")
+    info_lines.append("Dev ", style=f"bold {_C}")
     info_lines.append(f"{dev_model}", style="dim")
     info_lines.append(f"\n  {work_dir}", style="dim")
 
@@ -330,7 +347,7 @@ def load_config(config_path: str | None) -> dict:
 def _print_phase_banner(label: str, role: str, desc: str, color: str = "cyan") -> None:
     """Print a colored phase banner panel (like Qwen Code's notice boxes)."""
     content = Text()
-    content.append(f"Talking to ", style="default")
+    content.append("Talking to ", style="default")
     content.append(role, style=f"bold {color}")
     content.append(f" — {desc}", style="dim")
     console.print()
@@ -899,7 +916,7 @@ def _redraw_prompt_area(selected: int = -1) -> None:
     # Hint on the last attachment line (only in normal mode)
     if total > 0 and selected == -1:
         # Move cursor up to end of last attachment line, append hint
-        sys.stdout.write(f"\033[A\033[999C")  # up 1, end of line
+        sys.stdout.write("\033[A\033[999C")  # up 1, end of line
         sys.stdout.write(" \033[2m(↑ to select)\033[0m")
         sys.stdout.write("\n")  # back down
         sys.stdout.flush()
@@ -1339,7 +1356,7 @@ def _prompt_line_fallback(prompt_markup: str):
     except EOFError:
         return ("", None, "submit")
 
-    stripped = text.strip()
+    stripped = text.strip()  # noqa: F841
     time.sleep(0.05)
     if _has_stdin_data():
         remaining = _drain_stdin_lines()
@@ -1384,7 +1401,7 @@ def _prompt_task() -> str:
         console.rule(style="bright_black")
 
         # Show pending attachments with hint
-        has_attachments = total_att > 0
+        has_attachments = total_att > 0  # noqa: F841
         idx = 0
         for num, plines in _attached_pastes:
             badge = f"\\[Pasted text #{num} +{len(plines)} lines]"
@@ -1934,7 +1951,7 @@ def _run_task(
 
             # Run research and skills scout in parallel
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _scout_pool:
-                _wall = cfg.get("research_wall_seconds", 90)
+                _wall = cfg.get("research_wall_seconds", None)
                 _research_future = _scout_pool.submit(
                     _run_phase, "Research", run_research, task, codex, qwen, synthesizer,
                     wall_seconds=_wall,
@@ -1978,11 +1995,27 @@ def _run_task(
             if extra:
                 task = f"{task}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
                 log_info("Updated task with your instructions.")
-            disc_result = _run_phase("Discussion",
-                run_discussion, task, claude, codex, disc_rounds,
-                allow_user_questions=cfg.get("allow_user_questions", True),
-                repo_map=repo_map,
-                skills_context=skills_manifest.planner)
+            _agents_dict = build_agents_dict(claude, codex, qwen)
+            try:
+                disc_result = _run_phase("Discussion",
+                    run_discussion, task, claude, codex, disc_rounds,
+                    allow_user_questions=cfg.get("allow_user_questions", True),
+                    repo_map=repo_map,
+                    skills_context=skills_manifest.planner)
+            except UsageLimitReached as _e:
+                _fb = get_fallback_agent(_e.agent_name, _agents_dict)
+                if _fb is not None:
+                    console.print(f"[bold yellow]⚠ {_e.agent_name} limit — switching to {_fb.name} for discussion[/]")
+                    _new_claude = _fb if _e.agent_name.lower() == "claude" else claude
+                    _new_codex  = _fb if _e.agent_name.lower() == "codex" else codex
+                    disc_result = _run_phase("Discussion",
+                        run_discussion, task, _new_claude, _new_codex, disc_rounds,
+                        allow_user_questions=cfg.get("allow_user_questions", True),
+                        repo_map=repo_map,
+                        skills_context=skills_manifest.planner)
+                else:
+                    log_info("Discussion agents exhausted — proceeding without discussion.")
+                    disc_result = None
             if disc_result is not None:
                 discussion, agreed = disc_result
         else:
@@ -2004,12 +2037,27 @@ def _run_task(
             if extra:
                 task = f"{task}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
                 log_info("Updated task with your instructions.")
-            plan = _run_phase("Plan",
-                consolidate_plan, task, codex, work_dir, discussion,
-                memory_context=memory_context,
-                repo_map=repo_map,
-                claude=claude,
-                skills_context=skills_manifest.planner) or ""
+            _agents_dict = build_agents_dict(claude, codex, qwen)
+            try:
+                plan = _run_phase("Plan",
+                    consolidate_plan, task, codex, work_dir, discussion,
+                    memory_context=memory_context,
+                    repo_map=repo_map,
+                    claude=claude,
+                    skills_context=skills_manifest.planner) or ""
+            except UsageLimitReached as _e:
+                _fb = get_fallback_agent(_e.agent_name, _agents_dict)
+                if _fb is not None:
+                    console.print(f"[bold yellow]⚠ {_e.agent_name} limit — {_fb.name} will write the plan[/]")
+                    plan = _run_phase("Plan",
+                        consolidate_plan, task, _fb, work_dir, discussion,
+                        memory_context=memory_context,
+                        repo_map=repo_map,
+                        claude=claude,
+                        skills_context=skills_manifest.planner) or ""
+                else:
+                    log_info("No fallback for planning — proceeding without structured plan.")
+                    plan = ""
             # Parse structured plan for file-by-file generation
             structured_plan = parse_plan(plan)
             if is_structured(structured_plan):
@@ -2068,6 +2116,8 @@ def _run_task(
             if extra:
                 plan = f"{plan}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
                 log_info("Updated plan with your instructions.")
+            _agents_dict = build_agents_dict(claude, codex, qwen)
+            impl_fallback = get_fallback_agent("claude", _agents_dict)
             impl = None
             try:
                 impl = _run_phase("Implementation",
@@ -2079,7 +2129,8 @@ def _run_task(
                     qwen=qwen,
                     work_dir=work_dir,
                     max_workers=cfg.get("max_impl_workers", 5),
-                    skills_context=skills_manifest.developer)
+                    skills_context=skills_manifest.developer,
+                    fallback_agent=impl_fallback)
             except TimeoutSkipToReview:
                 log_info("Skipping to review phase (user request after timeout).")
                 skip_to_review = True
@@ -2118,7 +2169,8 @@ def _run_task(
         rev = _run_phase("Code Review",
             run_review, task, plan, claude, codex, work_dir,
             cfg["max_review_iterations"],
-            skills_context=skills_manifest.reviewer)
+            skills_context=skills_manifest.reviewer,
+            qwen=qwen)
         if rev is None:
             approved, review_text = True, ""
         elif isinstance(rev, tuple):
@@ -2165,7 +2217,14 @@ def _run_task(
             "</rules>"
         )
         log_info("Codex is writing commit message ...")
-        commit_msg = _run_phase("Commit message", codex.query, commit_prompt)
+        try:
+            commit_msg = _run_phase("Commit message", codex.query, commit_prompt)
+        except UsageLimitReached:
+            try:
+                console.print("[bold yellow]⚠ Codex limit — Qwen will write commit message[/]")
+                commit_msg = _run_phase("Commit message", qwen.query, commit_prompt)
+            except (UsageLimitReached, Exception):
+                commit_msg = ""
         if not commit_msg:
             commit_msg = f"orchestrator: {task[:72]}"
         # Clean up — take first line only, strip quotes

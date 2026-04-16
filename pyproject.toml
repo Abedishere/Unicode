@@ -17,6 +17,32 @@ dependencies = [
 [project.scripts]
 unicode = "orchestrator:main"
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+# E402: module-level import not at top (used intentionally in some utils)
+# E741: ambiguous variable name (l for line is common in existing code)
+# F401: auto-fixable unused imports handled via --fix; keep for new files
+ignore = ["E402", "E501", "E741"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+
 [tool.setuptools]
 py-modules = ["orchestrator"]
 packages = ["agents", "phases", "utils"]
