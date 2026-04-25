@@ -120,6 +120,11 @@ class CodexAgent(BaseAgent):
         self._maybe_audit(prompt)
         return self._run_codex(prompt, sandbox=True)
 
+    def implement(self, prompt: str) -> str:
+        """Run Codex with write access for implementation fallback work."""
+        self._maybe_audit(prompt)
+        return self._run_codex(prompt, sandbox=False, agent_suffix="implement")
+
     def review_query(self, prompt: str) -> str:
         """Query Codex for text-only code review tasks."""
         return self._run_codex(prompt, sandbox=False, agent_suffix="review")

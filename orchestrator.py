@@ -2138,6 +2138,14 @@ def _run_task(
                 log_info("Updated plan with your instructions.")
             _agents_dict = build_agents_dict(claude, codex, kiro)
             impl_fallback = get_fallback_agent("claude", _agents_dict)
+            impl_fallbacks = []
+            _cursor = "claude"
+            while True:
+                _next_fb = get_fallback_agent(_cursor, _agents_dict)
+                if _next_fb is None or _next_fb in impl_fallbacks:
+                    break
+                impl_fallbacks.append(_next_fb)
+                _cursor = _next_fb.name
             impl = None
             try:
                 impl = _run_phase("Implementation",
@@ -2150,7 +2158,8 @@ def _run_task(
                     work_dir=work_dir,
                     max_workers=cfg.get("max_impl_workers", 5),
                     skills_context=skills_manifest.developer,
-                    fallback_agent=impl_fallback)
+                    fallback_agent=impl_fallback,
+                    fallback_agents=impl_fallbacks)
             except TimeoutSkipToReview:
                 log_info("Skipping to review phase (user request after timeout).")
                 skip_to_review = True

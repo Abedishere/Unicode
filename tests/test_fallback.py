@@ -21,6 +21,11 @@ def test_claude_falls_back_to_codex() -> None:
     assert get_fallback_agent("claude", agents) is agents["codex"]
 
 
+def test_decorated_claude_name_falls_back_to_codex() -> None:
+    agents = build_agents_dict(_mock("Claude"), _mock("Codex"), _mock("Kiro"))
+    assert get_fallback_agent("Claude (dev:sonnet)", agents) is agents["codex"]
+
+
 def test_codex_falls_back_to_kiro() -> None:
     agents = build_agents_dict(_mock("Claude"), _mock("Codex"), _mock("Kiro"))
     assert get_fallback_agent("codex", agents) is agents["kiro"]

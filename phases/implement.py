@@ -584,6 +584,7 @@ def _implement_file_by_file(
     max_workers: int = 5,
     skills_context: str = "",
     fallback_agent=None,
+    fallback_agents: list | None = None,
     _status: dict | None = None,
     _outputs: dict | None = None,
 ) -> str:
@@ -597,12 +598,13 @@ def _implement_file_by_file(
     A Rich Live table shows per-file status.  Kiro memory synthesis runs
     sequentially after all files complete.
 
-    *fallback_agent* is used when the primary agent (*claude*) hits its usage
-    limit.  *_status* and *_outputs* allow recursive calls to share the same
-    tracking dicts so the parent can see the final state of all files.
+    *fallback_agent* / *fallback_agents* are used when the primary agent hits
+    its usage limit.  *_status* and *_outputs* allow recursive calls to share
+    the same tracking dicts so the parent can see the final state of all files.
     """
     total = len(structured_plan.files)
     repo_map_tokens = 2000  # same default as orchestrator
+    fallback_chain = list(fallback_agents or ([] if fallback_agent is None else [fallback_agent]))
 
     shared_deps = (
         "<shared_dependencies>\n"
@@ -636,6 +638,7 @@ def _implement_file_by_file(
     _lock = threading.Lock()
     update_event = threading.Event()
     stop_event = threading.Event()
+    limit_event = threading.Event()
 
     # Work queue: workers pop the next file atomically, regenerating the
     # repo_map at that moment so completed files are already on disk.
@@ -644,7 +647,7 @@ def _implement_file_by_file(
     def _dequeue_with_skeleton() -> tuple | None:
         """Pop the next file and snapshot the current repo_map under the lock."""
         with _lock:
-            if not _queue:
+            if limit_event.is_set() or not _queue:
                 return None
             spec = _queue.pop(0)
             current_map = (
@@ -683,6 +686,13 @@ def _implement_file_by_file(
     # Tracks which agent names hit their usage limit during parallel execution.
     agent_limit_hit: set[str] = set()
 
+    def _call_implement(agent, prompt: str) -> str:
+        return (
+            agent.implement(prompt)
+            if hasattr(agent, "implement")
+            else agent.query(prompt)
+        )
+
     def _worker() -> None:
         """Each thread loops: dequeue → implement → repeat until queue empty."""
         while True:
@@ -709,7 +719,7 @@ def _implement_file_by_file(
                 # a different name/path than the plan specifies.
                 before = _snapshot_dir(work_dir) if work_dir else set()
 
-                out = claude.implement(prompt)
+                out = _call_implement(claude, prompt)
 
                 after = _snapshot_dir(work_dir) if work_dir else set()
                 new_files = after - before
@@ -729,6 +739,7 @@ def _implement_file_by_file(
                     status[file_spec.path] = "Limit"
                     outputs[file_spec.path] = ""
                     agent_limit_hit.add(e.agent_name.lower())
+                    limit_event.set()
                 update_event.set()
                 return  # Stop this worker — limited agent will fail every subsequent file too
             except Exception:
@@ -765,23 +776,25 @@ def _implement_file_by_file(
         s for s in structured_plan.files
         if status[s.path] in ("Pending", "Running", "Limit")
     ]
-    if needs_fallback and fallback_agent is not None:
+    if needs_fallback and fallback_chain:
+        next_fallback = fallback_chain[0]
+        remaining_fallbacks = fallback_chain[1:]
         console.print(
             f"[bold yellow]⚠ {claude.name} limit reached — "
-            f"switching to {fallback_agent.name} for {len(needs_fallback)} file(s)[/]"
+            f"switching to {next_fallback.name} for {len(needs_fallback)} file(s)[/]"
         )
-        log_info(f"Fallback: {fallback_agent.name} handling {len(needs_fallback)} file(s)")
+        log_info(f"Fallback: {next_fallback.name} handling {len(needs_fallback)} file(s)")
         from utils.plan_parser import StructuredPlan as _StructuredPlan
         fallback_plan = _StructuredPlan(
             shared_dependencies=structured_plan.shared_dependencies,
             files=needs_fallback,
         )
         _implement_file_by_file(
-            task, fallback_plan, fallback_agent,
+            task, fallback_plan, next_fallback,
             repo_map=repo_map, memory_context=memory_context,
             kiro=kiro, work_dir=work_dir, max_workers=max_workers,
             skills_context=skills_context,
-            fallback_agent=None,   # no double-chaining in recursive call
+            fallback_agents=remaining_fallbacks,
             _status=status,        # share the same dicts so caller sees results
             _outputs=outputs,
         )
@@ -791,8 +804,12 @@ def _implement_file_by_file(
     # the missing files in the first place.
     # If the primary agent is limited, use the fallback for retry too.
     retry_agent = (
-        fallback_agent
-        if fallback_agent is not None and (agent_limit_hit & {claude.name.lower()})
+        fallback_chain[0]
+        if fallback_chain
+        and any(
+            name == claude.name.lower() or name.startswith(f"{claude.name.lower()} ")
+            for name in agent_limit_hit
+        )
         else claude
     )
     missing = [s for s in structured_plan.files if status[s.path] in ("Missing", "Error")]
@@ -804,9 +821,7 @@ def _implement_file_by_file(
             prompt = _build_file_prompt(task, spec, skeleton, shared_deps, memory_context, contracts, skills_context)
             try:
                 before = _snapshot_dir(work_dir) if work_dir else set()
-                out = (retry_agent.implement(prompt)
-                       if hasattr(retry_agent, "implement")
-                       else retry_agent.query(prompt))
+                out = _call_implement(retry_agent, prompt)
                 after = _snapshot_dir(work_dir) if work_dir else set()
                 new_files = after - before
 
@@ -857,6 +872,7 @@ def run_implementation(
     max_workers: int = 5,
     skills_context: str = "",
     fallback_agent=None,
+    fallback_agents: list | None = None,
 ) -> str:
     """Have Claude Code implement the plan non-interactively.
 
@@ -877,6 +893,7 @@ def run_implementation(
     Returns a status string.
     """
     log_phase("Phase 3: Implementation")
+    fallback_chain = list(fallback_agents or ([] if fallback_agent is None else [fallback_agent]))
 
     # Write plan to disk as a safety net
     plan_dir = Path(claude.working_dir) / ".orchestrator"
@@ -896,7 +913,7 @@ def run_implementation(
             task, structured_plan, claude, repo_map, memory_context,
             kiro=kiro, work_dir=work_dir, max_workers=max_workers,
             skills_context=skills_context,
-            fallback_agent=fallback_agent,
+            fallback_agents=fallback_chain,
         )
 
     # Monolithic fallback
@@ -926,13 +943,21 @@ def run_implementation(
     try:
         result = claude.implement(implement_prompt)
     except UsageLimitReached as e:
-        if fallback_agent is not None:
-            console.print(f"[bold yellow]⚠ {e.agent_name} limit — switching to {fallback_agent.name}[/]")
-            log_info(f"Monolithic fallback: {fallback_agent.name} will implement.")
-            result = (fallback_agent.implement(implement_prompt)
-                      if hasattr(fallback_agent, "implement")
-                      else fallback_agent.query(implement_prompt))
-        else:
-            raise
+        result = None
+        last_error = e
+        for agent in fallback_chain:
+            console.print(f"[bold yellow]⚠ {last_error.agent_name} limit — switching to {agent.name}[/]")
+            log_info(f"Monolithic fallback: {agent.name} will implement.")
+            try:
+                result = (
+                    agent.implement(implement_prompt)
+                    if hasattr(agent, "implement")
+                    else agent.query(implement_prompt)
+                )
+                break
+            except UsageLimitReached as next_error:
+                last_error = next_error
+        if result is None:
+            raise last_error
     log_success("Claude Code finished implementation.")
     return result

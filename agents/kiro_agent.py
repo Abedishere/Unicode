@@ -12,7 +12,7 @@ from utils.runner import run_cli
 KIRO_ROLE_PROMPTS: dict[str, str] = {
     "research": (
         "You are Unicode's research architect. Return concise factual notes. "
-        "Prefer read-only tools and do not modify files."
+        "Use read, grep, and glob tools to inspect the codebase. Do not modify files."
     ),
     "skills-scout": (
         "You are Unicode's skills scout. Return only the JSON shape requested "
@@ -20,11 +20,15 @@ KIRO_ROLE_PROMPTS: dict[str, str] = {
     ),
     "init": (
         "You initialize project memory for Unicode. Return exactly the requested "
-        "structured content. Prefer read-only inspection."
+        "structured content. Use read, grep, and glob to inspect the codebase."
     ),
     "review-fallback": (
         "You are Unicode's fallback primary code reviewer. Review only the "
         "provided diff context and return the requested verdict format."
+    ),
+    "implement-fallback": (
+        "You are Unicode's last-resort implementation worker. Modify the "
+        "project files needed to satisfy the prompt. Keep changes focused."
     ),
     "summary": (
         "You summarize completed Unicode runs. Be concise and follow the caller's "
@@ -40,6 +44,20 @@ KIRO_ROLE_PROMPTS: dict[str, str] = {
     ),
 }
 
+# Tools available to each role. All roles get read/grep/glob for codebase access.
+# thinking gives the model extended reasoning for complex tasks.
+_ROLE_TOOLS: dict[str, list[str]] = {
+    "research":       ["read", "grep", "glob", "thinking", "knowledge"],
+    "skills-scout":   ["read", "grep", "glob"],
+    "init":           ["read", "grep", "glob", "thinking"],
+    "review-fallback": ["read", "thinking"],
+    "implement-fallback": ["read", "grep", "glob", "write", "edit", "bash", "thinking"],
+    "summary":        ["read"],
+    "memory":         ["read"],
+    "docs":           ["read"],
+}
+_DEFAULT_TOOLS = ["read"]
+
 
 def ensure_kiro_role_agents(working_dir: str, model: str | None) -> None:
     """Create/update local Kiro custom agents used by Unicode.
@@ -51,11 +69,15 @@ def ensure_kiro_role_agents(working_dir: str, model: str | None) -> None:
     agents_dir = Path(working_dir) / ".kiro" / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
     for role, prompt in KIRO_ROLE_PROMPTS.items():
+        role_tools = _ROLE_TOOLS.get(role, _DEFAULT_TOOLS)
         data = {
             "name": f"unicode-{role}",
             "description": f"Unicode orchestrator {role} role",
             "prompt": prompt,
-            "allowedTools": ["read"],
+            # "tools" controls which tools the agent has access to.
+            # "allowedTools" auto-approves them so --no-interactive doesn't block on prompts.
+            "tools": role_tools,
+            "allowedTools": role_tools,
         }
         if model:
             data["model"] = model
@@ -105,6 +127,7 @@ class KiroAgent(BaseAgent):
                 "kiro-cli",
                 "chat",
                 "--no-interactive",
+                "--trust-all-tools",
                 "--agent",
                 f"unicode-{role}",
                 instruction,
@@ -125,6 +148,9 @@ class KiroAgent(BaseAgent):
 
     def query(self, prompt: str) -> str:
         return self._query_with_role(prompt, self.role)
+
+    def implement(self, prompt: str) -> str:
+        return self._query_with_role(prompt, "implement-fallback")
 
     def review_query(self, prompt: str) -> str:
         return self._query_with_role(prompt, "review-fallback")

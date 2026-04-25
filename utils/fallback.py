@@ -15,6 +15,15 @@ if TYPE_CHECKING:
 FALLBACK_CHAIN: list[str] = ["claude", "codex", "kiro"]
 
 
+def _canonical_agent_name(agent_name: str) -> str:
+    """Map display names like ``Claude (dev:sonnet)`` to fallback keys."""
+    current_lower = agent_name.lower().strip()
+    for candidate in FALLBACK_CHAIN:
+        if current_lower == candidate or current_lower.startswith(f"{candidate} "):
+            return candidate
+    return current_lower
+
+
 def get_fallback_agent(
     current_agent_name: str,
     agents: dict[str, BaseAgent],
@@ -24,7 +33,7 @@ def get_fallback_agent(
     *agents* maps lowercase agent name to agent instance.
     Returns None if no fallback is available.
     """
-    current_lower = current_agent_name.lower()
+    current_lower = _canonical_agent_name(current_agent_name)
     try:
         idx = FALLBACK_CHAIN.index(current_lower)
     except ValueError:
