@@ -15,8 +15,8 @@
       "Bash(echo:*)",
       "Bash(CLAUDECODE= claude --help)",
       "WebFetch(domain:developers.openai.com)",
-      "Bash(cd /c/Users/user/ai-orchestrator && npx skills add https://github.com/vercel-labs/skills --skill find-skills 2>&1)",
-      "Bash(cd /c/Users/user/ai-orchestrator && npx skills add https://github.com/vercel-labs/skills --skill find-skills -y 2>&1)",
+      "Bash(cd /c/Users/PinkPanther/unicode && npx skills add https://github.com/vercel-labs/skills --skill find-skills 2>&1)",
+      "Bash(cd /c/Users/PinkPanther/unicode && npx skills add https://github.com/vercel-labs/skills --skill find-skills -y 2>&1)",
       "Bash(npx skills:*)",
       "Bash(echo no codex config:*)",
       "Bash(git checkout:*)",
@@ -33,8 +33,21 @@
       "Bash(duckduckgo-mcp-server:*)",
       "Bash(for f in ad48dd7333c3dcd81 a9961a1f162fd07f9 ada2a5abee513bc96)",
       "Bash(do echo \"=== $f ===\")",
-      "Read(//c/Users/PinkPanther/AppData/Local/Temp/claude/C--Users-PinkPanther-ai-orchestrator/tasks/**)",
-      "Bash(done)"
+      "Read(//c/Users/PinkPanther/AppData/Local/Temp/claude/C--Users-PinkPanther-unicode/tasks/**)",
+      "Bash(done)",
+      "Bash(ORCHESTRATOR_SIMULATE_LIMIT_AFTER=1 python \"C:/Users/PinkPanther/unicode/orchestrator.py\" --working-dir . --tier quick --auto --phase implement \"Create a single Python file called calculator.py with add, subtract, multiply, divide functions. Each takes two numbers and returns a result. Keep it simple — no classes needed.\")",
+      "Bash(ORCHESTRATOR_SIMULATE_LIMIT_AFTER=1 PYTHONIOENCODING=utf-8 python \"C:/Users/PinkPanther/unicode/orchestrator.py\" --working-dir . --tier quick --auto --phase implement \"Create a single Python file called calculator.py with add, subtract, multiply, divide functions. Each takes two numbers and returns a result. Keep it simple — no classes needed.\")",
+      "Bash(ruff check *)",
+      "Bash(sort -t% -k1 -n)",
+      "Bash(sort -t% -k1 -rn)",
+      "Bash(gh run *)",
+      "Bash(gh.exe run *)",
+      "Bash(\"C:/Program Files/GitHub CLI/gh.exe\" run list --limit 5)",
+      "Bash(winget list *)",
+      "Bash(where gh *)",
+      "Read(//c/Users/PinkPanther/AppData/Local/**)",
+      "Bash(where ruff *)",
+      "Bash(C:/Users/PinkPanther/AppData/Local/Programs/Python/Python313/Scripts/ruff.exe check *)"
     ]
   }
 }

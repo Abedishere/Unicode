@@ -37,7 +37,7 @@ except ImportError:
 console = Console()
 
 if TYPE_CHECKING:
-    from agents.qwen_agent import QwenAgent
+    from agents.kiro_agent import KiroAgent
     from utils.plan_parser import StructuredPlan
 
 
@@ -65,14 +65,14 @@ def _build_context_brief(discussion: list[dict[str, str]] | None) -> str:
 
 
 def _synthesize_file_memory(
-    qwen: QwenAgent,
+    kiro: KiroAgent,
     task: str,
     file_path: str,
     file_spec: str,
     claude_output: str,
     work_dir: str,
 ) -> list[str]:
-    """Ask Qwen to extract memory entries from a single file's implementation.
+    """Ask Kiro to extract memory entries from a single file's implementation.
 
     Runs after each Claude subagent completes a file. Writes any discovered
     conventions, patterns, or bugs to .orchestrator/ immediately so they are
@@ -102,7 +102,7 @@ def _synthesize_file_memory(
         "Return ONLY valid JSON, no markdown fences."
     )
     try:
-        raw = qwen.query(prompt)
+        raw = kiro.query(prompt)
         data = parse_json_response(raw)
     except Exception:
         return []
@@ -125,11 +125,11 @@ def _synthesize_file_memory(
 
 
 def _extract_contracts(
-    qwen: QwenAgent,
+    kiro: KiroAgent,
     task: str,
     structured_plan: StructuredPlan,
 ) -> str:
-    """Use Qwen to extract expected public interfaces from all CREATE files.
+    """Use Kiro to extract expected public interfaces from all CREATE files.
 
     Runs once before parallel workers start. Returns a compact contracts string
     listing function/class signatures for each file being created. Injected into
@@ -163,7 +163,7 @@ def _extract_contracts(
     )
 
     try:
-        result = qwen.query(prompt)
+        result = kiro.query(prompt)
         if result.strip():
             return (
                 "<sibling_contracts>\n"
@@ -176,7 +176,7 @@ def _extract_contracts(
     return ""
 
 
-# ── Parallel Qwen memory synthesis ───────────────────────────────────────────
+# ── Parallel Kiro memory synthesis ───────────────────────────────────────────
 
 _MEMORY_AGENT_CONFIGS: list[dict] = [
     {
@@ -275,7 +275,7 @@ def _read_memory_skeleton(work_dir: str) -> str:
 
 
 def _run_memory_agent(
-    qwen,
+    kiro,
     cfg: dict,
     task: str,
     impls_block: str,
@@ -303,7 +303,7 @@ def _run_memory_agent(
         f"- Return empty [] or {{}} if nothing new to add to {cfg['filename']}"
     )
 
-    raw = qwen.query(prompt)
+    raw = kiro.query(prompt)
     data = parse_json_response(raw)
 
     if cfg["name"] == "bugs":
@@ -352,12 +352,12 @@ def _run_memory_agent(
 
 
 def _synthesize_memory_parallel(
-    qwen,
+    kiro,
     task: str,
     completed_files: list[tuple[str, str, str]],
     work_dir: str,
 ) -> None:
-    """Update all 5 memory files using 5 parallel Qwen agents.
+    """Update all 5 memory files using 5 parallel Kiro agents.
 
     Each agent specializes in one file:
         bugs.md / decisions.md / key_facts.md / issues.md / memory.yaml
@@ -379,7 +379,7 @@ def _synthesize_memory_parallel(
     # Snapshot memory once — all agents get the same baseline context
     skeleton = _read_memory_skeleton(work_dir)
 
-    qwen._quiet = True
+    kiro._quiet = True
     agent_status: dict[str, str] = {cfg["name"]: "Pending" for cfg in _MEMORY_AGENT_CONFIGS}
     _lock = threading.Lock()
     _colors = {"Pending": "dim", "Running": "yellow", "Done": "green", "Error": "red"}
@@ -413,7 +413,7 @@ def _synthesize_memory_parallel(
             agent_status[cfg["name"]] = "Running"
         update_event.set()
         try:
-            _run_memory_agent(qwen, cfg, task, impls_block, skeleton, work_dir)
+            _run_memory_agent(kiro, cfg, task, impls_block, skeleton, work_dir)
             with _lock:
                 agent_status[cfg["name"]] = "Done"
         except Exception as exc:
@@ -422,7 +422,7 @@ def _synthesize_memory_parallel(
                 agent_status[cfg["name"]] = "Error"
         update_event.set()
 
-    console.print("[bold cyan]▶  Running 5 parallel Qwen memory agents ...[/]")
+    console.print("[bold cyan]▶  Running 5 parallel Kiro memory agents ...[/]")
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=5)
     try:
         futures = [pool.submit(_agent_worker, cfg) for cfg in _MEMORY_AGENT_CONFIGS]
@@ -440,7 +440,7 @@ def _synthesize_memory_parallel(
             live.refresh()
     finally:
         pool.shutdown(wait=False)
-        qwen._quiet = False
+        kiro._quiet = False
 
     done_n = sum(1 for s in agent_status.values() if s == "Done")
     log_success(f"Memory synthesis complete — {done_n}/5 agents succeeded.")
@@ -579,7 +579,7 @@ def _implement_file_by_file(
     claude: ClaudeAgent,
     repo_map: str = "",
     memory_context: str = "",
-    qwen: QwenAgent | None = None,
+    kiro: KiroAgent | None = None,
     work_dir: str = "",
     max_workers: int = 5,
     skills_context: str = "",
@@ -594,7 +594,7 @@ def _implement_file_by_file(
     already on disk, so later workers see their real function signatures —
     no separate contracts pass needed.
 
-    A Rich Live table shows per-file status.  Qwen memory synthesis runs
+    A Rich Live table shows per-file status.  Kiro memory synthesis runs
     sequentially after all files complete.
 
     *fallback_agent* is used when the primary agent (*claude*) hits its usage
@@ -614,16 +614,16 @@ def _implement_file_by_file(
     # Extract cross-file interface contracts so parallel workers know what
     # sibling files will expose (prevents referencing non-existent functions).
     contracts = ""
-    if qwen is not None and total > 1:
-        log_info("Extracting cross-file contracts via Qwen ...")
-        contracts = _extract_contracts(qwen, task, structured_plan)
+    if kiro is not None and total > 1:
+        log_info("Extracting cross-file contracts via Kiro ...")
+        contracts = _extract_contracts(kiro, task, structured_plan)
         if contracts:
             log_info("Contracts extracted — injecting into worker prompts.")
 
     # Suppress individual Live spinners — the progress table handles display.
     claude._quiet = True
-    if qwen is not None:
-        qwen._quiet = True
+    if kiro is not None:
+        kiro._quiet = True
 
     _colors = {
         "Pending": "dim", "Running": "yellow",
@@ -756,8 +756,8 @@ def _implement_file_by_file(
     finally:
         pool.shutdown(wait=False)
         claude._quiet = False
-        if qwen is not None:
-            qwen._quiet = False
+        if kiro is not None:
+            kiro._quiet = False
 
     # If the primary agent hit its usage limit, hand unfinished files to the
     # fallback agent before sequential retry.
@@ -779,7 +779,7 @@ def _implement_file_by_file(
         _implement_file_by_file(
             task, fallback_plan, fallback_agent,
             repo_map=repo_map, memory_context=memory_context,
-            qwen=qwen, work_dir=work_dir, max_workers=max_workers,
+            kiro=kiro, work_dir=work_dir, max_workers=max_workers,
             skills_context=skills_context,
             fallback_agent=None,   # no double-chaining in recursive call
             _status=status,        # share the same dicts so caller sees results
@@ -836,10 +836,10 @@ def _implement_file_by_file(
             log_info(f"  {spec.path} — {state.lower()}")
             results.append(f"[{spec.path}] {state.lower()}")
 
-    # Parallel Qwen memory synthesis — 5 agents, one per memory file.
+    # Parallel Kiro memory synthesis — 5 agents, one per memory file.
     # Replaces the old sequential _synthesize_file_memory loop.
-    if qwen and work_dir and completed_for_memory:
-        _synthesize_memory_parallel(qwen, task, completed_for_memory, work_dir)
+    if kiro and work_dir and completed_for_memory:
+        _synthesize_memory_parallel(kiro, task, completed_for_memory, work_dir)
 
     return f"File-by-file implementation complete ({total} files):\n" + "\n".join(results)
 
@@ -852,7 +852,7 @@ def run_implementation(
     memory_context: str = "",
     repo_map: str = "",
     structured_plan: StructuredPlan | None = None,
-    qwen: QwenAgent | None = None,
+    kiro: KiroAgent | None = None,
     work_dir: str = "",
     max_workers: int = 5,
     skills_context: str = "",
@@ -894,7 +894,7 @@ def run_implementation(
         log_info(f"Using file-by-file generation ({len(structured_plan.files)} files)")
         return _implement_file_by_file(
             task, structured_plan, claude, repo_map, memory_context,
-            qwen=qwen, work_dir=work_dir, max_workers=max_workers,
+            kiro=kiro, work_dir=work_dir, max_workers=max_workers,
             skills_context=skills_context,
             fallback_agent=fallback_agent,
         )

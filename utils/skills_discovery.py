@@ -22,7 +22,7 @@ _GLOBAL_SKILLS_DIRS: list[Path] = [
     Path.home() / ".agents" / "skills",
     Path.home() / ".claude" / "skills",
     Path.home() / ".codex" / "skills",
-    Path.home() / ".qwen" / "skills",
+    Path.home() / ".kiro" / "skills",
 ]
 
 # Cap individual SKILL.md content to keep prompts reasonable

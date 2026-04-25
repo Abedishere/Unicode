@@ -69,7 +69,7 @@ def test_stdin_passthrough(tmp_path: Path) -> None:
     )
     stdout, _ = run_cli(
         cmd,
-        agent_name="Qwen",
+        agent_name="Kiro",
         timeout=30,
         input_text="hello orchestrator",
         quiet=True,

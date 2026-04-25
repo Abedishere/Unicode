@@ -85,28 +85,28 @@ def test_format_skills_block_no_at_sign() -> None:
 
 # ── run_skills_scout ──────────────────────────────────────────────────────────
 
-def _stub_qwen(response: str) -> MagicMock:
-    q = MagicMock()
-    q.query.return_value = response
-    return q
+def _stub_kiro(response: str) -> MagicMock:
+    agent = MagicMock()
+    agent.query.return_value = response
+    return agent
 
 
-def test_run_skills_scout_qwen_exception_returns_empty() -> None:
-    qwen = MagicMock()
-    qwen.query.side_effect = RuntimeError("Qwen down")
-    result = run_skills_scout("build a todo app", qwen)
+def test_run_skills_scout_kiro_exception_returns_empty() -> None:
+    kiro = MagicMock()
+    kiro.query.side_effect = RuntimeError("Kiro down")
+    result = run_skills_scout("build a todo app", kiro)
     assert result.is_empty()
 
 
 def test_run_skills_scout_invalid_json_returns_empty() -> None:
-    qwen = _stub_qwen("this is not json at all")
-    result = run_skills_scout("build a todo app", qwen)
+    kiro = _stub_kiro("this is not json at all")
+    result = run_skills_scout("build a todo app", kiro)
     assert result.is_empty()
 
 
 def test_run_skills_scout_empty_json_returns_empty() -> None:
-    qwen = _stub_qwen("{}")
-    result = run_skills_scout("build a todo app", qwen)
+    kiro = _stub_kiro("{}")
+    result = run_skills_scout("build a todo app", kiro)
     assert result.is_empty()
 
 
@@ -118,9 +118,9 @@ def test_run_skills_scout_valid_json_no_results() -> None:
         "developer": ["q5", "q6"],
         "reviewer": ["q7", "q8"],
     }
-    qwen = _stub_qwen(json.dumps(queries))
+    kiro = _stub_kiro(json.dumps(queries))
     with patch("phases.skills_scout.search_skills", return_value=[]):
-        result = run_skills_scout("task", qwen)
+        result = run_skills_scout("task", kiro)
     assert result.is_empty()
 
 
@@ -132,7 +132,7 @@ def test_run_skills_scout_installs_and_populates_manifest() -> None:
         "developer": ["python testing"],
         "reviewer": ["linting tools"],
     }
-    qwen = _stub_qwen(json.dumps(queries))
+    kiro = _stub_kiro(json.dumps(queries))
 
     with (
         patch("phases.skills_scout.search_skills", return_value=["cool-skill@1.0"]),
@@ -141,7 +141,7 @@ def test_run_skills_scout_installs_and_populates_manifest() -> None:
             return_value={"cool-skill@1.0": "# Cool Skill\nDo stuff."},
         ),
     ):
-        result = run_skills_scout("build todo", qwen)
+        result = run_skills_scout("build todo", kiro)
 
     # At least one role should have content
     assert not result.is_empty()
@@ -155,7 +155,7 @@ def test_run_skills_scout_deduplicates_packages() -> None:
         "developer": ["q3"],
         "reviewer": ["q4"],
     }
-    qwen = _stub_qwen(json.dumps(queries))
+    kiro = _stub_kiro(json.dumps(queries))
 
     assigned_packages: list[list] = []
 
@@ -167,7 +167,7 @@ def test_run_skills_scout_deduplicates_packages() -> None:
         patch("phases.skills_scout.search_skills", return_value=["shared-pkg@1.0"]),
         patch("phases.skills_scout.discover_and_install", side_effect=fake_install),
     ):
-        run_skills_scout("task", qwen)
+        run_skills_scout("task", kiro)
 
     # shared-pkg should appear in at most one role's install call
     all_pkgs = [p for batch in assigned_packages for p in batch]

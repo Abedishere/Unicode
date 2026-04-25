@@ -8,7 +8,7 @@ from phases.review import (
     _determine_verdict,
     _extract_file_diff,
     _handle_full_diff_request,
-    _qwen_primary_review,
+    _kiro_primary_review,
     _summarize_diff,
 )
 
@@ -246,50 +246,50 @@ def test_handle_full_diff_text_only_preamble_included() -> None:
     assert "TEXT-ONLY TASK" in received[0]
 
 
-# ── _qwen_primary_review ──────────────────────────────────────────────────────
+# ── _kiro_primary_review ──────────────────────────────────────────────────────
 
-def test_qwen_primary_review_approved() -> None:
-    qwen = MagicMock()
-    qwen.review_query.return_value = "APPROVED\nAll good."
+def test_kiro_primary_review_approved() -> None:
+    kiro = MagicMock()
+    kiro.review_query.return_value = "APPROVED\nAll good."
     with (
         patch("phases.review.log_agent"),
         patch("phases.review.log_info"),
         patch("phases.review.console"),
     ):
-        review, approved = _qwen_primary_review(
-            qwen, diff="", task="build auth", plan="create auth.py", iteration=1, max_iterations=2
+        review, approved = _kiro_primary_review(
+            kiro, diff="", task="build auth", plan="create auth.py", iteration=1, max_iterations=2
         )
     assert approved is True
     assert "APPROVED" in review
 
 
-def test_qwen_primary_review_changes_requested() -> None:
-    qwen = MagicMock()
-    qwen.review_query.return_value = "CHANGES_REQUESTED\n1. Missing validation."
+def test_kiro_primary_review_changes_requested() -> None:
+    kiro = MagicMock()
+    kiro.review_query.return_value = "CHANGES_REQUESTED\n1. Missing validation."
     with (
         patch("phases.review.log_agent"),
         patch("phases.review.log_info"),
         patch("phases.review.console"),
     ):
-        review, approved = _qwen_primary_review(
-            qwen, diff="", task="build auth", plan="create auth.py", iteration=1, max_iterations=2
+        review, approved = _kiro_primary_review(
+            kiro, diff="", task="build auth", plan="create auth.py", iteration=1, max_iterations=2
         )
     assert approved is False
     assert "CHANGES_REQUESTED" in review
 
 
-def test_qwen_primary_review_uses_provided_diff_summary() -> None:
+def test_kiro_primary_review_uses_provided_diff_summary() -> None:
     """If diff_summary is provided, _summarize_diff should not be called."""
-    qwen = MagicMock()
-    qwen.review_query.return_value = "APPROVED"
+    kiro = MagicMock()
+    kiro.review_query.return_value = "APPROVED"
     with (
         patch("phases.review.log_agent"),
         patch("phases.review.log_info"),
         patch("phases.review.console"),
         patch("phases.review._summarize_diff") as mock_summarize,
     ):
-        _qwen_primary_review(
-            qwen,
+        _kiro_primary_review(
+            kiro,
             diff="some diff",
             task="task",
             plan="plan",

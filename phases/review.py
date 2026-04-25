@@ -237,7 +237,7 @@ def _codex_primary_review(
         console.print("[bold green]✓  Codex review received.[/]")
         log_agent("Codex (Review Part 1)", review)
     except UsageLimitReached:
-        raise  # propagate to run_review to trigger Qwen fallback
+        raise  # propagate to run_review to trigger Kiro fallback
     except RuntimeError as exc:
         log_error(f"Codex review failed: {exc}")
         choice = click.prompt(
@@ -265,10 +265,10 @@ def _codex_primary_review(
     return review, approved
 
 
-# ── Qwen fallback primary review ─────────────────────────────────────────────
+# ── Kiro fallback primary review ─────────────────────────────────────────────
 
-def _qwen_primary_review(
-    qwen,
+def _kiro_primary_review(
+    kiro,
     diff: str,
     task: str,
     plan: str,
@@ -280,7 +280,7 @@ def _qwen_primary_review(
     """Fallback primary reviewer when Codex hits its usage limit.
 
     Uses the same review prompt structure as Codex but without the
-    NO-TOOLS preamble (Qwen doesn't execute shell commands in query mode).
+    NO-TOOLS preamble (Kiro runs in a constrained custom agent role).
     Returns (review_text, is_approved).
     """
     diff_summary = diff_summary or _summarize_diff(diff)
@@ -305,14 +305,14 @@ def _qwen_primary_review(
         "</output_format>"
     )
 
-    console.print("[bold green]▶  Qwen is reviewing the diff (Codex fallback) ...[/]")
-    review = qwen.review_query(prompt)
-    console.print("[bold green]✓  Qwen review received.[/]")
-    log_agent("Qwen (Review Part 1 fallback)", review)
+    console.print("[bold green]▶  Kiro is reviewing the diff (Codex fallback) ...[/]")
+    review = kiro.review_query(prompt)
+    console.print("[bold green]✓  Kiro review received.[/]")
+    log_agent("Kiro (Review Part 1 fallback)", review)
 
     approved = _determine_verdict(review)
     if approved and not _CHANGES_PAT.search(review) and not _APPROVED_PAT.search(review) and not _LOOKS_GOOD.search(review):
-        log_info("Qwen did not request changes — treating as approved.")
+        log_info("Kiro did not request changes — treating as approved.")
     return review, approved
 
 
@@ -365,7 +365,7 @@ def _claude_secondary_review(
     except (RuntimeError, UsageLimitReached) as exc:
         log_error(f"Claude secondary review unavailable: {exc} — using Codex review as-is.")
         if isinstance(exc, UsageLimitReached):
-            log_info("Accepting Codex/Qwen primary review as final (Claude limit hit).")
+            log_info("Accepting Codex/Kiro primary review as final (Claude limit hit).")
         return codex_review, True  # fall back to trusting the primary reviewer's findings
 
     # Handle NEED_FULL_DIFF requests
@@ -389,7 +389,7 @@ def run_review(
     working_dir: str,
     max_iterations: int,
     skills_context: str = "",
-    qwen=None,
+    kiro=None,
 ) -> tuple[bool, str]:
     """Two-phase code review loop.
 
@@ -452,7 +452,7 @@ def run_review(
         # ── Pre-compute diff summary (shared by both review parts) ──────
         diff_summary = _summarize_diff(diff)
 
-        # ── Review Part 1: Codex primary review (Qwen fallback if Codex is limited) ──
+        # ── Review Part 1: Codex primary review (Kiro fallback if Codex is limited) ──
         log_phase(
             f"Review Part 1 — Codex primary review "
             f"(cycle {iteration}/{max_iterations})"
@@ -464,12 +464,12 @@ def run_review(
                 skills_context=skills_context,
             )
         except UsageLimitReached as e:
-            if qwen is None:
+            if kiro is None:
                 raise
-            console.print(f"[bold yellow]⚠ {e.agent_name} limit — Qwen will review instead[/]")
-            log_info(f"Codex usage limit hit — switching to Qwen as primary reviewer (cycle {iteration})")
-            codex_review, approved = _qwen_primary_review(
-                qwen, diff, task, plan, iteration, max_iterations,
+            console.print(f"[bold yellow]⚠ {e.agent_name} limit — Kiro will review instead[/]")
+            log_info(f"Codex usage limit hit — switching to Kiro as primary reviewer (cycle {iteration})")
+            codex_review, approved = _kiro_primary_review(
+                kiro, diff, task, plan, iteration, max_iterations,
                 diff_summary=diff_summary,
                 skills_context=skills_context,
             )

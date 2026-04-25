@@ -13,7 +13,7 @@ console = Console()
 AGENT_STYLES = {
     "Claude": "bold cyan",
     "Codex": "bold green",
-    "Qwen": "bold magenta",
+    "Kiro": "bold magenta",
     "User": "bold white",
     "System": "bold yellow",
 }

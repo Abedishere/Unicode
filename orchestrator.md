@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-AI Orchestrator (`unicode` CLI) is a multi-agent automation pipeline that coordinates three AI coding agents — Claude Code, Codex CLI, and Qwen Coder — to complete software engineering tasks end-to-end. A user describes a task; the orchestrator runs it through five sequential phases (clarify → discuss → plan → implement → review), with built-in approval gates, iterative code review, persistent memory across sessions, and automatic git integration. The result is a tested, reviewed, committed implementation with no manual intervention required beyond the initial task description.
+AI Orchestrator (`unicode` CLI) is a multi-agent automation pipeline that coordinates three AI coding agents — Claude Code, Codex CLI, and Kiro — to complete software engineering tasks end-to-end. A user describes a task; the orchestrator runs it through five sequential phases (clarify → discuss → plan → implement → review), with built-in approval gates, iterative code review, persistent memory across sessions, and automatic git integration. The result is a tested, reviewed, committed implementation with no manual intervention required beyond the initial task description.
 
 ---
 
@@ -15,17 +15,17 @@ User Task
 Phase 0: Clarify     — Claude asks 1-3 clarifying questions (optional, skipped in auto mode)
     │
     ▼
-Phase 0.5: Research  — Codex (×2) + Qwen research in parallel (3 workers):
+Phase 0.5: Research  — Codex (×2) + Kiro research in parallel (3 workers):
     │                     Codex-A: similar products & libraries
     │                     Codex-B: technical patterns & pitfalls
-    │                     Qwen:    architectural patterns (web search if key set)
+    │                     Kiro:    architectural patterns (web search if key set)
     │                   Claude synthesizes the 3 findings into one brief,
     │                   which is prepended to the task prompt for all later phases
     ▼
 Phase 1: Discuss     — Claude + Codex debate approach (N rounds per tier)
     │
     ▼
-Phase 2: Plan        — Qwen synthesizes discussion into an implementation plan
+Phase 2: Plan        — Kiro synthesizes discussion into an implementation plan
     │                   Plan written to .orchestrator/plan.md and shown for approval
     ▼
 Phase 3: Implement   — Claude Code implements the plan against the working directory
@@ -41,7 +41,7 @@ Finalization         — Commit, push (optional), update CLAUDE.md / AGENTS.md /
 ```
 
 **Key design principles:**
-- Role separation: Qwen plans, Claude implements and reviews, Codex reviews and implements minor fixes
+- Role separation: Kiro plans/researches/synthesizes, Claude implements and reviews, Codex reviews and implements minor fixes
 - Every approval gate is interactive (or auto-approved in `--auto` mode)
 - Agents communicate via prompt construction — no direct API calls between agents
 - Persistent state survives between sessions via `.orchestrator/` (all memory, notes, history, and YAML index live there)
@@ -51,7 +51,7 @@ Finalization         — Commit, push (optional), update CLAUDE.md / AGENTS.md /
 ## Folder Structure
 
 ```
-ai-orchestrator/
+unicode/
 ├── orchestrator.py          Entry point. CLI definition (Click), phase orchestration,
 │                            finalization, banner, session management, config loading.
 ├── config.yaml              Default config: models, timeouts, discussion rounds, tiers.
@@ -62,13 +62,13 @@ ai-orchestrator/
 │   ├── base.py              BaseAgent ABC: query(), implement(), review_query()
 │   ├── claude_agent.py      Wraps `claude` CLI. Supports sdk/cli modes, streaming output.
 │   ├── codex_agent.py       Wraps `codex` CLI. exec mode for implementation, text mode for review.
-│   └── qwen_agent.py        Wraps `qwen` / Qwen Coder CLI for planning and synthesis.
+│   └── kiro_agent.py        Wraps `kiro-cli` for research, planning, memory, and fallback review.
 │
 ├── phases/                  One module per pipeline phase
 │   ├── clarify.py           Phase 0: Claude asks clarifying questions before planning.
 │   ├── research.py          Phase 0.5: Codex searches for similar apps / patterns (implicit).
 │   ├── discuss.py           Phase 1: Multi-round Claude ↔ Codex discussion loop.
-│   ├── plan.py              Phase 2: Qwen consolidates discussion into structured plan.
+│   ├── plan.py              Phase 2: Kiro consolidates discussion into structured plan.
 │   ├── implement.py         Phase 3: Claude implements the plan, handles timeout/cancel.
 │   └── review.py            Phase 4: Two-pass review (Codex primary, Claude secondary).
 │
@@ -77,7 +77,7 @@ ai-orchestrator/
 │   ├── git_utils.py         git add/diff/commit/push helpers. Windows-safe (junction points).
 │   ├── history.py           Run history (.orchestrator/history.md), CLAUDE.md / AGENTS.md synthesis.
 │   ├── logger.py            Structured terminal logging (Rich). Transcript file writer.
-│   ├── init_project.py      /init command: scans codebase, Qwen fills all memory files.
+│   ├── init_project.py      /init command: scans codebase, Kiro fills all memory files.
 │   ├── memory.py            Dual-write memory system (YAML index + markdown notes).
 │   ├── runner.py            Subprocess runner with timeout, streaming, cancel support.
 │   └── session.py           Session save/resume (.orchestrator/sessions/).
@@ -88,7 +88,7 @@ ai-orchestrator/
 │   ├── plan.md              Most recent implementation plan.
 │   ├── bugs.md              Bug log: date, issue, root cause, solution, prevention.
 │   ├── decisions.md         Architectural Decision Records (ADR-001, ADR-002, ...).
-│   ├── key_facts.md         Project config, ports, URLs, conventions — filled by Qwen /init.
+│   ├── key_facts.md         Project config, ports, URLs, conventions — filled by Kiro /init.
 │   ├── issues.md            Work log: completed tasks with outcomes.
 │   ├── sessions/            Saved session checkpoints (JSON).
 │   └── transcript_*.log     Full conversation transcripts per run.
@@ -98,7 +98,7 @@ ai-orchestrator/
 │   └── project-memory/      Memory skill: structured note-taking format reference.
 │
 ├── .claude/skills/          Claude Code skills (symlinks → .agents/skills/)
-├── .qwen/skills/            Qwen skills (symlinks → .agents/skills/)
+├── .kiro/agents/            Kiro custom agent configs (per-role prompts and model selection)
 │
 ├── CLAUDE.md                Claude Code context file — read on every startup.
 └── AGENTS.md                Codex/generic agent context file — read on every startup.
@@ -115,7 +115,7 @@ ai-orchestrator/
 | Terminal UI | Rich 13.x |
 | Config / Memory | PyYAML 6.x |
 | Process mgmt | psutil 5.x |
-| AI agents | Claude Code CLI, Codex CLI, Qwen Coder CLI |
+| AI agents | Claude Code CLI, Codex CLI, Kiro CLI |
 | Skills | npx skills (Vercel Labs convention) |
 | VCS | git (via subprocess) |
 
@@ -128,13 +128,13 @@ The orchestrator integrates with the `npx skills` ecosystem so that agents can d
 ### find-skills
 - **Source:** `npx skills add https://github.com/vercel-labs/skills --skill find-skills`
 - **Purpose:** Meta-skill — agents can run `npx skills find [query]` to search the registry and install new skills when they encounter a task that needs specialized knowledge.
-- **Installed at:** `.agents/skills/find-skills`, `.claude/skills/find-skills`, `.qwen/skills/find-skills`
+- **Installed at:** `.agents/skills/find-skills`, `.claude/skills/find-skills`
 - **Global (Codex):** `~/.agents/skills/find-skills`, `~/.codex/skills/find-skills`
 
 ### project-memory
 - **Source:** `npx skills add https://github.com/spillwavesolutions/project-memory --skill project-memory`
-- **Purpose:** Defines the structured format for memory entries. All notes now live in `.orchestrator/` (bugs.md, decisions.md, key_facts.md, issues.md). Qwen populates them on `/init`; the orchestrator appends automatically at finalization.
-- **Installed at:** `.agents/skills/project-memory`, `.claude/skills/project-memory`, `.qwen/skills/project-memory`
+- **Purpose:** Defines the structured format for memory entries. All notes now live in `.orchestrator/` (bugs.md, decisions.md, key_facts.md, issues.md). Kiro populates them on `/init`; the orchestrator appends automatically at finalization.
+- **Installed at:** `.agents/skills/project-memory`, `.claude/skills/project-memory`
 - **Global (Codex):** `~/.agents/skills/project-memory`, `~/.codex/skills/project-memory`
 - **Orchestrator integration:** `utils/memory.py` implements all four note types (`log_bug`, `log_decision`, `log_issue`, `log_key_fact`) following the exact skill format. Notes are written automatically at finalization.
 
@@ -150,7 +150,7 @@ Two complementary stores run in parallel and are both written at the end of ever
 - Keyword-searched to find relevant past tasks and surface them in future prompts
 
 **Markdown notes** (`.orchestrator/`) — same directory as the YAML index
-- Human-readable; Qwen fills them on first run via `/init`, orchestrator appends on every task
+- Human-readable; Kiro fills them on first run via `/init`, orchestrator appends on every task
 - `.orchestrator/bugs.md` — structured bug log with root causes and prevention notes
 - `.orchestrator/decisions.md` — ADRs with context, decision, alternatives, consequences
 - `.orchestrator/key_facts.md` — project config, credentials, ports, important URLs

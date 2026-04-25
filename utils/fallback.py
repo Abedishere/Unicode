@@ -3,7 +3,7 @@
 When an agent hits its usage/rate limit, the orchestrator uses this module
 to find the next available agent in the chain and hand off remaining work.
 
-Chain order (most capable → last resort): Claude → Codex → Qwen
+Chain order (most capable → last resort): Claude → Codex → Kiro
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from agents.base import BaseAgent
 
-FALLBACK_CHAIN: list[str] = ["claude", "codex", "qwen"]
+FALLBACK_CHAIN: list[str] = ["claude", "codex", "kiro"]
 
 
 def get_fallback_agent(
@@ -36,13 +36,13 @@ def get_fallback_agent(
     return None
 
 
-def build_agents_dict(claude, codex, qwen) -> dict[str, BaseAgent]:
+def build_agents_dict(claude, codex, kiro) -> dict[str, BaseAgent]:
     """Build the standard agents dict used by get_fallback_agent."""
     result: dict[str, BaseAgent] = {}
     if claude is not None:
         result["claude"] = claude
     if codex is not None:
         result["codex"] = codex
-    if qwen is not None:
-        result["qwen"] = qwen
+    if kiro is not None:
+        result["kiro"] = kiro
     return result

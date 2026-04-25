@@ -174,8 +174,8 @@ def test_write_orchestrator_md_content(tmp_path: Path) -> None:
 
 def test_write_orchestrator_md_exception_skipped(tmp_path: Path) -> None:
     agent = MagicMock()
-    agent.name = "Qwen"
-    agent.query.side_effect = RuntimeError("Qwen unavailable")
+    agent.name = "Kiro"
+    agent.query.side_effect = RuntimeError("Kiro unavailable")
     # Should not raise — exception is logged and skipped
     write_orchestrator_md(str(tmp_path), "task", "plan", [], agent)
     assert not (tmp_path / "orchestrator.md").exists()

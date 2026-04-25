@@ -53,6 +53,9 @@ class BaseAgent(ABC):
     @staticmethod
     def check_cli_output(stdout: str, stderr: str, agent_name: str) -> str:
         """Validate CLI output — raise on empty stdout with stderr present."""
+        from utils.runner import UsageLimitReached, _is_usage_limit
+        if _is_usage_limit(stdout, stderr):
+            raise UsageLimitReached(agent_name, (stdout + stderr)[-300:])
         if not stdout.strip() and stderr.strip():
             raise RuntimeError(f"{agent_name} CLI failed: {stderr}")
         return stdout.strip()

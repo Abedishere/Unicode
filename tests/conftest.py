@@ -1,4 +1,4 @@
-"""Shared fixtures and stub agents for the ai-orchestrator test suite."""
+"""Shared fixtures and stub agents for the unicode orchestrator test suite."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -7,7 +7,7 @@ from typing import Generator
 import pytest
 
 from agents.base import BaseAgent
-from agents.qwen_agent import QwenAgent
+from agents.kiro_agent import KiroAgent
 from utils.runner import UsageLimitReached
 
 
@@ -99,11 +99,11 @@ class StubCodexAgent(_ScriptedMixin, BaseAgent):
         return "Codex fallback: implemented successfully."
 
 
-class StubQwenAgent(_ScriptedMixin, QwenAgent):
-    """Scripted stub for QwenAgent (research + memory synthesis roles)."""
+class StubKiroAgent(_ScriptedMixin, KiroAgent):
+    """Scripted stub for KiroAgent (research + memory synthesis roles)."""
 
     def __init__(self, responses: list[str], work_dir: str):
-        QwenAgent.__init__(self, model="stub", timeout=30, working_dir=work_dir)
+        KiroAgent.__init__(self, model="stub", timeout=30, working_dir=work_dir)
         self._init_scripted(responses)
 
     def query(self, prompt: str) -> str:
@@ -140,7 +140,7 @@ CODEX_RESPONSES = [
     "Updated.",
 ]
 
-QWEN_RESPONSES = [
+KIRO_RESPONSES = [
     "Architectural pattern: simple utility modules.",
     "Created calc.py with add(a, b).",
     "{}",
@@ -161,11 +161,11 @@ def work_dir(tmp_path: Path) -> Generator[str, None, None]:
 
 @pytest.fixture
 def stub_agents(work_dir: str):
-    """Return (claude, codex, qwen) stub agents wired to work_dir."""
+    """Return (claude, codex, kiro) stub agents wired to work_dir."""
     claude = StubClaudeAgent(CLAUDE_RESPONSES[:], work_dir)
     codex = StubCodexAgent(CODEX_RESPONSES[:], work_dir)
-    qwen = StubQwenAgent(QWEN_RESPONSES[:], work_dir)
-    return claude, codex, qwen
+    kiro = StubKiroAgent(KIRO_RESPONSES[:], work_dir)
+    return claude, codex, kiro
 
 
 @pytest.fixture
@@ -178,9 +178,12 @@ def base_cfg() -> dict:
         "allow_user_questions": False,
         # Models (stubs — no real CLI calls needed)
         "claude_model": "stub",
+        "claude_effort": "medium",
         "dev_model": "stub",
+        "dev_effort": "medium",
         "codex_model": "stub",
-        "qwen_model": "stub",
+        "codex_reasoning_effort": "medium",
+        "kiro_model": "stub",
         # Timeouts
         "timeout_seconds": 30,
         "codex_timeout_seconds": 60,
@@ -199,10 +202,10 @@ def base_cfg() -> dict:
 
 @pytest.fixture
 def patch_internal_agents():
-    """Patch ClaudeAgent/QwenAgent constructors in orchestrator to return stubs.
+    """Patch ClaudeAgent/KiroAgent constructors in orchestrator to return stubs.
 
-    The research phase creates its own synthesizer (ClaudeAgent) and qwen_scout
-    (QwenAgent) internally.  This fixture replaces those with MagicMocks so no
+    The research phase creates its own synthesizer (ClaudeAgent) and kiro_scout
+    (KiroAgent) internally.  This fixture replaces those with MagicMocks so no
     real CLI calls are made during integration tests.
     """
     from unittest.mock import MagicMock, patch
@@ -216,6 +219,11 @@ def patch_internal_agents():
 
     with (
         patch("orchestrator.ClaudeAgent", side_effect=_factory),
-        patch("orchestrator.QwenAgent", side_effect=_factory),
+        patch("orchestrator.KiroAgent", side_effect=_factory),
     ):
         yield
+
+
+# Backwards-compatible aliases for older tests/imports during the migration.
+StubQwenAgent = StubKiroAgent
+QWEN_RESPONSES = KIRO_RESPONSES

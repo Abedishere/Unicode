@@ -1,9 +1,9 @@
-"""Phase 0.5b: Skills Scout — dedicated Qwen agent that finds skills for every pipeline role.
+"""Phase 0.5b: Skills Scout — dedicated Kiro agent that finds skills for every pipeline role.
 
 Runs in parallel with Phase 0.5 (Research) inside _run_task.
 
 Workflow:
-  1. Qwen Scout generates 2 search queries per pipeline role
+  1. Kiro Scout generates 2 search queries per pipeline role
      (researcher · planner · developer · reviewer).
   2. For each role, runs `npx skills find` for each query.
   3. Installs the top matching skills globally (-g -y).
@@ -92,31 +92,31 @@ def _format_skills_block(skills: dict[str, str]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def run_skills_scout(task: str, qwen: BaseAgent) -> SkillsManifest:
+def run_skills_scout(task: str, kiro: BaseAgent) -> SkillsManifest:
     """Run the Skills Scout and return a populated SkillsManifest.
 
     Non-fatal: any failure at any step returns whatever was collected so far
-    (or an empty manifest if Qwen's query itself fails).
+    (or an empty manifest if Kiro's query itself fails).
     """
     log_phase("Phase 0.5b: Skills Scout")
-    log_info("Qwen (Skills Scout) generating role-specific skill queries …")
+    log_info("Kiro (Skills Scout) generating role-specific skill queries …")
 
-    # ── Step 1: Ask Qwen for role-specific search queries ─────────────────────
+    # ── Step 1: Ask Kiro for role-specific search queries ─────────────────────
     try:
-        raw = qwen.query(_SCOUT_PROMPT.format(task=task[:600]))
+        raw = kiro.query(_SCOUT_PROMPT.format(task=task[:600]))
     except Exception as exc:
         log_info(f"Skills Scout query failed (non-fatal): {exc}")
         return SkillsManifest()
 
-    # Strip markdown fences if Qwen wrapped its JSON
+    # Strip markdown fences if Kiro wrapped its JSON
     cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
     try:
         queries: dict[str, list[str]] = json.loads(cleaned)
     except Exception:
-        log_info("Skills Scout could not parse Qwen response — skipping.")
+        log_info("Skills Scout could not parse Kiro response — skipping.")
         return SkillsManifest()
 
-    log_agent("Skills Scout (Qwen)", raw)
+    log_agent("Skills Scout (Kiro)", raw)
 
     # ── Step 2: Search, install, and read for each role ───────────────────────
     manifest = SkillsManifest()

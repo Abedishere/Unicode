@@ -18,10 +18,19 @@ class ClaudeAgent(BaseAgent):
     used for implementation tasks.
     """
 
-    def __init__(self, model: str, timeout: int, working_dir: str,
-                 dev_model: str | None = None):
+    def __init__(
+        self,
+        model: str,
+        timeout: int,
+        working_dir: str,
+        dev_model: str | None = None,
+        effort: str | None = None,
+        dev_effort: str | None = None,
+    ):
         super().__init__(model=model, timeout=timeout, working_dir=working_dir)
         self.dev_model = dev_model or model
+        self.effort = effort
+        self.dev_effort = dev_effort or effort
 
     @property
     def name(self) -> str:
@@ -31,6 +40,8 @@ class ClaudeAgent(BaseAgent):
         """Query Claude in admin/read-only mode. No file access."""
         self._maybe_audit(prompt)
         cmd = ["claude", "-p", "--output-format", "text", "--model", self.model]
+        if self.effort:
+            cmd += ["--effort", self.effort]
         stdout, stderr = run_cli(
             cmd,
             agent_name=self.name,
@@ -53,6 +64,8 @@ class ClaudeAgent(BaseAgent):
             "--model", self.dev_model,
             "--dangerously-skip-permissions",
         ]
+        if self.dev_effort:
+            cmd += ["--effort", self.dev_effort]
         agent_name = f"{self.name} (dev:{self.dev_model})"
         stdout, stderr = run_cli(
             cmd,
@@ -77,6 +90,8 @@ class ClaudeAgent(BaseAgent):
             "--dangerously-skip-permissions",
             "Read .orchestrator/plan.md and implement the plan exactly.",
         ]
+        if self.dev_effort:
+            cmd[3:3] = ["--effort", self.dev_effort]
         return run_interactive(
             cmd,
             agent_name=f"{self.name} (dev:{self.dev_model})",

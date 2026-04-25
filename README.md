@@ -4,7 +4,7 @@
 
 # Unicode — AI Agent Orchestrator
 
-Multi-agent orchestrator that coordinates **Claude Code**, **Codex CLI**, and **Qwen CLI** to collaboratively plan, implement, and review code — with persistent memory, structured project notes, and an extensible skills ecosystem.
+Multi-agent orchestrator that coordinates **Claude Code**, **Codex CLI**, and **Kiro** to collaboratively plan, implement, and review code — with persistent memory, structured project notes, and an extensible skills ecosystem.
 
 ## How it works
 
@@ -14,7 +14,7 @@ Phase 1: Discuss      — Claude + Codex debate the approach (N rounds per tier)
                           · Repo skeleton map injected for structural context
                           · Sliding window keeps only last 2 exchanges verbatim;
                             older rounds compressed to ~150-char summaries
-Phase 2: Plan         — Qwen synthesizes discussion into a structured plan
+Phase 2: Plan         — Kiro synthesizes discussion into a structured plan
                           · Outputs per-file specs (CREATE|MODIFY) with shared
                             dependencies section
 Phase 3: Implement    — Claude implements the plan with full file access
@@ -35,7 +35,7 @@ Finalization          — Commit, update context files, write to shared memory
 **Agent roles:**
 - **Claude** — discussion, implementation, secondary review, context file synthesis
 - **Codex** — discussion, primary code review, minor fixes
-- **Qwen** — plan synthesis, `orchestrator.md` documentation
+- **Kiro** — research, plan synthesis, memory, summaries, fallback review, `orchestrator.md` documentation
 
 ## Prerequisites
 
@@ -45,11 +45,11 @@ You need these CLI tools installed and available on your PATH:
 |---|---|
 | **Claude Code** | `npm install -g @anthropic-ai/claude-code` |
 | **Codex CLI** | `npm install -g @openai/codex` |
-| **Qwen CLI** | `npm install -g @anthropic-ai/qwen` |
+| **Kiro CLI** | Install from [kiro.dev](https://kiro.dev) and run `kiro-cli login` |
 | **Python** | 3.10+ |
 | **Node.js** | 18+ (for `npx skills`) |
 
-Make sure `claude`, `codex`, and `qwen` all work from your terminal before proceeding.
+Make sure `claude`, `codex`, and `kiro-cli` all work from your terminal before proceeding.
 
 ## Install
 
@@ -143,7 +143,7 @@ discussion_rounds: 4
 max_review_iterations: 3
 claude_model: "opus"
 codex_model: "gpt-5.3-codex"
-qwen_model: "qwen3-coder"
+kiro_model: "haiku"
 dev_model: "sonnet"
 timeout_seconds: 600
 codex_timeout_seconds: 300
@@ -202,7 +202,7 @@ Defines a structured format for persistent project notes in `.orchestrator/`. Th
 npx skills add https://github.com/spillwavesolutions/project-memory --skill project-memory -g
 ```
 
-Skills are installed to `.agents/skills/` (universal) and symlinked into `.claude/skills/`, `.qwen/skills/`, and `~/.codex/skills/` so every agent picks them up natively.
+Skills are installed to `.agents/skills/` (universal) and symlinked into `.claude/skills/` and `~/.codex/skills/` so every agent picks them up natively.
 
 ## Persistent Memory
 
@@ -228,7 +228,7 @@ Relevant entries from both stores are automatically surfaced in agent prompts fo
 |---|---|---|
 | `CLAUDE.md` | Codex (synthesized) | Project context for Claude Code CLI |
 | `AGENTS.md` | Codex (synthesized) | Project context for Codex CLI |
-| `orchestrator.md` | Qwen | Full project summary, architecture, folder structure |
+| `orchestrator.md` | Kiro | Full project summary, architecture, folder structure |
 | `.orchestrator/bugs.md` | Orchestrator | Structured bug log |
 | `.orchestrator/decisions.md` | Orchestrator | Architectural Decision Records |
 | `.orchestrator/key_facts.md` | Orchestrator | Project config and key facts |

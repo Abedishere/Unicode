@@ -7,10 +7,10 @@ from pathlib import Path
 import utils.approval as _approval
 import orchestrator as _orch
 from tests.conftest import (
-    QWEN_RESPONSES,
+    KIRO_RESPONSES,
     StubClaudeAgent,
     StubCodexAgent,
-    StubQwenAgent,
+    StubKiroAgent,
 )
 from utils.memory import load_memory
 
@@ -26,7 +26,7 @@ def _patch_approval(orig):
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _run(task, cfg, work_dir, claude, codex, qwen, phase="all"):
+def _run(task, cfg, work_dir, claude, codex, kiro, phase="all"):
     orig = _approval.request_approval
     _approval.set_auto_all(True)
     _approval.request_approval = _patch_approval(orig)
@@ -38,7 +38,7 @@ def _run(task, cfg, work_dir, claude, codex, qwen, phase="all"):
             work_dir=work_dir,
             claude=claude,
             codex=codex,
-            qwen=qwen,
+            kiro=kiro,
             phase=phase,
             tier="standard",
         )
@@ -78,9 +78,9 @@ None
         ],
         work_dir,
     )
-    qwen = StubQwenAgent(QWEN_RESPONSES[:], work_dir)
+    kiro = StubKiroAgent(KIRO_RESPONSES[:], work_dir)
 
-    _run("Create calc.py with add(a, b)", base_cfg, work_dir, claude, codex, qwen)
+    _run("Create calc.py with add(a, b)", base_cfg, work_dir, claude, codex, kiro)
 
     orch_dir = Path(work_dir) / ".orchestrator"
     for fname in ("memory.yaml", "bugs.md", "decisions.md", "key_facts.md", "issues.md"):
@@ -104,9 +104,9 @@ None
     codex = StubCodexAgent(
         ["Tip.", "Tip.", "AGREED", _PLAN, "commit msg", "Updated."], work_dir
     )
-    qwen = StubQwenAgent(QWEN_RESPONSES[:], work_dir)
+    kiro = StubKiroAgent(KIRO_RESPONSES[:], work_dir)
 
-    _run("Create calc.py", base_cfg, work_dir, claude, codex, qwen)
+    _run("Create calc.py", base_cfg, work_dir, claude, codex, kiro)
 
     mem = load_memory(work_dir)
     assert isinstance(mem, dict)
@@ -135,10 +135,10 @@ None
         ["Tip.", "Tip.", "AGREED", _PLAN, "commit", "Updated."],
         work_dir,
     )
-    qwen = StubQwenAgent(QWEN_RESPONSES[:], work_dir)
+    kiro = StubKiroAgent(KIRO_RESPONSES[:], work_dir)
 
     cfg = {**base_cfg, "discussion_rounds": 1}
-    _run("Create output.py", cfg, work_dir, claude, codex, qwen, phase="implement")
+    _run("Create output.py", cfg, work_dir, claude, codex, kiro, phase="implement")
 
     assert (Path(work_dir) / "output.py").exists()
 
@@ -160,8 +160,8 @@ None
     codex = StubCodexAgent(
         ["Tip.", "Tip.", "AGREED", _PLAN, "add noop", "Updated."], work_dir
     )
-    qwen = StubQwenAgent(QWEN_RESPONSES[:], work_dir)
+    kiro = StubKiroAgent(KIRO_RESPONSES[:], work_dir)
 
     # If a gate blocks, this will hang and pytest will time out the test
-    _run("Create noop.py", base_cfg, work_dir, claude, codex, qwen)
+    _run("Create noop.py", base_cfg, work_dir, claude, codex, kiro)
     assert True  # reached without hanging

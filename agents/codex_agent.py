@@ -34,6 +34,10 @@ def read_codex_config() -> dict:
 
 def _read_output(output_path: str, stdout: str, stderr: str) -> str:
     """Read Codex output from the temp file, falling back to stdout."""
+    from utils.runner import UsageLimitReached, _is_usage_limit
+    if _is_usage_limit(stdout, stderr):
+        raise UsageLimitReached("Codex", (stdout + stderr)[-300:])
+
     try:
         with open(output_path, "r", encoding="utf-8") as f:
             result = f.read().strip()
@@ -60,6 +64,16 @@ class CodexAgent(BaseAgent):
     def name(self) -> str:
         return "Codex"
 
+    def __init__(
+        self,
+        model: str | None,
+        timeout: int,
+        working_dir: str,
+        reasoning_effort: str | None = None,
+    ):
+        super().__init__(model=model, timeout=timeout, working_dir=working_dir)
+        self.reasoning_effort = reasoning_effort
+
     def _run_codex(self, prompt: str, *, sandbox: bool, agent_suffix: str = "") -> str:
         """Common codex exec invocation.
 
@@ -80,6 +94,8 @@ class CodexAgent(BaseAgent):
             cmd = ["codex", "exec"]
             if self.model:
                 cmd += ["--model", self.model]
+            if self.reasoning_effort:
+                cmd += ["-c", f'model_reasoning_effort="{self.reasoning_effort}"']
             cmd += ["--full-auto"]
             if sandbox:
                 cmd += ["--sandbox", "read-only"]

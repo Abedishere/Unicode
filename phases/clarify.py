@@ -44,7 +44,7 @@ def _collect_input() -> str:
 
 
 def run_interpreter(task: str, interpreter: BaseAgent) -> str:
-    """Chat with the user via the interpreter (Qwen) to refine the task.
+    """Chat with the user via the interpreter to refine the task.
 
     Returns a clean task brief string.
     """

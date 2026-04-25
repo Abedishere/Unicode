@@ -1,9 +1,9 @@
-"""Phase 0.5: Research — 2 Codex + 1 Qwen in parallel, synthesizer distills.
+"""Phase 0.5: Research — 2 Codex + 1 Kiro in parallel, synthesizer distills.
 
 Workflow:
   1. Codex-A  — researches similar products, open-source projects, and libraries.
   2. Codex-B  — researches technical implementation approaches and pitfalls.
-  3. Qwen     — researches architectural patterns via DuckDuckGo MCP (unlimited, no key).
+  3. Kiro     — researches architectural patterns.
   4. Synthesizer (Haiku by default) — reads all three, distills every key finding
                into a single compact brief that is prepended to the task prompt.
                It summarizes — it does not choose, recommend, or advise.
@@ -20,7 +20,7 @@ from rich.table import Table
 from rich.text import Text
 
 from agents.base import BaseAgent
-from agents.qwen_agent import QwenAgent
+from agents.kiro_agent import KiroAgent
 from utils.logger import console, log_agent, log_info, log_phase
 
 
@@ -57,7 +57,7 @@ Write informal technical notes — bullets are fine. No preamble. Just the facts
 </rules>
 """
 
-_QWEN_PROMPT = """\
+_KIRO_PROMPT = """\
 <role>You are a senior architect and code-quality researcher. You have a web search tool.</role>
 
 <task>{task}</task>
@@ -99,8 +99,8 @@ It should read like a factual briefing, not a set of instructions.
 ━━━ CODEX (technical patterns) ━━━
 {codex_b}
 
-━━━ QWEN (architecture, web-searched) ━━━
-{qwen}
+━━━ KIRO (architecture) ━━━
+{kiro}
 </context>
 
 <output_format>
@@ -122,7 +122,7 @@ No preamble, no conclusion, no advice.
 
 def _query(agent: BaseAgent, prompt: str, *, web_search: bool = False) -> str:
     try:
-        if web_search and isinstance(agent, QwenAgent):
+        if web_search and isinstance(agent, KiroAgent):
             result = agent.research_query(prompt)
         else:
             result = agent.query(prompt)
@@ -137,7 +137,7 @@ def _query(agent: BaseAgent, prompt: str, *, web_search: bool = False) -> str:
 def run_research(
     task: str,
     codex: BaseAgent,
-    qwen: BaseAgent,
+    kiro: BaseAgent,
     synthesizer: BaseAgent,
     wall_seconds: int | None = None,
 ) -> str:
@@ -145,29 +145,29 @@ def run_research(
 
     Agents:
       - Codex ×2 in parallel (two different research angles)
-      - Qwen   ×1 in parallel (web search via DuckDuckGo MCP, no API key)
+      - Kiro   ×1 in parallel
       - synthesizer ×1 sequential (distills all findings — Haiku recommended)
 
     wall_seconds: hard deadline for the parallel phase. Agents that finish
     within the window contribute; stragglers are cancelled so the pipeline
-    doesn't stall (e.g. if Qwen web search hangs). None means no timeout.
+    doesn't stall (e.g. if Kiro research hangs). None means no timeout.
 
     Returns the enriched task string (original task + research context).
     Returns the original task unchanged if all agents fail or find nothing.
     """
     log_phase("Phase 0.5: Research")
-    console.print("[dim]Codex (×2) and Qwen are researching in parallel …[/]")
+    console.print("[dim]Codex (×2) and Kiro are researching in parallel …[/]")
     console.print()
 
     codex_a_prompt = _CODEX_A_PROMPT.format(task=task)
     codex_b_prompt = _CODEX_B_PROMPT.format(task=task)
-    qwen_prompt    = _QWEN_PROMPT.format(task=task)
+    kiro_prompt    = _KIRO_PROMPT.format(task=task)
 
     # ── 1. Parallel research with hard wall-clock deadline ────────────────────
     status = {
         "codex_a": {"state": "Pending", "snippet": ""},
         "codex_b": {"state": "Pending", "snippet": ""},
-        "qwen":    {"state": "Pending", "snippet": ""},
+        "kiro":    {"state": "Pending", "snippet": ""},
     }
     _lock = threading.Lock()
 
@@ -183,7 +183,7 @@ def run_research(
         for key, label in [
             ("codex_a", "Codex (products & libraries)"),
             ("codex_b", "Codex (technical patterns)"),
-            ("qwen",    "Qwen  (architecture + web)"),
+            ("kiro",    "Kiro  (architecture)"),
         ]:
             s = st[key]
             c = _colors.get(s["state"], "white")
@@ -216,7 +216,7 @@ def run_research(
     # Suppress run_cli's own Live display while our research table is active.
     # Workers share the same agent objects; both codex workers want quiet=True.
     codex._quiet = True
-    qwen._quiet = True
+    kiro._quiet = True
 
     done: set = set()
     pending: set = set()
@@ -224,14 +224,14 @@ def run_research(
     try:
         f_a = pool.submit(_worker, codex, codex_a_prompt, "codex_a")
         f_b = pool.submit(_worker, codex, codex_b_prompt, "codex_b")
-        f_q = pool.submit(_worker, qwen,  qwen_prompt,    "qwen", True)
+        f_k = pool.submit(_worker, kiro,  kiro_prompt,    "kiro", True)
 
         with Live(_make_research_table(status), auto_refresh=False, console=console) as live:
             refresh_thread = threading.Thread(target=_refresh, args=(live,), daemon=True)
             refresh_thread.start()
             try:
-                done, pending = concurrent.futures.wait([f_a, f_b, f_q], timeout=wall_seconds)
-                for key, fut in [("codex_a", f_a), ("codex_b", f_b), ("qwen", f_q)]:
+                done, pending = concurrent.futures.wait([f_a, f_b, f_k], timeout=wall_seconds)
+                for key, fut in [("codex_a", f_a), ("codex_b", f_b), ("kiro", f_k)]:
                     if fut in pending:
                         with _lock:
                             status[key]["state"] = "Timeout"
@@ -262,18 +262,18 @@ def run_research(
 
         codex_a = _get(f_a)
         codex_b = _get(f_b)
-        qwen_r  = _get(f_q)
+        kiro_r  = _get(f_k)
     finally:
         pool.shutdown(wait=False)
         codex._quiet = False
-        qwen._quiet = False
+        kiro._quiet = False
 
     # All per-agent result logging happens after the Live block exits
     log_agent("Codex (products & libraries)", codex_a or "(no findings)")
     log_agent("Codex (technical patterns)",   codex_b or "(no findings)")
-    log_agent("Qwen  (architecture + web)",   qwen_r  or "(no findings)")
+    log_agent("Kiro  (architecture)",   kiro_r  or "(no findings)")
 
-    if not any([codex_a, codex_b, qwen_r]):
+    if not any([codex_a, codex_b, kiro_r]):
         log_info("All research agents returned empty — skipping synthesis.")
         return task
 
@@ -283,7 +283,7 @@ def run_research(
         task=task,
         codex_a=codex_a or "(no findings)",
         codex_b=codex_b or "(no findings)",
-        qwen=qwen_r     or "(no findings)",
+        kiro=kiro_r     or "(no findings)",
     ))
 
     if not brief:

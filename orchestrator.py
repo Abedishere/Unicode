@@ -36,7 +36,7 @@ from rich.text import Text
 
 from agents.claude_agent import ClaudeAgent
 from agents.codex_agent import CodexAgent, read_codex_config
-from agents.qwen_agent import QwenAgent
+from agents.kiro_agent import KiroAgent, ensure_kiro_role_agents
 from phases.discuss import run_discussion
 from phases.implement import run_implementation
 from phases.plan import consolidate_plan
@@ -51,6 +51,12 @@ from utils.memory import (
     extract_keywords_from_task,
     get_context_for_task, init_project_notes, load_memory,
     log_bug, log_decision, log_issue, log_key_fact, parse_json_response, save_memory,
+)
+from utils.model_config import (
+    load_global_config,
+    migrate_model_keys,
+    run_first_run_wizard,
+    should_run_onboarding,
 )
 from utils.init_project import run_init
 from utils.fallback import build_agents_dict, get_fallback_agent
@@ -80,12 +86,12 @@ VERSION = "0.2.0"
 
 _MAX_SESSIONS_DISPLAYED = 15
 
-# 3-color gradient stops: orange (Claude) → teal (Codex) → purple (Qwen)
+# 3-color gradient stops: orange (Claude) → teal (Codex) → purple (Kiro)
 _C = "#E8915C"  # Claude orange/amber
 _X = "#50C8B4"  # Codex teal/blue-green
-_Q = "#7B68EE"  # Qwen purple/blue
+_Q = "#7B68EE"  # Kiro purple/blue
 
-# Box-drawing block letters (Qwen Code style)
+# Box-drawing block letters
 _art_lines = [
     "  ██╗          ▄▄    ▄▄ ▄▄▄    ▄▄ ▄▄  ▄▄▄▄▄▄   ▄▄▄▄▄▄  ▄▄▄▄▄▄  ▄▄▄▄▄▄▄ ",
     "    ██╗        ██║   ██║████╗  ██║██║██╔════╝ ██╔═══██╗██╔══██╗██╔════╝",
@@ -163,7 +169,10 @@ def _print_banner(cfg: dict, work_dir: str) -> None:
     info_lines.append("Unicode Orchestrator", style="bold white")
     info_lines.append(f" (v{VERSION})\n\n", style="dim")
     info_lines.append("  Claude ", style=f"bold {_C}")
-    info_lines.append(f"{cfg['claude_model']}", style="dim")
+    claude_display = cfg["claude_model"]
+    if cfg.get("claude_effort"):
+        claude_display += f" ({cfg['claude_effort']})"
+    info_lines.append(f"{claude_display}", style="dim")
     info_lines.append("  |  ", style="dim")
     codex_display = cfg["codex_model"]
     if not codex_display:
@@ -173,11 +182,15 @@ def _print_banner(cfg: dict, work_dir: str) -> None:
         if effort:
             codex_display += f" ({effort})"
     info_lines.append("Codex ", style=f"bold {_X}")
+    if cfg.get("codex_reasoning_effort") and "(" not in str(codex_display):
+        codex_display = f"{codex_display} ({cfg['codex_reasoning_effort']})"
     info_lines.append(f"{codex_display}", style="dim")
-    info_lines.append("\n  Qwen ", style=f"bold {_Q}")
-    info_lines.append(f"{cfg['qwen_model']}", style="dim")
+    info_lines.append("\n  Kiro ", style=f"bold {_Q}")
+    info_lines.append(f"{cfg['kiro_model']}", style="dim")
     info_lines.append("  |  ", style="dim")
     info_lines.append("Dev ", style=f"bold {_C}")
+    if cfg.get("dev_effort"):
+        dev_model += f" ({cfg['dev_effort']})"
     info_lines.append(f"{dev_model}", style="dim")
     info_lines.append(f"\n  {work_dir}", style="dim")
 
@@ -243,7 +256,7 @@ _DEFAULT_TIERS = {
         "discussion_rounds": 2,
     },
     "complex": {
-        "dev_model": "opus",
+        "dev_model": "sonnet",
         "max_review_iterations": 3,
         "discussion_rounds": 4,
     },
@@ -319,9 +332,12 @@ def load_config(config_path: str | None) -> dict:
         "discussion_rounds": 4,
         "max_review_iterations": 3,
         "claude_model": "opus",
-        "codex_model": None,  # None → use ~/.codex/config.toml
-        "qwen_model": "qwen3-coder",
+        "claude_effort": "medium",
+        "codex_model": "gpt-5.5",
+        "codex_reasoning_effort": "medium",
+        "kiro_model": "haiku",
         "dev_model": "sonnet",
+        "dev_effort": "medium",
         "timeout_seconds": 600,
         "codex_timeout_seconds": 300,
         "auto_commit": False,
@@ -337,15 +353,17 @@ def load_config(config_path: str | None) -> dict:
             resolved = candidate
         elif (PACKAGE_DIR / candidate.name).exists():
             resolved = PACKAGE_DIR / candidate.name
+    global_cfg = load_global_config()
+    defaults.update(global_cfg)
     if resolved:
         with open(resolved, "r", encoding="utf-8") as f:
             overrides = yaml.safe_load(f) or {}
         defaults.update(overrides)
-    return defaults
+    return migrate_model_keys(defaults)
 
 
 def _print_phase_banner(label: str, role: str, desc: str, color: str = "cyan") -> None:
-    """Print a colored phase banner panel (like Qwen Code's notice boxes)."""
+    """Print a colored phase banner panel."""
     content = Text()
     content.append("Talking to ", style="default")
     content.append(role, style=f"bold {color}")
@@ -1642,10 +1660,10 @@ _COMPACT_INSTRUCTIONS = {
 }
 
 
-def _compact_memory_files(qwen: QwenAgent, codex: CodexAgent, work_dir: str) -> None:
+def _compact_memory_files(kiro: KiroAgent, codex: CodexAgent, work_dir: str) -> None:
     """Distill oversized .orchestrator/ markdown files.
 
-    Tries Qwen first. If Qwen returns something larger than the original
+    Tries Kiro first. If Kiro returns something larger than the original
     (or fails), falls back to Codex. If both fail, the file is left as-is.
     issues.md is excluded — it is a chronological log, not a lookup store.
     """
@@ -1681,8 +1699,8 @@ def _compact_memory_files(qwen: QwenAgent, codex: CodexAgent, work_dir: str) -> 
         )
 
         compacted = None
-        # Priority-ordered fallback: Qwen first, Codex if Qwen returns a larger result
-        for agent_name, query_fn in [("Qwen", qwen.query), ("Codex", codex.query)]:
+        # Priority-ordered fallback: Kiro first, Codex if Kiro returns a larger result
+        for agent_name, query_fn in [("Kiro", kiro.query), ("Codex", codex.query)]:
             try:
                 result = query_fn(prompt).strip()
                 if result and len(result) < len(content):
@@ -1702,7 +1720,7 @@ def _compact_memory_files(qwen: QwenAgent, codex: CodexAgent, work_dir: str) -> 
 
 
 def _synthesize_memory(
-    qwen: QwenAgent,
+    kiro: KiroAgent,
     codex: CodexAgent,
     task: str,
     plan: str,
@@ -1710,7 +1728,7 @@ def _synthesize_memory(
     outcome: str,
     work_dir: str,
 ) -> None:
-    """Ask Qwen to extract real memory entries from the completed run and write them.
+    """Ask Kiro to extract real memory entries from the completed run and write them.
 
     Replaces the old mechanical raw-dump approach with actual synthesis.
     Writes to: memory.yaml, bugs.md, decisions.md, key_facts.md, issues.md.
@@ -1763,7 +1781,7 @@ def _synthesize_memory(
         "Return ONLY valid JSON, no markdown fences, nothing else."
     )
     try:
-        raw = qwen.query(prompt)
+        raw = kiro.query(prompt)
         data = parse_json_response(raw)
     except Exception:
         data = {}
@@ -1827,7 +1845,7 @@ def _synthesize_memory(
     log_info("Memory synthesized and saved to .orchestrator/")
 
     # Compact oversized markdown files so they never grow unboundedly
-    _compact_memory_files(qwen, codex, work_dir)
+    _compact_memory_files(kiro, codex, work_dir)
 
 
 def _run_task(
@@ -1836,7 +1854,7 @@ def _run_task(
     work_dir: str,
     claude: ClaudeAgent,
     codex: CodexAgent,
-    qwen: QwenAgent,
+    kiro: KiroAgent,
     phase: str = "all",
     tier: str = "standard",
     session: Session | None = None,
@@ -1869,13 +1887,13 @@ def _run_task(
 
     # Enable prompt audit logging for all agents
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    for agent in [claude, codex, qwen]:
+    for agent in [claude, codex, kiro]:
         agent.enable_audit(work_dir, run_id)
 
     def _set_phase(phase: str) -> None:
         """Set current phase on session and all agents in one call."""
         session.current_phase = phase
-        for _a in [claude, codex, qwen]:
+        for _a in [claude, codex, kiro]:
             _a.set_phase(phase)
 
     # Load shared memory context for this task (cached once, reused by all phases)
@@ -1923,15 +1941,15 @@ def _run_task(
     elif phase in ("all", "plan", "discuss"):
         if phase == "all":
             _print_phase_banner(
-                "Research", "Codex × 2 + Qwen",
-                "Codex (×2) · Qwen (web) research in parallel → Haiku synthesizes",
+                "Research", "Codex × 2 + Kiro",
+                "Codex (×2) · Kiro research in parallel → Haiku synthesizes",
                 "cyan",
             )
         _set_phase("research")
         save_session(work_dir, session)
         result, _ = request_approval(
             "research",
-            "Two Codex instances and Qwen (DuckDuckGo web search) will research the task in parallel. "
+            "Two Codex instances and Kiro will research the task in parallel. "
             "Haiku will distill their findings into background context prepended to the task prompt.",
         )
         if result == "proceed":
@@ -1940,24 +1958,26 @@ def _run_task(
                 model="claude-haiku-4-5-20251001",
                 timeout=cfg.get("timeout_seconds", 120),
                 working_dir=work_dir,
+                effort=cfg.get("claude_effort"),
             )
-            # Dedicated Qwen instance for skills scouting (runs in parallel with research)
-            qwen_scout = QwenAgent(
-                model=cfg["qwen_model"],
+            # Dedicated Kiro instance for skills scouting (runs in parallel with research)
+            kiro_scout = KiroAgent(
+                model=cfg["kiro_model"],
                 timeout=cfg.get("timeout_seconds", 120),
                 working_dir=work_dir,
+                role="skills-scout",
             )
-            qwen_scout.enable_audit(work_dir, run_id)
+            kiro_scout.enable_audit(work_dir, run_id)
 
             # Run research and skills scout in parallel
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _scout_pool:
                 _wall = cfg.get("research_wall_seconds", None)
                 _research_future = _scout_pool.submit(
-                    _run_phase, "Research", run_research, task, codex, qwen, synthesizer,
+                    _run_phase, "Research", run_research, task, codex, kiro, synthesizer,
                     wall_seconds=_wall,
                 )
                 _scout_future = _scout_pool.submit(
-                    _run_phase, "Skills Scout", run_skills_scout, task, qwen_scout
+                    _run_phase, "Skills Scout", run_skills_scout, task, kiro_scout
                 )
                 enriched = _research_future.result()
                 skills_manifest = _scout_future.result() or SkillsManifest()
@@ -1995,7 +2015,7 @@ def _run_task(
             if extra:
                 task = f"{task}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
                 log_info("Updated task with your instructions.")
-            _agents_dict = build_agents_dict(claude, codex, qwen)
+            _agents_dict = build_agents_dict(claude, codex, kiro)
             try:
                 disc_result = _run_phase("Discussion",
                     run_discussion, task, claude, codex, disc_rounds,
@@ -2037,7 +2057,7 @@ def _run_task(
             if extra:
                 task = f"{task}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
                 log_info("Updated task with your instructions.")
-            _agents_dict = build_agents_dict(claude, codex, qwen)
+            _agents_dict = build_agents_dict(claude, codex, kiro)
             try:
                 plan = _run_phase("Plan",
                     consolidate_plan, task, codex, work_dir, discussion,
@@ -2096,7 +2116,7 @@ def _run_task(
         log_info("Dry-run mode — stopping before implementation.")
         return
 
-    # ── Phase 3: Implementation (Claude as developer, with Qwen available) ──
+    # ── Phase 3: Implementation (Claude as developer, with Kiro available) ──
     run_impl = (
         phase in ("all", "implement")
         and not session.phase_done("implement")
@@ -2116,7 +2136,7 @@ def _run_task(
             if extra:
                 plan = f"{plan}\n\nADDITIONAL USER INSTRUCTIONS:\n{extra}"
                 log_info("Updated plan with your instructions.")
-            _agents_dict = build_agents_dict(claude, codex, qwen)
+            _agents_dict = build_agents_dict(claude, codex, kiro)
             impl_fallback = get_fallback_agent("claude", _agents_dict)
             impl = None
             try:
@@ -2126,7 +2146,7 @@ def _run_task(
                     memory_context=memory_context,
                     repo_map=repo_map,
                     structured_plan=structured_plan,
-                    qwen=qwen,
+                    kiro=kiro,
                     work_dir=work_dir,
                     max_workers=cfg.get("max_impl_workers", 5),
                     skills_context=skills_manifest.developer,
@@ -2135,12 +2155,12 @@ def _run_task(
                 log_info("Skipping to review phase (user request after timeout).")
                 skip_to_review = True
 
-            # Qwen writes orchestrator.md — non-fatal, isolated from implementation
-            # so a Qwen failure here never blocks Phase 4 (Review).
+            # Kiro writes orchestrator.md — non-fatal, isolated from implementation
+            # so a Kiro failure here never blocks Phase 4 (Review).
             if impl is not None:
                 try:
                     _run_phase("Writing orchestrator.md",
-                        write_orchestrator_md, work_dir, task, plan, discussion, qwen)
+                        write_orchestrator_md, work_dir, task, plan, discussion, kiro)
                 except Exception as exc:
                     log_info(f"Warning: orchestrator.md skipped — {exc}")
         else:
@@ -2170,7 +2190,7 @@ def _run_task(
             run_review, task, plan, claude, codex, work_dir,
             cfg["max_review_iterations"],
             skills_context=skills_manifest.reviewer,
-            qwen=qwen)
+            kiro=kiro)
         if rev is None:
             approved, review_text = True, ""
         elif isinstance(rev, tuple):
@@ -2221,8 +2241,8 @@ def _run_task(
             commit_msg = _run_phase("Commit message", codex.query, commit_prompt)
         except UsageLimitReached:
             try:
-                console.print("[bold yellow]⚠ Codex limit — Qwen will write commit message[/]")
-                commit_msg = _run_phase("Commit message", qwen.query, commit_prompt)
+                console.print("[bold yellow]⚠ Codex limit — Kiro will write commit message[/]")
+                commit_msg = _run_phase("Commit message", kiro.query, commit_prompt)
             except (UsageLimitReached, Exception):
                 commit_msg = ""
         if not commit_msg:
@@ -2245,7 +2265,7 @@ def _run_task(
     else:
         log_error("Implementation was NOT approved after all review iterations.")
 
-    # Record history (Qwen summarizes, not Claude)
+    # Record history (Kiro summarizes, not Claude)
     duration = time.time() - start_time
     summary_prompt = (
         f"<task>{task}</task>\n\n"
@@ -2254,8 +2274,8 @@ def _run_task(
         "List files created/modified as a bullet list. One line each. No commentary.\n"
         "</rules>"
     )
-    log_info("Qwen is summarizing actions ...")
-    actions_summary = _run_phase("Summary", qwen.query, summary_prompt)
+    log_info("Kiro is summarizing actions ...")
+    actions_summary = _run_phase("Summary", kiro.query, summary_prompt)
     if not actions_summary:
         actions_summary = "- Summary skipped"
 
@@ -2263,9 +2283,9 @@ def _run_task(
     append_history(work_dir, task, outcome, duration, actions_summary, transcript_name)
     log_info("Appended run to .orchestrator/history.md")
 
-    # ── Synthesize and save memory (Qwen extracts real entries) ──
-    log_info("Qwen is synthesizing memory entries ...")
-    _synthesize_memory(qwen, codex, task, plan, review_text, outcome, work_dir)
+    # ── Synthesize and save memory (Kiro extracts real entries) ──
+    log_info("Kiro is synthesizing memory entries ...")
+    _synthesize_memory(kiro, codex, task, plan, review_text, outcome, work_dir)
 
     # ── Verify memory was written ──
     _mem_after = load_memory(work_dir)
@@ -2332,6 +2352,9 @@ def main(
     signal.signal(signal.SIGINT, _sigint_handler)
 
     cfg = load_config(config_path)
+    if should_run_onboarding():
+        cfg.update(run_first_run_wizard(cfg))
+        cfg = migrate_model_keys(cfg)
 
     # CLI overrides
     if rounds is not None:
@@ -2451,6 +2474,7 @@ def main(
                     model="claude-haiku-4-5-20251001",
                     timeout=60,
                     working_dir=work_dir,
+                    effort=cfg.get("claude_effort"),
                 )
                 try:
                     log_info("Claude (haiku) is answering your question ...")
@@ -2468,10 +2492,12 @@ def main(
 
             # Handle /init — bootstrap all memory files from the existing codebase
             if isinstance(current_task, str) and current_task == "__INIT__":
-                init_agent = QwenAgent(
-                    model=cfg["qwen_model"],
+                ensure_kiro_role_agents(work_dir, cfg.get("kiro_model"))
+                init_agent = KiroAgent(
+                    model=cfg["kiro_model"],
                     timeout=cfg["timeout_seconds"],
                     working_dir=work_dir,
+                    role="init",
                 )
                 try:
                     run_init(work_dir, init_agent)
@@ -2509,19 +2535,24 @@ def main(
                 timeout=cfg["timeout_seconds"],
                 working_dir=work_dir,
                 dev_model=cfg.get("dev_model", cfg["claude_model"]),
+                effort=cfg.get("claude_effort"),
+                dev_effort=cfg.get("dev_effort", cfg.get("claude_effort")),
             )
             codex = CodexAgent(
                 model=cfg["codex_model"],
                 timeout=cfg["codex_timeout_seconds"],
                 working_dir=work_dir,
+                reasoning_effort=cfg.get("codex_reasoning_effort", "medium"),
             )
-            qwen = QwenAgent(
-                model=cfg["qwen_model"],
+            ensure_kiro_role_agents(work_dir, cfg.get("kiro_model"))
+            kiro = KiroAgent(
+                model=cfg["kiro_model"],
                 timeout=cfg["timeout_seconds"],
                 working_dir=work_dir,
+                role="memory",
             )
 
-            _run_task(current_task, cfg, work_dir, claude, codex, qwen, phase,
+            _run_task(current_task, cfg, work_dir, claude, codex, kiro, phase,
                       tier=selected_tier, session=current_session, dry_run=dry_run)
 
             # Reset auto-all after each task (unless set via CLI)

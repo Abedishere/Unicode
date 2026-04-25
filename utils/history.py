@@ -54,7 +54,7 @@ _MEMORY_PROTOCOL_SECTION = (
     "All persistent memory lives in `.orchestrator/`:\n"
     "- `bugs.md` · `decisions.md` · `key_facts.md` · `issues.md` · `memory.yaml`\n\n"
     "Check these before making architectural changes or debugging known issues.\n"
-    "Run `/init` to have Qwen populate them from the codebase if they are empty.\n\n"
+    "Run `/init` to have Kiro populate them from the codebase if they are empty.\n\n"
 )
 
 _CLAUDE_MD_HEADER = (
@@ -189,9 +189,9 @@ def write_orchestrator_md(
     task: str,
     plan: str,
     discussion: list[dict[str, str]],
-    qwen: BaseAgent,
+    kiro: BaseAgent,
 ) -> None:
-    """Have Qwen write orchestrator.md — a project summary with architecture,
+    """Have Kiro write orchestrator.md — a project summary with architecture,
     folder structure, and key information for anyone (human or AI) picking
     up the project.
     """
@@ -213,11 +213,11 @@ def write_orchestrator_md(
         "This file will be read by both humans and AI tools to understand the project."
     )
 
-    log_info("Qwen is writing orchestrator.md ...")
+    log_info("Kiro is writing orchestrator.md ...")
     try:
-        content = qwen.query(prompt)
+        content = kiro.query(prompt)
     except Exception as exc:
-        log_info(f"Warning: orchestrator.md skipped — Qwen unavailable: {exc}")
+        log_info(f"Warning: orchestrator.md skipped — Kiro unavailable: {exc}")
         return
 
     orch_md = work / "orchestrator.md"

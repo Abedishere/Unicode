@@ -1,18 +1,19 @@
 discussion_rounds: 4
 max_review_iterations: 3
 claude_model: "opus"
-codex_model: null  # null → reads from ~/.codex/config.toml automatically
-qwen_model: "coder-model"
+claude_effort: "medium"
+codex_model: "gpt-5.5"
+codex_reasoning_effort: "medium"
+kiro_model: "haiku"
 dev_model: "sonnet"
+dev_effort: "medium"
 timeout_seconds: 600
 codex_timeout_seconds: 300
 auto_commit: false
 working_directory: "."
 
 # Research phase settings
-research_wall_seconds: 90  # hard deadline for parallel research agents (seconds)
-                           # agents that finish within this window contribute;
-                           # stragglers are skipped so the pipeline doesn't stall
+research_wall_seconds: ~  # no time limit; agents run until they finish
 
 # Optimization settings
 repo_map_max_tokens: 2000
@@ -33,6 +34,6 @@ tiers:
     max_review_iterations: 2
     discussion_rounds: 2
   complex:
-    dev_model: "opus"
+    dev_model: "sonnet"
     max_review_iterations: 3
     discussion_rounds: 4

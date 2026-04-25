@@ -6,7 +6,7 @@ from pathlib import Path
 
 import utils.approval as _approval
 import orchestrator as _orch
-from tests.conftest import StubClaudeAgent, StubCodexAgent, StubQwenAgent
+from tests.conftest import StubClaudeAgent, StubCodexAgent, StubKiroAgent
 from utils.memory import load_memory
 
 _STRUCTURED_PLAN = """\
@@ -33,7 +33,7 @@ _CODEX_RESPONSES = [
     "Updated.",
 ]
 
-_QWEN_RESPONSES = [
+_KIRO_RESPONSES = [
     "Architectural pattern: simple utility modules.",
     "Created calc.py with add(a, b).",
     "{}",
@@ -54,7 +54,7 @@ def test_basic_implement_flow(
 
     claude = StubClaudeAgent(_CLAUDE_RESPONSES[:], work_dir)
     codex = StubCodexAgent(_CODEX_RESPONSES[:], work_dir)
-    qwen = StubQwenAgent(_QWEN_RESPONSES[:], work_dir)
+    kiro = StubKiroAgent(_KIRO_RESPONSES[:], work_dir)
 
     _approval.set_auto_all(True)
     _approval.request_approval = _patched_req
@@ -66,7 +66,7 @@ def test_basic_implement_flow(
             work_dir=work_dir,
             claude=claude,
             codex=codex,
-            qwen=qwen,
+            kiro=kiro,
             phase="all",
             tier="standard",
         )

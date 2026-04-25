@@ -67,7 +67,7 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
     On Windows with ``shell=True``, ``proc.terminate()`` only kills the
     ``cmd.exe`` wrapper, leaving the actual CLI process (claude, codex,
-    qwen) alive.  This helper uses *psutil* to find every descendant and
+    kiro-cli) alive.  This helper uses *psutil* to find every descendant and
     kill them all, then falls back to ``taskkill /T /F`` if needed.
     """
     try:
@@ -266,7 +266,7 @@ def run_cli(
     style = {
         "Claude": "cyan",
         "Codex": "green",
-        "Qwen": "magenta",
+        "Kiro": "magenta",
     }.get(agent_name.split(" ")[0], "white")
 
     # ── Live display loop ───────────────────────────────────────────
