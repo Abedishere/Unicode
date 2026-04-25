@@ -36,7 +36,6 @@ def migrate_model_keys(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg.setdefault("kiro_model", "haiku")
     cfg.setdefault("claude_effort", "medium")
     cfg.setdefault("dev_effort", "medium")
-    cfg.setdefault("codex_model", "gpt-5.5")
     cfg.setdefault("codex_reasoning_effort", "medium")
     return cfg
 
@@ -73,13 +72,21 @@ def _run_json_command(cmd: list[str], timeout: int = 20) -> Any:
         return result.stdout
 
 
+def _strip_model_description(raw: str) -> str:
+    """Keep only the model ID from strings like 'haiku — Fast model' or 'haiku: desc'."""
+    for sep in (" — ", " - ", ": ", "\t"):
+        if sep in raw:
+            return raw.split(sep, 1)[0].strip()
+    return raw.strip()
+
+
 def list_kiro_models() -> list[str]:
     data = _run_json_command(["kiro-cli", "chat", "--list-models", "--format", "json"])
     if isinstance(data, list):
         models = []
         for item in data:
             if isinstance(item, str):
-                models.append(item)
+                models.append(_strip_model_description(item))
             elif isinstance(item, dict):
                 value = item.get("id") or item.get("model") or item.get("name")
                 if value:
@@ -94,8 +101,25 @@ def list_kiro_models() -> list[str]:
                 if item
             ]
     if isinstance(data, str):
-        return [line.strip() for line in data.splitlines() if line.strip()]
+        return [_strip_model_description(line) for line in data.splitlines() if line.strip()]
     return []
+
+
+def _detect_codex_model() -> str | None:
+    """Read the model from ~/.codex/config.toml if set."""
+    config_path = Path.home() / ".codex" / "config.toml"
+    if not config_path.exists():
+        return None
+    try:
+        for line in config_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.lower().startswith("model"):
+                parts = line.split("=", 1)
+                if len(parts) == 2:
+                    return parts[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
 
 
 def _provider_status(command: str) -> str:
@@ -140,6 +164,12 @@ def run_first_run_wizard(defaults: dict[str, Any]) -> dict[str, Any]:
         click.echo("Kiro CLI was not found. Install/login later with `kiro-cli login`.")
 
     kiro_models = list_kiro_models() if shutil.which("kiro-cli") else []
+    codex_model = defaults.get("codex_model") or _detect_codex_model()
+    if codex_model:
+        click.echo(click.style(f"  → Codex: using {codex_model}", fg="yellow"))
+    else:
+        click.echo(click.style("  → Codex: using latest (no model set in ~/.codex/config.toml)", fg="yellow"))
+
     cfg = {
         "onboarding_complete": True,
         "claude_model": _prompt_model(
@@ -154,11 +184,6 @@ def run_first_run_wizard(defaults: dict[str, Any]) -> dict[str, Any]:
             ["sonnet", "opus"],
         ),
         "dev_effort": "medium",
-        "codex_model": _prompt_model(
-            "Codex model",
-            defaults.get("codex_model", "gpt-5.5"),
-            [str(defaults["codex_model"])] if defaults.get("codex_model") else [],
-        ),
         "codex_reasoning_effort": "medium",
         "kiro_model": _prompt_model(
             "Kiro model for research, init, memory, summaries, and fallback review",
@@ -166,6 +191,8 @@ def run_first_run_wizard(defaults: dict[str, Any]) -> dict[str, Any]:
             kiro_models,
         ),
     }
+    if codex_model:
+        cfg["codex_model"] = codex_model
     save_global_config(cfg)
     click.echo(click.style(f"Saved defaults to {GLOBAL_CONFIG_PATH}", fg="green"))
     return cfg
