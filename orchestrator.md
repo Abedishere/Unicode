@@ -18,7 +18,7 @@ Phase 0: Clarify     — Claude asks 1-3 clarifying questions (optional, skipped
 Phase 0.5: Research  — Codex (×2) + Kiro research in parallel (3 workers):
     │                     Codex-A: similar products & libraries
     │                     Codex-B: technical patterns & pitfalls
-    │                     Kiro:    architectural patterns (web search if key set)
+    │                     Kiro:    architectural patterns (training knowledge + codebase inspection)
     │                   Claude synthesizes the 3 findings into one brief,
     │                   which is prepended to the task prompt for all later phases
     ▼

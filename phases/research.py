@@ -3,7 +3,8 @@
 Workflow:
   1. Codex-A  — researches similar products, open-source projects, and libraries.
   2. Codex-B  — researches technical implementation approaches and pitfalls.
-  3. Kiro     — researches architectural patterns.
+  3. Kiro     — researches architectural patterns, pitfalls, and security/perf considerations
+               using training knowledge + codebase inspection (grep/glob/read).
   4. Synthesizer (Haiku by default) — reads all three, distills every key finding
                into a single compact brief that is prepended to the task prompt.
                It summarizes — it does not choose, recommend, or advise.
@@ -58,22 +59,21 @@ Write informal technical notes — bullets are fine. No preamble. Just the facts
 """
 
 _KIRO_PROMPT = """\
-<role>You are a senior architect and code-quality researcher. You have a web search tool.</role>
+<role>You are a senior architect and code-quality researcher.</role>
 
 <task>{task}</task>
 
 <rules>
-STRICT RULES — follow exactly:
-1. Call the search tool ONCE with a single focused query.
-2. Do NOT call fetch_content or visit any URLs.
-3. Do NOT search again after the first result.
-4. Work only with the snippets returned by the search.
+Draw on your training knowledge to surface:
+- Proven architectural patterns suited to this kind of task
+- Common design mistakes teams make and how to avoid them
+- Security and performance considerations worth flagging
+- Relevant conventions, RFCs, or community standards
 
-Your ONE search query should find: architectural patterns, common mistakes, \
-and security/performance considerations for the task above.
+If relevant files exist in the current codebase, use read/grep/glob to check them \
+and reference what you find. Do not fabricate file contents.
 
-After the single search, write your findings as informal bullet notes. \
-No preamble, no URLs, no conclusion. Just the facts from the snippets.
+Write informal bullet notes. No preamble, no URLs, no conclusion. Just the facts.
 </rules>
 """
 
@@ -140,6 +140,7 @@ def run_research(
     kiro: BaseAgent,
     synthesizer: BaseAgent,
     wall_seconds: int | None = None,
+    global_context: str = "",
 ) -> str:
     """Run parallel research and return the task prompt enriched with findings.
 
@@ -279,12 +280,15 @@ def run_research(
 
     # ── 2. Synthesis (Haiku distills — summarizes, does not advise) ───────────
     log_info(f"Synthesizing with {synthesizer.name} …")
-    brief = _query(synthesizer, _SYNTHESIS_PROMPT.format(
+    synthesis_prompt = _SYNTHESIS_PROMPT.format(
         task=task,
         codex_a=codex_a or "(no findings)",
         codex_b=codex_b or "(no findings)",
         kiro=kiro_r     or "(no findings)",
-    ))
+    )
+    if global_context:
+        synthesis_prompt = global_context + "\n\n" + synthesis_prompt
+    brief = _query(synthesizer, synthesis_prompt)
 
     if not brief:
         log_info("Synthesis returned empty — skipping.")

@@ -390,6 +390,7 @@ def run_review(
     max_iterations: int,
     skills_context: str = "",
     kiro=None,
+    past_mistakes_context: str = "",
 ) -> tuple[bool, str]:
     """Two-phase code review loop.
 
@@ -457,11 +458,18 @@ def run_review(
             f"Review Part 1 — Codex primary review "
             f"(cycle {iteration}/{max_iterations})"
         )
+        _reviewer_skills = skills_context
+        if past_mistakes_context:
+            _reviewer_skills = (
+                (skills_context + "\n\n" if skills_context else "")
+                + "## Past Mistakes to Watch For\n"
+                + past_mistakes_context
+            )
         try:
             codex_review, approved = _codex_primary_review(
                 codex, diff, task, plan, iteration, max_iterations,
                 diff_summary=diff_summary,
-                skills_context=skills_context,
+                skills_context=_reviewer_skills,
             )
         except UsageLimitReached as e:
             if kiro is None:

@@ -47,7 +47,45 @@
       "Bash(where gh *)",
       "Read(//c/Users/PinkPanther/AppData/Local/**)",
       "Bash(where ruff *)",
-      "Bash(C:/Users/PinkPanther/AppData/Local/Programs/Python/Python313/Scripts/ruff.exe check *)"
+      "Bash(C:/Users/PinkPanther/AppData/Local/Programs/Python/Python313/Scripts/ruff.exe check *)",
+      "Bash(kiro-cli --help)",
+      "Bash(kiro --help)",
+      "Bash(kiro-cli chat *)",
+      "Bash(kiro-cli agent *)",
+      "Bash(gh repo *)",
+      "Bash(gh api *)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\PinkPanther\\\\unicode\" -Recurse -Directory)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(pip --version)",
+      "PowerShell(python -m pip install rank_bm25 2>&1)",
+      "PowerShell(python -c \"from rank_bm25 import BM25Okapi; print\\('rank_bm25 ok'\\)\")",
+      "Bash(git rm *)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"C:/Users/PinkPanther/unicode/scripts/hook_stop.py\"",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"C:/Users/PinkPanther/unicode/scripts/hook_prompt_submit.py\"",
+            "timeout": 3000
+          }
+        ]
+      }
     ]
   }
 }

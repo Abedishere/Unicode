@@ -6,7 +6,6 @@ from pathlib import Path
 
 from utils.memory import (
     _default_memory,
-    add_learning,
     add_task_to_index,
     extract_keywords_from_task,
     load_memory,
@@ -56,11 +55,11 @@ def test_load_memory_missing_file(tmp_path: Path) -> None:
 
 def test_save_and_load_round_trip(tmp_path: Path) -> None:
     mem = _default_memory()
-    mem["patterns_learned"].append({"date": "2026-01-01", "text": "test pattern"})
+    mem["task_index"].append({"date": "2026-01-01", "task": "test task", "outcome": "done", "keywords": []})
     save_memory(str(tmp_path), mem)
 
     loaded = load_memory(str(tmp_path))
-    assert loaded["patterns_learned"][0]["text"] == "test pattern"
+    assert loaded["task_index"][0]["task"] == "test task"
 
 
 def test_load_memory_malformed_yaml(tmp_path: Path) -> None:
@@ -73,16 +72,15 @@ def test_load_memory_malformed_yaml(tmp_path: Path) -> None:
 
 
 def test_save_memory_prunes_old_entries(tmp_path: Path) -> None:
-    """Lists exceeding 20 entries should be pruned to the 20 most recent."""
+    """task_index exceeding 20 entries should be pruned to the 20 most recent."""
     mem = _default_memory()
     for i in range(25):
-        mem["patterns_learned"].append({"date": "2026-01-01", "text": f"entry {i}"})
+        mem["task_index"].append({"date": "2026-01-01", "task": f"task {i}", "outcome": "done", "keywords": []})
     save_memory(str(tmp_path), mem)
 
     loaded = load_memory(str(tmp_path))
-    assert len(loaded["patterns_learned"]) == 20
-    # Most recent entries are kept
-    assert loaded["patterns_learned"][-1]["text"] == "entry 24"
+    assert len(loaded["task_index"]) == 20
+    assert loaded["task_index"][-1]["task"] == "task 24"
 
 
 # ── add_task_to_index ─────────────────────────────────────────────────────────
@@ -115,14 +113,6 @@ def test_search_returns_empty_for_no_match(tmp_path: Path) -> None:
     add_task_to_index(str(tmp_path), "fix database migration", "done", ["db", "sql"])
     results = search_past_tasks(str(tmp_path), "authentication jwt")
     assert results == []
-
-
-# ── add_learning ──────────────────────────────────────────────────────────────
-
-def test_add_learning_appends_entry(tmp_path: Path) -> None:
-    add_learning(str(tmp_path), "codebase_conventions", "Always use type hints")
-    mem = load_memory(str(tmp_path))
-    assert any("type hints" in e.get("text", "") for e in mem["codebase_conventions"])
 
 
 # ── extract_keywords_from_task ────────────────────────────────────────────────

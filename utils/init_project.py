@@ -21,13 +21,7 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from utils.logger import log_error
-from utils.memory import (
-    init_project_notes,
-    load_memory,
-    log_decision,
-    log_key_fact,
-    save_memory,
-)
+from utils.local_memory import _load_all as _load_local_all, write_local_patterns
 
 console = Console()
 
@@ -352,21 +346,17 @@ def run_init(work_dir: str, agent) -> None:
     ))
     console.print()
 
-    # ── Step 1: Ensure memory directory and files exist ───────────────────────
-    init_project_notes(work_dir)
+    # ── Step 1: Ensure .orchestrator/ directory exists ───────────────────────
+    (root / ".orchestrator").mkdir(parents=True, exist_ok=True)
 
     # ── Step 2: Audit current state ───────────────────────────────────────────
-    already: dict[str, bool] = {
-        f: _has_real_content(work_dir, f)
-        for f in ("bugs.md", "decisions.md", "key_facts.md", "issues.md")
-    }
+    already_populated = bool(_load_local_all(work_dir))
     upgrade_claude = _needs_memory_upgrade(work_dir, "CLAUDE.md")
     upgrade_agents = _needs_memory_upgrade(work_dir, "AGENTS.md")
     has_orch_md    = (root / "orchestrator.md").exists()
 
-    skipping = [f for f, v in already.items() if v]
-    if skipping:
-        console.print(f"[dim]  Skipping (already populated): {', '.join(skipping)}[/]")
+    if already_populated:
+        console.print("[dim]  local_patterns.yaml already has entries — new patterns will be deduped.[/]")
 
     # ── Step 3: Gather context ────────────────────────────────────────────────
     with Progress(
@@ -411,69 +401,50 @@ def run_init(work_dir: str, agent) -> None:
 
         progress.update(t, description="Writing memory files …")
 
-    # ── Step 5: Populate key_facts.md ────────────────────────────────────────
-    facts_written = 0
-    if not already["key_facts.md"]:
-        desc = analysis.get("description", "")
-        if desc:
-            log_key_fact(work_dir, "Project Overview", desc, today)
-            facts_written += 1
+    # ── Steps 5-7: Write all findings to local_patterns.yaml ─────────────────
+    new_patterns: list[dict] = []
 
-        tech = analysis.get("tech_stack", [])
-        if tech:
-            log_key_fact(work_dir, "Tech Stack", ", ".join(tech), today)
-            facts_written += 1
+    desc = analysis.get("description", "")
+    if desc:
+        new_patterns.append({"category": "convention", "pattern": f"Project overview: {desc[:120]}", "context": "", "quality_score": 0.8})
 
-        entry = analysis.get("entry_points", [])
-        if entry:
-            log_key_fact(work_dir, "Entry Points", " | ".join(entry), today)
-            facts_written += 1
+    tech = analysis.get("tech_stack", [])
+    if tech:
+        new_patterns.append({"category": "convention", "pattern": f"Tech stack: {', '.join(tech)}", "context": "Core technologies in use.", "quality_score": 0.8})
 
-        for item in analysis.get("key_facts", []):
-            cat  = item.get("category", "General")
-            fact = item.get("fact", "").strip()
-            if fact:
-                log_key_fact(work_dir, cat, fact, today)
-                facts_written += 1
+    for item in analysis.get("entry_points", []):
+        if item.strip():
+            new_patterns.append({"category": "convention", "pattern": f"Entry point: {item.strip()}", "context": "", "quality_score": 0.8})
 
-    # ── Step 6: Populate decisions.md ────────────────────────────────────────
-    adrs_written = 0
-    if not already["decisions.md"]:
-        for adr in analysis.get("architectural_decisions", []):
-            title        = adr.get("title", "").strip()
-            context      = adr.get("context", "").strip()
-            decision     = adr.get("decision", "").strip()
-            consequences = adr.get("consequences", "").strip()
-            if title and decision:
-                log_decision(work_dir, title, context, decision,
-                             consequences=consequences, date=today)
-                adrs_written += 1
-
-    # ── Step 7: Update YAML memory store ─────────────────────────────────────
-    memory = load_memory(work_dir)
-
-    convs_written = 0
-    for conv in analysis.get("conventions", []):
-        if conv.strip():
-            memory["codebase_conventions"].append({"date": today, "text": conv.strip()})
-            convs_written += 1
-
-    mistakes_written = 0
-    for m in analysis.get("past_mistakes_to_avoid", []):
-        if m.strip():
-            memory["past_mistakes"].append({"date": today, "text": m.strip()})
-            mistakes_written += 1
+    for item in analysis.get("key_facts", []):
+        fact = item.get("fact", "").strip()
+        if fact:
+            new_patterns.append({"category": "convention", "pattern": fact, "context": item.get("category", ""), "quality_score": 0.8})
 
     for adr in analysis.get("architectural_decisions", []):
-        title    = adr.get("title", "")
-        decision = adr.get("decision", "")
+        title    = adr.get("title", "").strip()
+        decision = adr.get("decision", "").strip()
+        context  = adr.get("context", "").strip()
+        conseq   = adr.get("consequences", "").strip()
         if title and decision:
-            memory["architecture_decisions"].append({
-                "date": today,
-                "text": f"{title}: {decision[:150]}",
-            })
+            ctx = " | ".join(filter(None, [context, conseq]))
+            new_patterns.append({"category": "decision", "pattern": f"{title}: {decision[:120]}", "context": ctx, "quality_score": 0.8})
 
-    save_memory(work_dir, memory)
+    for conv in analysis.get("conventions", []):
+        if conv.strip():
+            new_patterns.append({"category": "convention", "pattern": conv.strip(), "context": "", "quality_score": 0.8})
+
+    for m in analysis.get("past_mistakes_to_avoid", []):
+        if m.strip():
+            new_patterns.append({"category": "bug", "pattern": m.strip(), "context": "Pitfall to avoid in this project.", "quality_score": 0.8})
+
+    patterns_written = 0
+    if new_patterns:
+        from utils.local_memory import _load_all as _check_existing
+        before = len(_check_existing(work_dir))
+        write_local_patterns(work_dir, new_patterns)
+        after = len(_check_existing(work_dir))
+        patterns_written = after - before
 
     # ── Step 8: Upgrade old CLAUDE.md / AGENTS.md ────────────────────────────
     upgraded: list[str] = []
@@ -520,12 +491,8 @@ def run_init(work_dir: str, agent) -> None:
         note = " [dim](already had content — skipped)[/]" if skipped else ""
         console.print(f"  {icon}  [dim]{label:<35}[/] {value}{note}")
 
-    _row(".orchestrator/key_facts.md",
-         f"[cyan]{facts_written} facts written[/]", already["key_facts.md"])
-    _row(".orchestrator/decisions.md",
-         f"[cyan]{adrs_written} ADRs written[/]",   already["decisions.md"])
-    _row(".orchestrator/memory.yaml",
-         f"[cyan]{convs_written} conventions · {mistakes_written} pitfalls[/]")
+    _row(".orchestrator/local_patterns.yaml",
+         f"[cyan]{patterns_written} new patterns written[/]", already_populated and patterns_written == 0)
 
     if upgraded:
         for f in upgraded:
@@ -537,7 +504,7 @@ def run_init(work_dir: str, agent) -> None:
 
     console.print()
     console.print(
-        "  [dim]Run [bold white]/init[/] again any time — it will only fill empty files.[/]"
+        "  [dim]Run [bold white]/init[/] again any time — duplicate patterns are automatically deduped.[/]"
     )
     console.print()
 

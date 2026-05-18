@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import io
 import os
+import re
 import signal
 import sys
 import time
@@ -48,10 +49,14 @@ from utils.git_utils import commit, push, init_repo, is_git_repo
 from utils.history import append_history, agent_update_md, init_agent_md, write_orchestrator_md
 from utils.logger import format_duration, init_transcript, log_error, log_info, log_memory_context, log_phase, log_phase_outcome, log_success
 from utils.memory import (
+    add_task_to_index,
+    compute_quality_score,
     extract_keywords_from_task,
-    get_context_for_task, init_project_notes, load_memory,
-    log_bug, log_decision, log_issue, log_key_fact, parse_json_response, save_memory,
+    get_context_for_task, load_memory,
+    parse_json_response,
 )
+from utils.global_memory import format_global_context, load_global_patterns, write_global_patterns
+from utils.local_memory import write_local_patterns
 from utils.model_config import (
     load_global_config,
     migrate_model_keys,
@@ -1634,218 +1639,132 @@ def _load_saved_plan(work_dir: str) -> str:
     return ""
 
 
-_COMPACT_THRESHOLD = 6_000   # chars — compact if file exceeds this
-_COMPACT_TARGET = 3_000      # chars — aim for this after compaction
-_MEMORY_LIST_MAX = 20    # max YAML list entries per category before pruning
-
-_COMPACT_INSTRUCTIONS = {
-    "bugs.md": (
-        "This is a bug log. Keep the 5 most important and recent entries. "
-        "For each, preserve: date, issue, root cause, solution, prevention. "
-        "Merge entries that describe the same underlying problem. "
-        "Drop entries that are too vague to be actionable."
-    ),
-    "decisions.md": (
-        "This is an architectural decision log (ADRs). Keep the 5 most impactful decisions. "
-        "Prefer decisions that constrain future work (technology choices, patterns, conventions). "
-        "Drop decisions about one-off tasks or minor implementation details. "
-        "Preserve the ADR-NNN numbering of kept entries."
-    ),
-    "key_facts.md": (
-        "This is a project facts file. Merge duplicate categories. "
-        "Within each category keep only the most recent and accurate fact. "
-        "Drop outdated facts superseded by newer ones. "
-        "Keep: tech stack, entry points, conventions, important URLs."
-    ),
-}
-
-
-def _compact_memory_files(kiro: KiroAgent, codex: CodexAgent, work_dir: str) -> None:
-    """Distill oversized .orchestrator/ markdown files.
-
-    Tries Kiro first. If Kiro returns something larger than the original
-    (or fails), falls back to Codex. If both fail, the file is left as-is.
-    issues.md is excluded — it is a chronological log, not a lookup store.
-    """
-    notes_dir = Path(work_dir) / ".orchestrator"
-    for filename, instructions in _COMPACT_INSTRUCTIONS.items():
-        path = notes_dir / filename
-        if not path.exists():
-            continue
-        try:
-            if path.stat().st_size <= _COMPACT_THRESHOLD:
-                continue
-            content = path.read_text(encoding="utf-8")
-            if len(content) <= _COMPACT_THRESHOLD:
-                continue
-        except OSError:
-            continue
-
-        prompt = (
-            f"<role>You are compacting a project memory file that has grown too large.</role>\n\n"
-            f"<context>\n"
-            f"FILE: {filename}\n"
-            f"CURRENT CONTENT ({len(content)} chars):\n{content}\n"
-            f"</context>\n\n"
-            f"<rules>\n"
-            f"{instructions}\n"
-            f"Rewrite the file keeping only the most important entries. "
-            f"Target under {_COMPACT_TARGET} characters. "
-            f"Keep the original markdown format and the top-level heading. "
-            f"Add a line '> Compacted {datetime.now().strftime('%Y-%m-%d')} — older entries distilled.' "
-            f"after the heading.\n"
-            f"</rules>\n\n"
-            f"Return ONLY the new file content, nothing else."
-        )
-
-        compacted = None
-        # Priority-ordered fallback: Kiro first, Codex if Kiro returns a larger result
-        for agent_name, query_fn in [("Kiro", kiro.query), ("Codex", codex.query)]:
-            try:
-                result = query_fn(prompt).strip()
-                if result and len(result) < len(content):
-                    compacted = result
-                    log_info(f"Compacted {filename} via {agent_name}: {len(content)} → {len(result)} chars")
-                    break
-                else:
-                    log_info(f"{agent_name} compaction of {filename} did not reduce size — trying fallback")
-            except Exception:
-                log_info(f"{agent_name} compaction of {filename} failed — trying fallback")
-
-        if compacted:
-            try:
-                path.write_text(compacted + "\n", encoding="utf-8")
-            except OSError:
-                pass  # Never break the pipeline over memory housekeeping
+def _global_research_context(work_dir: str, task: str) -> str:
+    """Return a brief global-patterns block for the research synthesizer prompt."""
+    try:
+        pats = load_global_patterns(task, n=4)
+        return format_global_context(pats) if pats else ""
+    except Exception:
+        return ""
 
 
 def _synthesize_memory(
     kiro: KiroAgent,
-    codex: CodexAgent,
     task: str,
     plan: str,
     review_text: str,
     outcome: str,
     work_dir: str,
+    quality_score: float = 0.5,
 ) -> None:
-    """Ask Kiro to extract real memory entries from the completed run and write them.
-
-    Replaces the old mechanical raw-dump approach with actual synthesis.
-    Writes to: memory.yaml, bugs.md, decisions.md, key_facts.md, issues.md.
-    """
-    prompt = (
-        "You just completed a software task. Extract structured memory entries from the context below.\n\n"
-        f"<task>{task[:400]}</task>\n\n"
-        f"<context>\n"
-        f"PLAN SUMMARY: {plan[:600]}\n\n"
-        f"OUTCOME: {outcome}\n"
-        f"</context>\n\n"
-    )
-    if review_text:
-        prompt += f"<context>\nREVIEW FEEDBACK:\n{review_text[:600]}\n</context>\n\n"
-    prompt += (
-        "<output_format>\n"
-        "Return a JSON object with these optional keys (omit any key if nothing real to record):\n"
-        "{\n"
-        '  "key_facts": [\n'
-        '    {"category": "Tech Stack", "fact": "Uses FastAPI with async SQLAlchemy"}\n'
-        "  ],\n"
-        '  "decisions": [\n'
-        "    {\n"
-        '      "title": "Use async handlers for DB queries",\n'
-        '      "context": "App needs concurrent request handling",\n'
-        '      "decision": "All DB queries use async/await with SQLAlchemy async session",\n'
-        '      "alternatives": "Sync with thread pool",\n'
-        '      "consequences": "Better concurrency, careful session lifecycle needed"\n'
-        "    }\n"
-        "  ],\n"
-        '  "bugs": [\n'
-        "    {\n"
-        '      "issue": "Race condition in session cleanup",\n'
-        '      "root_cause": "Session not closed in finally block",\n'
-        '      "solution": "Use async context manager pattern",\n'
-        '      "prevention": "Always use context managers for DB sessions"\n'
-        "    }\n"
-        "  ],\n"
-        '  "lessons": ["Specific lesson 1", "Specific lesson 2"],\n'
-        '  "issue_notes": "One sentence summary of what was done and the result."\n'
-        "}\n"
-        "</output_format>\n\n"
-        "<rules>\n"
-        "- Only record REAL decisions made during THIS task, not generic advice.\n"
-        "- Only record bugs actually found or fixed during this task.\n"
-        "- key_facts should be specific to this project (ports, patterns, conventions found).\n"
-        "- lessons should be concrete coding lessons (max 3, max 50 words each).\n"
-        "- If nothing meaningful to record for a key, omit it entirely.\n"
-        "</rules>\n"
-        "Return ONLY valid JSON, no markdown fences, nothing else."
-    )
-    try:
-        raw = kiro.query(prompt)
-        data = parse_json_response(raw)
-    except Exception:
-        data = {}
-
-    memory = load_memory(work_dir)
-
-    # ── key_facts.md ─────────────────────────────────────────────────────────
-    for entry in data.get("key_facts", []):
-        if isinstance(entry, dict) and entry.get("fact"):
-            log_key_fact(work_dir, entry.get("category", "General"), entry["fact"])
-
-    # ── decisions.md + YAML architecture_decisions ───────────────────────────
-    for dec in data.get("decisions", []):
-        if isinstance(dec, dict) and dec.get("title") and dec.get("decision"):
-            log_decision(
-                working_dir=work_dir,
-                title=dec["title"],
-                context=dec.get("context", f"Task: {task[:200]}"),
-                decision=dec["decision"],
-                alternatives=dec.get("alternatives", ""),
-                consequences=dec.get("consequences", f"Outcome: {outcome}"),
-            )
-            if isinstance(memory.get("architecture_decisions"), list):
-                memory["architecture_decisions"].append({
-                    "date": datetime.now().strftime("%Y-%m-%d"),
-                    "text": f"{dec['title']}: {dec['decision'][:150]}",
-                })
-
-    # ── bugs.md + YAML past_mistakes ─────────────────────────────────────────
-    for bug in data.get("bugs", []):
-        if isinstance(bug, dict) and bug.get("issue"):
-            log_bug(
-                working_dir=work_dir,
-                issue=bug["issue"],
-                root_cause=bug.get("root_cause", ""),
-                solution=bug.get("solution", ""),
-                prevention=bug.get("prevention", ""),
-            )
-    for lesson in data.get("lessons", []):
-        if isinstance(lesson, str) and lesson.strip():
-            memory["past_mistakes"].append({
-                "date": datetime.now().strftime("%Y-%m-%d"),
-                "text": lesson.strip(),
-            })
-
-    # ── issues.md ────────────────────────────────────────────────────────────
-    issue_notes = data.get("issue_notes", "")
-    log_issue(work_dir, task, outcome, notes=issue_notes)
-
-    # ── YAML task_index ───────────────────────────────────────────────────────
-    keywords = extract_keywords_from_task(task)
-    memory["task_index"].append({
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "task": task[:200],
-        "outcome": outcome,
-        "keywords": keywords,
-    })
-
-    # Prune and save YAML
-    save_memory(work_dir, memory)
+    """Extract patterns from the completed run and write to local + global stores."""
+    _extract_local_patterns(kiro, task, plan, review_text, outcome, quality_score, work_dir)
+    add_task_to_index(work_dir, task, outcome, extract_keywords_from_task(task), quality_score=quality_score)
+    if outcome == "APPROVED" and quality_score >= 0.6:
+        _extract_global_patterns(kiro, task, plan, review_text, quality_score, work_dir)
     log_info("Memory synthesized and saved to .orchestrator/")
 
-    # Compact oversized markdown files so they never grow unboundedly
-    _compact_memory_files(kiro, codex, work_dir)
+
+def _extract_local_patterns(
+    kiro: KiroAgent,
+    task: str,
+    plan: str,
+    review_text: str,
+    outcome: str,
+    quality_score: float,
+    work_dir: str,
+) -> None:
+    """Ask Kiro to extract project-specific patterns and write them to local store."""
+    try:
+        extraction_prompt = (
+            "Extract 0-5 project-specific learnings from this completed software task.\n\n"
+            f"<task>{task[:400]}</task>\n"
+            f"<outcome>{outcome}</outcome>\n"
+            f"<quality_score>{quality_score}</quality_score>\n"
+            f"<plan_summary>\n{plan[:500]}\n</plan_summary>\n"
+            f"<review_notes>\n{review_text[:500] if review_text else '(none)'}\n</review_notes>\n\n"
+            "<rules>\n"
+            "- CAN include project-specific details: file paths, local APIs, conventions, bugs found\n"
+            "- Must be actionable: something a future agent working on THIS project should know\n"
+            "- Must be non-obvious: skip generic advice\n"
+            "- Include bugs discovered, decisions made, conventions observed\n"
+            "- If nothing qualifies, output empty list: []\n"
+            "</rules>\n\n"
+            "Output ONLY a valid YAML list (no prose, no fences):\n"
+            "- category: [architecture|debugging|testing|refactoring|api_design|error_handling|performance|convention|bug|decision]\n"
+            "  pattern: \"concise actionable statement, max 20 words\"\n"
+            "  context: \"1-2 sentences: when this applies and why\"\n"
+        )
+
+        log_info("Kiro extracting local project patterns ...")
+        raw = kiro.query(extraction_prompt)
+        if not raw or not raw.strip():
+            return
+
+        cleaned = re.sub(r'^```[a-z]*\n?', '', raw.strip(), flags=re.IGNORECASE)
+        cleaned = re.sub(r'\n?```$', '', cleaned.strip())
+        parsed = yaml.safe_load(cleaned)
+        if not isinstance(parsed, list) or not parsed:
+            return
+
+        for entry in parsed:
+            if isinstance(entry, dict):
+                entry["quality_score"] = quality_score
+
+        write_local_patterns(work_dir, parsed)
+        log_info(f"Local memory: {len(parsed)} pattern(s) stored.")
+    except Exception as exc:
+        log_info(f"Local pattern extraction skipped: {exc}")
+
+
+def _extract_global_patterns(
+    kiro: KiroAgent,
+    task: str,
+    plan: str,
+    review_text: str,
+    quality_score: float,
+    work_dir: str,
+) -> None:
+    """Ask Kiro to extract project-agnostic patterns and write them to global store."""
+    try:
+        extraction_prompt = (
+            "Extract 0-3 project-agnostic learnings from this completed software task.\n\n"
+            f"<task>{task[:400]}</task>\n"
+            f"<quality_score>{quality_score}</quality_score>\n"
+            f"<plan_summary>\n{plan[:400]}\n</plan_summary>\n"
+            f"<review_notes>\n{review_text[:400] if review_text else '(none)'}\n</review_notes>\n\n"
+            "<rules>\n"
+            "- Only include insights that are TRUE regardless of project (no file paths, "
+            "port numbers, library versions, or project-specific names)\n"
+            "- Must be actionable: something a future agent should DO or AVOID\n"
+            "- Must be non-obvious: skip generic advice like 'write tests' or 'handle errors'\n"
+            "- If nothing qualifies, output empty list: []\n"
+            "</rules>\n\n"
+            "Output ONLY a valid YAML list (no prose, no fences):\n"
+            "- category: [architecture|debugging|testing|refactoring|api_design|error_handling|performance]\n"
+            "  pattern: \"imperative statement, max 15 words\"\n"
+            "  context: \"1-2 sentences: when this applies and why it matters\"\n"
+        )
+
+        log_info("Kiro extracting global cross-project patterns ...")
+        raw = kiro.query(extraction_prompt)
+        if not raw or not raw.strip():
+            return
+
+        cleaned = re.sub(r'^```[a-z]*\n?', '', raw.strip(), flags=re.IGNORECASE)
+        cleaned = re.sub(r'\n?```$', '', cleaned.strip())
+        parsed = yaml.safe_load(cleaned)
+        if not isinstance(parsed, list) or not parsed:
+            return
+
+        for entry in parsed:
+            if isinstance(entry, dict):
+                entry["quality_score"] = quality_score
+
+        write_global_patterns(parsed, source_project=Path(work_dir).name)
+        log_info(f"Global memory: {len(parsed)} pattern(s) extracted and stored.")
+    except Exception as exc:
+        log_info(f"Global pattern extraction skipped: {exc}")
 
 
 def _run_task(
@@ -1975,6 +1894,7 @@ def _run_task(
                 _research_future = _scout_pool.submit(
                     _run_phase, "Research", run_research, task, codex, kiro, synthesizer,
                     wall_seconds=_wall,
+                    global_context=_global_research_context(work_dir, task),
                 )
                 _scout_future = _scout_pool.submit(
                     _run_phase, "Skills Scout", run_skills_scout, task, kiro_scout
@@ -2292,18 +2212,38 @@ def _run_task(
     append_history(work_dir, task, outcome, duration, actions_summary, transcript_name)
     log_info("Appended run to .orchestrator/history.md")
 
+    # ── Compute quality score from run signals ────────────────────────────────
+    _review_cycles = max(
+        (int(m) for m in re.findall(r'Codex Review \(cycle (\d+)\)', review_text or "")),
+        default=1,
+    )
+    _file_statuses: dict[str, str] = {}
+    for _m in re.finditer(r'^\s+(.+?):\s+(Done|Error|Missing|Limit)\s*$', impl or "", re.MULTILINE):
+        _file_statuses[_m.group(1).strip()] = _m.group(2)
+    _fallback_triggered = bool(
+        re.search(r'limit reached|switching to (Codex|Kiro)', (impl or "") + (review_text or ""), re.IGNORECASE)
+    )
+    _quality_score = compute_quality_score(
+        approved=approved,
+        review_cycles=_review_cycles,
+        file_statuses=_file_statuses,
+        fallback_triggered=_fallback_triggered,
+    )
+    log_phase_outcome("quality", {"score": _quality_score, "review_cycles": _review_cycles,
+                                   "file_errors": sum(1 for s in _file_statuses.values() if s != "Done"),
+                                   "fallback": _fallback_triggered})
+
     # ── Synthesize and save memory (Kiro extracts real entries) ──
     log_info("Kiro is synthesizing memory entries ...")
-    _synthesize_memory(kiro, codex, task, plan, review_text, outcome, work_dir)
+    _synthesize_memory(kiro, task, plan, review_text, outcome, work_dir, quality_score=_quality_score)
 
     # ── Verify memory was written ──
     _mem_after = load_memory(work_dir)
-    _counts = {k: len(_mem_after.get(k, [])) for k in
-               ["architecture_decisions", "past_mistakes", "task_index"]}
-    if sum(_counts.values()) == 0:
+    _task_count = len(_mem_after.get("task_index", []))
+    if _task_count == 0:
         log_error("WARNING: Memory synthesis wrote 0 entries — memory.yaml may be empty.")
     else:
-        log_phase_outcome("memory", {"counts": _counts})
+        log_phase_outcome("memory", {"task_index_entries": _task_count})
 
     # ── Mark session complete ──
     session.mark_phase_done("finalize", outcome)
@@ -2387,9 +2327,6 @@ def main(
 
     # Initialize agent MD files (header + orchestrator.md reference)
     init_agent_md(work_dir)
-
-    # Initialize .orchestrator/ memory files (project-memory skill)
-    init_project_notes(work_dir)
 
     # Print the banner with info box
     _print_banner(cfg, work_dir)

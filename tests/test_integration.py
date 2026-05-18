@@ -83,8 +83,7 @@ None
     _run("Create calc.py with add(a, b)", base_cfg, work_dir, claude, codex, kiro)
 
     orch_dir = Path(work_dir) / ".orchestrator"
-    for fname in ("memory.yaml", "bugs.md", "decisions.md", "key_facts.md", "issues.md"):
-        assert (orch_dir / fname).exists(), f"{fname} missing after pipeline"
+    assert (orch_dir / "memory.yaml").exists(), "memory.yaml missing after pipeline"
 
 
 def test_memory_yaml_valid_dict_after_pipeline(
@@ -110,9 +109,7 @@ None
 
     mem = load_memory(work_dir)
     assert isinstance(mem, dict)
-    for key in ("patterns_learned", "codebase_conventions", "past_mistakes",
-                "architecture_decisions", "task_index"):
-        assert key in mem, f"memory key '{key}' missing"
+    assert "task_index" in mem, "task_index missing from memory.yaml"
 
 
 def test_implement_phase_only_writes_file(work_dir: str, base_cfg: dict) -> None:
