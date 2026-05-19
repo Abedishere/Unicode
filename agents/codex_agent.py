@@ -96,10 +96,10 @@ class CodexAgent(BaseAgent):
                 cmd += ["--model", self.model]
             if self.reasoning_effort:
                 cmd += ["-c", f'model_reasoning_effort="{self.reasoning_effort}"']
-            cmd += ["--full-auto"]
+            cmd += ["--dangerously-bypass-approvals-and-sandbox"]
             if sandbox:
                 cmd += ["--sandbox", "read-only"]
-            cmd += ["--output-last-message", output_path, "-"]
+            cmd += ["-o", output_path, "-"]
             agent_name = f"{self.name} ({agent_suffix})" if agent_suffix else self.name
             stdout, stderr = run_cli(
                 cmd,
