@@ -18,16 +18,12 @@ from datetime import datetime
 from pathlib import Path
 
 import yaml
-from rank_bm25 import BM25Plus
 
 from utils.logger import log_info
 
 
 def parse_json_response(raw: str) -> dict:
-    """Parse a JSON object from an LLM response, stripping markdown fences.
-
-    Returns an empty dict if the response contains no valid JSON object.
-    """
+    """Parse a JSON object from an LLM response, stripping markdown fences."""
     raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
     raw = re.sub(r"\n?```$", "", raw.strip())
     match = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -47,12 +43,15 @@ def _memory_path(working_dir: str) -> Path:
     return Path(working_dir) / _MEMORY_FILE
 
 
+def _task_emb_path(working_dir: str) -> Path:
+    return Path(working_dir) / ".orchestrator" / "task_index_emb.npy"
+
+
 def _default_memory() -> dict:
     return {"task_index": []}
 
 
 def load_memory(working_dir: str) -> dict:
-    """Load the shared memory file, or return defaults if it doesn't exist."""
     path = _memory_path(working_dir)
     if path.exists():
         try:
@@ -69,14 +68,11 @@ def load_memory(working_dir: str) -> dict:
 
 
 def save_memory(working_dir: str, memory: dict) -> None:
-    """Save the shared memory file, pruning old entries."""
     path = _memory_path(working_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-
     for key, val in memory.items():
         if isinstance(val, list) and len(val) > _MAX_ENTRIES_PER_CATEGORY:
             memory[key] = val[-_MAX_ENTRIES_PER_CATEGORY:]
-
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(memory, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
@@ -99,6 +95,32 @@ def add_task_to_index(
     })
     save_memory(working_dir, memory)
 
+    # Append embedding for the new task entry
+    try:
+        from utils.embeddings import is_available, encode_document, load_emb, save_emb
+        import numpy as np
+        if is_available():
+            all_tasks = memory.get("task_index", [])
+            n_total = len(all_tasks)
+            text = task[:200] + " " + " ".join(keywords)
+            new_emb = encode_document([text])
+            if new_emb is not None:
+                ep = _task_emb_path(working_dir)
+                existing_emb = load_emb(ep, n_total - 1)
+                if existing_emb is not None:
+                    combined = np.vstack([existing_emb, new_emb])
+                else:
+                    # Rebuild from all entries (handles first run or length mismatch)
+                    texts = [
+                        e.get("task", "")[:200] + " " + " ".join(e.get("keywords", []))
+                        for e in all_tasks
+                    ]
+                    combined = encode_document(texts)
+                if combined is not None:
+                    save_emb(ep, combined)
+    except Exception:
+        pass
+
 
 def compute_quality_score(
     approved: bool,
@@ -106,14 +128,7 @@ def compute_quality_score(
     file_statuses: dict[str, str],
     fallback_triggered: bool,
 ) -> float:
-    """Compute a 0-1 quality score for a completed task run.
-
-    Inputs come from signals already tracked by the orchestrator:
-    - approved: whether the review passed
-    - review_cycles: how many review-fix iterations were needed
-    - file_statuses: per-file outcome dict (Done/Error/Missing/Limit)
-    - fallback_triggered: whether usage-limit fallback chain fired
-    """
+    """Compute a 0-1 quality score for a completed task run."""
     if not approved:
         return 0.0
     bad = sum(1 for s in file_statuses.values() if s in {"Error", "Limit", "Missing"})
@@ -133,41 +148,76 @@ def _tokenize(text: str) -> list[str]:
 def search_past_tasks(
     working_dir: str, query: str, _memory: dict | None = None
 ) -> list[dict]:
-    """Search the YAML task index for related past tasks using BM25Plus.
+    """Search the YAML task index for related past tasks.
 
-    Pass *_memory* to reuse an already-loaded memory dict and avoid a
-    redundant disk read.
+    Uses semantic cosine similarity when fastembed is available; falls back to BM25Plus.
+    Pass *_memory* to reuse an already-loaded dict and avoid a redundant disk read.
     """
     memory = _memory if _memory is not None else load_memory(working_dir)
     entries = memory.get("task_index", [])
     if not entries:
         return []
 
-    corpus = [
-        _tokenize(
-            e.get("task", "") + " "
-            + e.get("outcome", "") + " "
-            + " ".join(e.get("keywords", []))
+    # ── Semantic + MMR path ───────────────────────────────────────────────────
+    try:
+        from utils.embeddings import (
+            is_available, encode_query, encode_document, cosine_scores, load_emb, save_emb,
+            SEARCH_THRESHOLD, mmr_rerank,
         )
-        for e in entries
-    ]
-    if not any(corpus):
+        import numpy as np
+        if is_available():
+            q_emb = encode_query([query])
+            if q_emb is not None:
+                ep = _task_emb_path(working_dir)
+                corpus_emb = load_emb(ep, len(entries))
+                if corpus_emb is None:
+                    texts = [
+                        e.get("task", "")[:200] + " " + " ".join(e.get("keywords", []))
+                        for e in entries
+                    ]
+                    corpus_emb = encode_document(texts)
+                    if corpus_emb is not None:
+                        save_emb(ep, corpus_emb)
+                if corpus_emb is not None:
+                    sims = cosine_scores(q_emb[0], corpus_emb)
+                    keep = np.where(np.asarray(sims) >= SEARCH_THRESHOLD)[0]
+                    if keep.size:
+                        rel = np.array([
+                            float(sims[i]) * (0.5 + 0.5 * entries[i].get("quality_score", 0.5))
+                            for i in keep
+                        ])
+                        sel = mmr_rerank(q_emb[0], corpus_emb[keep], rel, n=5)
+                        return [{**entries[keep[i]], "_score": float(rel[i])} for i in sel]
+                    return []
+    except Exception:
+        pass
+
+    # ── BM25 fallback ─────────────────────────────────────────────────────────
+    try:
+        from rank_bm25 import BM25Plus
+        corpus = [
+            _tokenize(
+                e.get("task", "") + " "
+                + e.get("outcome", "") + " "
+                + " ".join(e.get("keywords", []))
+            )
+            for e in entries
+        ]
+        if not any(corpus):
+            return []
+        bm25 = BM25Plus(corpus)
+        query_tokens = _tokenize(query)
+        raw_scores = bm25.get_scores(query_tokens)
+        results = []
+        for entry, raw in zip(entries, raw_scores):
+            if raw <= 0:
+                continue
+            q = entry.get("quality_score", 0.5)
+            results.append({**entry, "_score": raw * (0.5 + 0.5 * q)})
+        results.sort(key=lambda x: x["_score"], reverse=True)
+        return results[:5]
+    except Exception:
         return []
-
-    bm25 = BM25Plus(corpus)
-    query_tokens = _tokenize(query)
-    raw_scores = bm25.get_scores(query_tokens)
-
-    results = []
-    for entry, raw in zip(entries, raw_scores):
-        if raw <= 0:
-            continue
-        q = entry.get("quality_score", 0.5)
-        final = raw * (0.5 + 0.5 * q)
-        results.append({**entry, "_score": final})
-
-    results.sort(key=lambda x: x["_score"], reverse=True)
-    return results[:5]
 
 
 # ── Combined context builder ──────────────────────────────────────────────────
@@ -179,14 +229,12 @@ def get_context_for_task(working_dir: str, task: str) -> str:
     Sources (in order):
     1. Global cross-project patterns from ~/.unicode/global/
     2. Local project patterns from .orchestrator/local_patterns.yaml
-    3. Related past tasks from .orchestrator/memory.yaml (BM25 task index)
+    3. Related past tasks from .orchestrator/memory.yaml
 
     Cached per (working_dir, task) pair within a single run.
-    Returns a formatted string to prepend to agent prompts.
     """
     sections = []
 
-    # 1. Global cross-project patterns
     try:
         from utils.global_memory import load_global_patterns, format_global_context, increment_usage_counts
         global_pats = load_global_patterns(task, n=8)
@@ -196,7 +244,6 @@ def get_context_for_task(working_dir: str, task: str) -> str:
     except Exception:
         pass
 
-    # 2. Local project-specific patterns
     try:
         from utils.local_memory import load_local_patterns, format_local_context, increment_local_usage_counts
         local_pats = load_local_patterns(working_dir, task, n=8)
@@ -206,7 +253,6 @@ def get_context_for_task(working_dir: str, task: str) -> str:
     except Exception:
         pass
 
-    # 3. Related past tasks (BM25 task index)
     related = search_past_tasks(working_dir, task)
     if related:
         lines = [f"  - [{e['date']}] {e['task']} ({e['outcome']})" for e in related]
