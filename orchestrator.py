@@ -59,8 +59,11 @@ from utils.global_memory import format_global_context, load_global_patterns, wri
 from utils.local_memory import write_local_patterns
 from utils.model_config import (
     load_global_config,
+    load_project_config,
     migrate_model_keys,
     run_first_run_wizard,
+    run_project_global_memory_wizard,
+    should_ask_project_global_memory,
     should_run_onboarding,
 )
 from utils.init_project import run_init
@@ -1660,7 +1663,12 @@ def _synthesize_memory(
     """Extract patterns from the completed run and write to local + global stores."""
     _extract_local_patterns(kiro, task, plan, review_text, outcome, quality_score, work_dir)
     add_task_to_index(work_dir, task, outcome, extract_keywords_from_task(task), quality_score=quality_score)
-    if outcome == "APPROVED" and quality_score >= 0.6:
+    project_cfg = load_project_config(work_dir)
+    if (
+        outcome == "APPROVED"
+        and quality_score >= 0.6
+        and project_cfg.get("global_memory_opt_in", False)
+    ):
         _extract_global_patterns(kiro, task, plan, review_text, quality_score, work_dir)
     log_info("Memory synthesized and saved to .orchestrator/")
 
@@ -2324,6 +2332,10 @@ def main(
     if not is_git_repo(work_dir):
         init_repo(work_dir)
         log_info(f"Initialized git repo in {work_dir}")
+
+    # Per-project global-memory opt-in (asked once, on first use of a new project)
+    if should_ask_project_global_memory(work_dir, cfg):
+        run_project_global_memory_wizard(work_dir, cfg)
 
     # Initialize agent MD files (header + orchestrator.md reference)
     init_agent_md(work_dir)

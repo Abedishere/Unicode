@@ -193,6 +193,72 @@ def run_first_run_wizard(defaults: dict[str, Any]) -> dict[str, Any]:
     }
     if codex_model:
         cfg["codex_model"] = codex_model
+
+    click.echo()
+    click.echo(click.style("Global memory", fg="cyan", bold=True))
+    click.echo(
+        "Patterns learned in any project can be stored in a shared store\n"
+        f"({Path.home() / '.unicode' / 'global'}) and reused across all future projects."
+    )
+    enable_global = click.confirm("Enable cross-project global memory?", default=True)
+    cfg["enable_global_memory"] = enable_global
+    if enable_global:
+        click.echo(click.style("  Global memory enabled. Each new project will ask whether to contribute.", fg="green"))
+    else:
+        click.echo(click.style("  Global memory disabled. Only per-project local memory will be used.", fg="yellow"))
+
     save_global_config(cfg)
     click.echo(click.style(f"Saved defaults to {GLOBAL_CONFIG_PATH}", fg="green"))
     return cfg
+
+
+# ── Per-project config ────────────────────────────────────────────────────────
+
+def _project_config_path(work_dir: str) -> Path:
+    return Path(work_dir) / ".orchestrator" / "project_config.yaml"
+
+
+def load_project_config(work_dir: str) -> dict[str, Any]:
+    p = _project_config_path(work_dir)
+    if not p.exists():
+        return {}
+    try:
+        return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except OSError:
+        return {}
+
+
+def save_project_config(work_dir: str, cfg: dict[str, Any]) -> None:
+    p = _project_config_path(work_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+
+
+def should_ask_project_global_memory(work_dir: str, global_cfg: dict[str, Any]) -> bool:
+    """Return True when the per-project global-memory preference has not been set yet."""
+    if "pytest" in sys.modules:
+        return False
+    if os.environ.get("UNICODE_SKIP_ONBOARDING"):
+        return False
+    if not sys.stdin.isatty():
+        return False
+    if not global_cfg.get("enable_global_memory"):
+        return False
+    return "global_memory_opt_in" not in load_project_config(work_dir)
+
+
+def run_project_global_memory_wizard(work_dir: str, global_cfg: dict[str, Any]) -> None:
+    """Ask once per project whether to push patterns to the global store."""
+    project_name = Path(work_dir).name
+    click.echo()
+    click.echo(click.style(f"New project: {project_name}", fg="cyan", bold=True))
+    click.echo(
+        "Push patterns learned in this project to the global cross-project store?\n"
+        "You can change this later by editing .orchestrator/project_config.yaml."
+    )
+    opt_in = click.confirm("Contribute to global memory?", default=True)
+    save_project_config(work_dir, {"global_memory_opt_in": opt_in})
+    if opt_in:
+        click.echo(click.style("  This project will contribute to global memory.", fg="green"))
+    else:
+        click.echo(click.style("  This project will only use local memory.", fg="yellow"))

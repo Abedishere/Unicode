@@ -55,7 +55,7 @@ def test_format_local_context_header(tmp_path: Path) -> None:
     write_local_patterns(str(tmp_path), [
         {"pattern": "Prefer composition over inheritance", "context": "Easier to test and extend.", "category": "architecture"},
     ])
-    pats = load_local_patterns(str(tmp_path), "composition design")
+    pats = load_local_patterns(str(tmp_path), "prefer composition over inheritance in object-oriented design")
     ctx = format_local_context(pats)
     assert "Project-Specific Patterns" in ctx
     assert "Prefer composition over inheritance" in ctx
