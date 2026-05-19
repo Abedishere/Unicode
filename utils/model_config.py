@@ -200,6 +200,8 @@ def run_first_run_wizard(defaults: dict[str, Any]) -> dict[str, Any]:
         "Patterns learned in any project can be stored in a shared store\n"
         f"({Path.home() / '.unicode' / 'global'}) and reused across all future projects."
     )
+    click.echo("  Y - Yes (Recommended)")
+    click.echo("  N - No")
     enable_global = click.confirm("Enable cross-project global memory?", default=True)
     cfg["enable_global_memory"] = enable_global
     if enable_global:
@@ -256,6 +258,8 @@ def run_project_global_memory_wizard(work_dir: str, global_cfg: dict[str, Any]) 
         "Push patterns learned in this project to the global cross-project store?\n"
         "You can change this later by editing .orchestrator/project_config.yaml."
     )
+    click.echo("  Y - Yes (Recommended)")
+    click.echo("  N - No")
     opt_in = click.confirm("Contribute to global memory?", default=True)
     save_project_config(work_dir, {"global_memory_opt_in": opt_in})
     if opt_in:
