@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
@@ -333,7 +332,6 @@ def run_init(work_dir: str, agent) -> None:
     Old CLAUDE.md / AGENTS.md files missing the memory-protocol section are
     upgraded in-place (content preserved, header appended).
     """
-    today = datetime.now().strftime("%Y-%m-%d")
     root = Path(work_dir)
 
     console.print()

@@ -19,7 +19,6 @@ from pathlib import Path
 
 import yaml
 
-from utils.logger import log_info
 
 
 def parse_json_response(raw: str) -> dict:

@@ -9,7 +9,6 @@ All tests require fastembed and are skipped when it is absent.
 """
 from __future__ import annotations
 
-import numpy as np
 import pytest
 
 from utils.embeddings import (
